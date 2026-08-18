@@ -1,0 +1,35 @@
+# SMBPal repo hygiene — copy to .gitignore at the root of every SMBPal repo.
+#
+# D5 opens these repos once established, and we publish the FULL history rather than
+# squashing or splitting repos (§11.3). That decision is only safe if nothing
+# unpublishable ever lands, because a later delete does not remove it from history.
+
+# --- Captured Samba config -------------------------------------------------
+# SMBPal's job is generating smb.conf, so templates and fixtures are legitimate and are
+# un-ignored below. What must never be committed is a real one lifted off a machine:
+# it carries hostnames, absolute paths, usernames and sometimes credentials.
+smb.conf
+smb.conf.*
+*.smb.conf
+!*.smb.conf.in
+!tests/fixtures/*.smb.conf.example
+
+# --- Signing and notarization (§11.3, line 654: "belong in no repository") --
+*.p12
+*.pem
+*.key
+*.cer
+*.certSigningRequest
+*.mobileprovision
+*.provisionprofile
+AuthKey_*.p8
+
+# --- Credentials -----------------------------------------------------------
+.env
+.env.*
+!.env.example
+secrets.*
+credentials.*
+*.keychain
+*.keychain-db
+.DS_Store
