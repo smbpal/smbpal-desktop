@@ -21,12 +21,29 @@ from tests.fakes import FakeSamba
 
 
 class TestEscaping(unittest.TestCase):
-    def test_the_one_case_m0_confirmed(self) -> None:
-        # M0 §4 produced mnt-m0.mount and mnt-m0.automount for /mnt/m0.
-        self.assertEqual(units.unit_names("/mnt/m0"), ("mnt-m0.mount", "mnt-m0.automount"))
+    """Captured from `systemd-escape -p --suffix=mount` on Pi OS, 20 August 2026.
 
-    def test_a_hyphen_is_escaped_because_it_is_the_separator(self) -> None:
-        self.assertEqual(units.escape_path("/mnt/my-share"), r"mnt-my\x2dshare")
+    A fixture rather than four assertions derived from one reading of the spec.
+    Getting one wrong means a unit name systemd never matches, and therefore a
+    mount that silently never happens.
+    """
+
+    CONFIRMED = {
+        "/mnt/m0": "mnt-m0.mount",
+        "/mnt/my-share": "mnt-my" + chr(92) + "x2dshare.mount",
+        "/.dotdir": chr(92) + "x2edotdir.mount",
+        "/srv/a b": "srv-a" + chr(92) + "x20b.mount",
+    }
+
+    def test_against_real_systemd_output(self) -> None:
+        for path, expected in self.CONFIRMED.items():
+            with self.subTest(path=path):
+                self.assertEqual(units.unit_names(path)[0], expected)
+
+    def test_the_automount_name_matches_the_mount_name(self) -> None:
+        self.assertEqual(
+            units.unit_names("/mnt/m0"), ("mnt-m0.mount", "mnt-m0.automount")
+        )
 
     def test_the_root_path(self) -> None:
         self.assertEqual(units.escape_path("/"), "-")
@@ -34,15 +51,13 @@ class TestEscaping(unittest.TestCase):
     def test_redundant_slashes_collapse(self) -> None:
         self.assertEqual(units.escape_path("//mnt///m0/"), "mnt-m0")
 
-    def test_a_leading_dot_is_escaped_so_the_unit_is_not_hidden(self) -> None:
-        self.assertEqual(units.escape_path("/.dotdir"), r"\x2edotdir")
-
     def test_a_dot_elsewhere_is_left_alone(self) -> None:
         self.assertEqual(units.escape_path("/mnt/a.b"), "mnt-a.b")
 
-    def test_spaces_and_non_ascii_escape_per_byte(self) -> None:
-        self.assertEqual(units.escape_path("/srv/a b"), r"srv-a\x20b")
-        self.assertEqual(units.escape_path("/srv/é"), r"srv-\xc3\xa9")
+    def test_non_ascii_escapes_per_byte(self) -> None:
+        # The documented rule only — unlike the four cases above, this one has
+        # not been checked against real systemd.
+        self.assertEqual(units.escape_path("/srv/\u00e9"), "srv-" + chr(92) + "xc3" + chr(92) + "xa9")
 
 
 class TestUnitContent(unittest.TestCase):

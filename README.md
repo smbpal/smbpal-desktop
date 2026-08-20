@@ -133,19 +133,22 @@ Three properties worth knowing:
   user as `No such device` while `Permission denied` sat in the unit's journal.
   `systemd.show()` exists and returns what M5 needs; nothing reads it yet.
 
-### Needs one check on real hardware
+### Unit naming: verified against real systemd
 
-`escape_path` implements systemd's path escaping from the documented algorithm
-rather than shelling out to `systemd-escape`, so it is testable anywhere. It
-agrees with the one case M0 confirmed (`/mnt/m0` → `mnt-m0`). **The other cases
-— a hyphen, a leading dot, non-ASCII — are untested against real systemd.**
-Worth a one-line spot check on the Pi:
+`escape_path` implements systemd's path escaping rather than shelling out to
+`systemd-escape`, so it is testable anywhere. Checked on Pi OS, 20 August 2026 —
+all four agree, and the expected values are a fixture in `tests/test_mounts.py`:
 
-```sh
-for p in /mnt/m0 /mnt/my-share /.dotdir "/srv/a b"; do
-    printf '%-16s %s\n' "$p" "$(systemd-escape -p --suffix=mount "$p")"
-done
 ```
+/mnt/m0          mnt-m0.mount
+/mnt/my-share    mnt-my\x2dshare.mount
+/.dotdir         \x2edotdir.mount
+/srv/a b         srv-a\x20b.mount
+```
+
+Multi-byte UTF-8 is still the documented per-byte rule only, and unverified. A
+share path with non-ASCII in it is unusual but not impossible, and the failure
+mode is a unit name systemd never matches — a mount that silently never happens.
 
 ### Known interim: authorisation
 

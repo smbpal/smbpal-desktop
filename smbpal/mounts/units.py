@@ -35,8 +35,10 @@ def escape_path(path: str) -> str:
     `\\x2e`, and every other byte outside `[A-Za-z0-9:_.]` — **including `-`,
     because it is the separator** — becomes `\\xNN`.
 
-    M0 confirms one real case: `/mnt/m0` produced `mnt-m0.mount` and
-    `mnt-m0.automount`.
+    **Verified against `systemd-escape -p --suffix=mount` on Pi OS, 20 August
+    2026** for `/mnt/m0`, `/mnt/my-share`, `/.dotdir` and `/srv/a b` — all four
+    agree. Multi-byte UTF-8 is still only the documented per-byte rule and has
+    not been checked against real systemd.
     """
     collapsed = _SLASHES.sub("/", path).strip("/")
     if not collapsed:
