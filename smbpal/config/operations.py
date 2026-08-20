@@ -118,6 +118,7 @@ def add_connection(
     id: str | None = None,
     credential_ref: str | None = None,
     auto_connect: str = "on_this_network",
+    owner: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     result = copy.deepcopy(doc)
     connections = result.setdefault("connections", [])
@@ -142,6 +143,7 @@ def add_connection(
         "mountpoint": mountpoint,
         "credential_ref": credential_ref,
         "auto_connect": auto_connect,
+        "owner": owner,
     }
     connections.append(connection)
     validate_or_raise(

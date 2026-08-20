@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import pwd
 from typing import Any, Callable
 
 from smbpal import PROTOCOL_VERSION, __version__
@@ -16,6 +17,8 @@ from smbpal.config import ConfigStore
 from smbpal.config import operations as ops
 from smbpal.discovery import discover
 from smbpal.errors import InvalidParams, NotFound, NotPermitted, SmbpalError, UnknownMethod
+from smbpal.mounts import systemd, units
+from smbpal.mounts.apply import Mounter
 from smbpal.samba import control, passwd
 from smbpal.samba.apply import Applier
 from smbpal.shares import ownership
@@ -84,12 +87,14 @@ class Dispatcher:
         *,
         authoriser: Authoriser | None = None,
         applier: Applier | None = None,
+        mounter: Mounter | None = None,
     ) -> None:
         self.store = store
         self.authoriser = authoriser or Authoriser()
         # None means config-only: useful on a development machine with no
         # Samba, and the reason --no-apply exists.
         self.applier = applier
+        self.mounter = mounter
 
     def handle(self, connection: Connection, frame: bytes) -> bytes | None:
         request: Request | None = None
@@ -137,15 +142,21 @@ class Dispatcher:
         re-applied, rather than leaving a record of a share that is not served.
         """
         self.store.save(updated)
-        if self.applier is None:
+        if self.applier is None and self.mounter is None:
             return None
         try:
-            return self.applier.apply(updated)
+            report = self.applier.apply(updated) if self.applier else None
+            if self.mounter is not None:
+                self.mounter.apply(updated)
+            return report
         except SmbpalError:
             log.warning("apply failed; rolling the config back")
             self.store.save(previous)
             try:
-                self.applier.apply(previous)
+                if self.applier is not None:
+                    self.applier.apply(previous)
+                if self.mounter is not None:
+                    self.mounter.apply(previous)
             except SmbpalError:
                 log.exception("could not re-apply the previous config after rollback")
             raise
@@ -183,13 +194,19 @@ class Dispatcher:
                 "applying": self.applier is not None,
             },
             "shares": self._share_states(config),
-            # Still "unknown": nothing mounts until M4, and a status line that
-            # claims otherwise is the lie D12 warns about. M5 replaces this with
-            # real state, pushed rather than polled.
-            "connections": [
-                {**conn, "state": "unknown"} for conn in config.get("connections", [])
-            ],
+            "connections": self._connection_states(config),
         }
+
+    def _connection_states(self, config: dict[str, Any]) -> list[dict[str, Any]]:
+        if self.mounter is None:
+            return [
+                {**conn, "state": "not applied"}
+                for conn in config.get("connections", [])
+            ]
+        # Shallow by construction: `plan` answers from the kernel's mount table
+        # and never stats a mountpoint, so a switched-off NAS cannot make
+        # `status` slow (M0 §4).
+        return [planned.to_wire() for planned in self.mounter.plan(config)]
 
     def _share_states(self, config: dict[str, Any]) -> list[dict[str, Any]]:
         if self.applier is None:
@@ -286,16 +303,18 @@ class Dispatcher:
 
     def _connection_add(self, request: Request, peer: PeerCredentials) -> dict[str, Any]:
         params = request.params
+        previous = self.store.load()
         updated, connection = ops.add_connection(
-            self.store.load(),
+            previous,
             host=_require_str(params, "host"),
             share=_require_str(params, "share"),
             mountpoint=_require_str(params, "mountpoint"),
             id=_optional_str(params, "id"),
             credential_ref=_optional_str(params, "credential_ref"),
             auto_connect=_optional_str(params, "auto_connect") or "on_this_network",
+            owner=_optional_str(params, "owner") or _owner_from(peer),
         )
-        self.store.save(updated)
+        self._commit(previous, updated)
         _audit(peer, "connection.add", connection["id"])
         return connection
 
@@ -303,10 +322,79 @@ class Dispatcher:
         self, request: Request, peer: PeerCredentials
     ) -> dict[str, Any]:
         ref = _require_str(request.params, "ref")
-        updated, connection = ops.remove_connection(self.store.load(), ref)
-        self.store.save(updated)
+        previous = self.store.load()
+        updated, connection = ops.remove_connection(previous, ref)
+        self._commit(previous, updated)
+        if self.mounter is not None and connection.get("credential_ref"):
+            self.mounter.forget_credentials(connection["credential_ref"])
         _audit(peer, "connection.remove", connection["id"])
         return connection
+
+    def _connection_set_credentials(
+        self, request: Request, peer: PeerCredentials
+    ) -> dict[str, Any]:
+        """Store the remote username and password for a connection.
+
+        `password` is the second and last parameter in the protocol that carries
+        a secret. It goes straight into a 0600 root-owned file and is never
+        logged, echoed back, or placed in an argv — cifs takes the file's *path*
+        (§10.6, M0 §9).
+        """
+        if self.mounter is None:
+            raise SmbpalError("this daemon was started with --no-apply")
+        ref = _require_str(request.params, "ref")
+        username = _require_str(request.params, "username")
+        password = request.params.get("password")
+        if not isinstance(password, str) or not password:
+            raise InvalidParams("'password' is required and must be a non-empty string")
+
+        previous = self.store.load()
+        connection = _find_connection(previous, ref)
+        credential_ref = connection.get("credential_ref") or connection["id"]
+        self.mounter.credentials.write(
+            credential_ref,
+            username=username,
+            password=password,
+            domain=_optional_str(request.params, "domain"),
+        )
+        updated = {
+            **previous,
+            "connections": [
+                {**c, "credential_ref": credential_ref} if c["id"] == connection["id"] else c
+                for c in previous["connections"]
+            ],
+        }
+        self._commit(previous, updated)
+        _audit(peer, "connection.set_credentials", connection["id"])
+        return {"id": connection["id"], "username": username}
+
+    def _connection_connect(
+        self, request: Request, peer: PeerCredentials
+    ) -> dict[str, Any]:
+        connection, mount_name = self._unit_for(request)
+        systemd.start(mount_name, runner=self._runner())
+        _audit(peer, "connection.connect", connection["id"])
+        return {"id": connection["id"], "unit": mount_name}
+
+    def _connection_disconnect(
+        self, request: Request, peer: PeerCredentials
+    ) -> dict[str, Any]:
+        connection, mount_name = self._unit_for(request)
+        systemd.stop(mount_name, runner=self._runner())
+        _audit(peer, "connection.disconnect", connection["id"])
+        return {"id": connection["id"], "unit": mount_name}
+
+    def _unit_for(self, request: Request) -> tuple[dict[str, Any], str]:
+        if self.mounter is None:
+            raise SmbpalError("this daemon was started with --no-apply")
+        connection = _find_connection(
+            self.store.load(), _require_str(request.params, "ref")
+        )
+        mount_name, _ = units.unit_names(connection["mountpoint"])
+        return connection, mount_name
+
+    def _runner(self) -> Any:
+        return self.mounter.runner if self.mounter else None
 
     # --- credentials -------------------------------------------------------
 
@@ -346,6 +434,29 @@ class Dispatcher:
             raise InvalidParams("'timeout' must be a number of seconds")
         timeout = max(1.0, min(float(timeout), 30.0))
         return [machine.to_wire() for machine in discover(timeout=timeout)]
+
+
+def _owner_from(peer: PeerCredentials) -> str | None:
+    """Default a connection's owner to whoever asked for it.
+
+    The person adding a connection is the person who will use it, and the
+    kernel already told us who they are. Root is not defaulted: a CLI run under
+    `sudo` arrives as uid 0, and mounting a NAS as root-owned is almost never
+    what was meant — the CLI passes the real user instead.
+    """
+    if peer.uid == 0:
+        return None
+    try:
+        return pwd.getpwuid(peer.uid).pw_name
+    except KeyError:
+        return None
+
+
+def _find_connection(config: dict[str, Any], ref: str) -> dict[str, Any]:
+    for connection in config.get("connections", []):
+        if connection.get("id") == ref or connection.get("mountpoint") == ref:
+            return connection
+    raise NotFound(f"no connection called {ref!r}")
 
 
 def _find_share(config: dict[str, Any], ref: str) -> dict[str, Any]:
@@ -403,5 +514,8 @@ _METHODS: dict[str, Method] = {
     "connection.list": Dispatcher._connection_list,
     "connection.add": Dispatcher._connection_add,
     "connection.remove": Dispatcher._connection_remove,
+    "connection.set_credentials": Dispatcher._connection_set_credentials,
+    "connection.connect": Dispatcher._connection_connect,
+    "connection.disconnect": Dispatcher._connection_disconnect,
     "browse": Dispatcher._browse,
 }

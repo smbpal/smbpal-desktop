@@ -23,6 +23,9 @@ from smbpal.config.store import DEFAULT_CONFIG_PATH
 from smbpal.daemon.handlers import Dispatcher
 from smbpal.discovery.advertise import DEFAULT_SERVICE_FILE, Advertiser
 from smbpal.errors import SmbpalError
+from smbpal.mounts.apply import Mounter
+from smbpal.mounts.credentials import DEFAULT_CREDENTIALS_DIR, CredentialsStore
+from smbpal.mounts.systemd import DEFAULT_UNIT_DIR
 from smbpal.samba.apply import DEFAULT_SMB_CONF, DEFAULT_SMBPAL_CONF, Applier
 from smbpal.ipc.server import (
     DEFAULT_SOCKET_GROUP,
@@ -74,6 +77,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--avahi-service", type=Path, default=DEFAULT_SERVICE_FILE, help=argparse.SUPPRESS
     )
+    parser.add_argument(
+        "--unit-dir", type=Path, default=DEFAULT_UNIT_DIR, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--credentials-dir",
+        type=Path,
+        default=DEFAULT_CREDENTIALS_DIR,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--version", action="version", version=f"smbpald {__version__}")
     return parser
 
@@ -114,7 +126,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     applier: Applier | None = None
+    mounter: Mounter | None = None
     if not args.no_apply:
+        mounter = Mounter(
+            unit_dir=args.unit_dir,
+            credentials=CredentialsStore(args.credentials_dir),
+        )
         applier = Applier(
             smb_conf=args.smb_conf,
             smbpal_conf=args.smbpal_conf,
@@ -132,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         log.info("--no-apply: holding config only, not touching Samba or Avahi")
 
-    dispatcher = Dispatcher(store, applier=applier)
+    dispatcher = Dispatcher(store, applier=applier, mounter=mounter)
     log.info("%s", dispatcher.authoriser.policy_note())
     _install_signal_handlers(transport)
     _sd_notify("READY=1")

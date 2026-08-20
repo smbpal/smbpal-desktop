@@ -8,7 +8,7 @@ from pathlib import Path
 from smbpal.samba import conf, control, include, passwd
 from smbpal.samba.include import SmbConfError
 from smbpal.errors import InvalidParams, NotFound
-from tests.fake_samba import FakeSamba
+from tests.fakes import FakeSamba
 
 # Debian's stock smb.conf, reduced to the parts that matter here. [print$] is
 # last on purpose: that is the section M0's appended include landed inside.

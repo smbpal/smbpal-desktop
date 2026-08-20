@@ -16,7 +16,7 @@ from smbpal.errors import SmbpalError
 from smbpal.samba import control, include
 from smbpal.samba.apply import Applier
 from smbpal.shares import ownership
-from tests.fake_samba import FakeSamba
+from tests.fakes import FakeSamba
 from tests.test_samba import STOCK
 
 

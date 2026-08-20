@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import os
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -122,10 +123,30 @@ def build_parser() -> argparse.ArgumentParser:
         default="on_this_network",
         help="when to connect (default on_this_network)",
     )
-    connection_add.add_argument("--credential", help="reference to a stored credential")
+    connection_add.add_argument(
+        "--user", help="username on the remote server (you will be asked for the password)"
+    )
+    connection_add.add_argument(
+        "--owner",
+        help="local account the mounted files belong to (defaults to you, or to "
+        "$SUDO_USER when run under sudo)",
+    )
+    connection_add.add_argument("--domain", help="Windows domain, if the server wants one")
+    connection_add.add_argument(
+        "--stdin-password", action="store_true", help="read the password from stdin"
+    )
 
     connection_remove = connection_cmds.add_parser("remove", help="remove a connection")
     connection_remove.add_argument("ref", help="connection id or mountpoint")
+
+    connection_connect = connection_cmds.add_parser(
+        "connect", help="mount now, without waiting for first access"
+    )
+    connection_connect.add_argument("ref", help="connection id or mountpoint")
+    connection_disconnect = connection_cmds.add_parser(
+        "disconnect", help="unmount now (the automount will remount on next access)"
+    )
+    connection_disconnect.add_argument("ref", help="connection id or mountpoint")
 
     return parser
 
@@ -174,7 +195,7 @@ def _cmd_status(client: Client, args: argparse.Namespace) -> int:
             _section(
                 "Connections",
                 status["connections"],
-                ("id", "host", "share", "mountpoint", "auto_connect", "state"),
+                ("id", "host", "share", "mountpoint", "state"),
                 "no connections configured",
             ),
         ]
@@ -325,7 +346,7 @@ def _cmd_connection_list(client: Client, args: argparse.Namespace) -> int:
         args,
         connections,
         lambda: render_table(
-            connections, ("id", "host", "share", "mountpoint", "auto_connect")
+            connections, ("id", "host", "share", "mountpoint", "owner", "auto_connect")
         )
         or "no connections configured",
     )
@@ -340,15 +361,60 @@ def _cmd_connection_add(client: Client, args: argparse.Namespace) -> int:
             "mountpoint": _resolve(args.mountpoint),
             "id": args.id,
             "auto_connect": args.auto,
-            "credential_ref": args.credential,
+            # The daemon can read the peer uid, but a CLI run under sudo arrives
+            # as root — and mounting a NAS as root-owned is almost never meant.
+            # $SUDO_USER is the only place the real user survives.
+            "owner": args.owner or os.environ.get("SUDO_USER") or getpass.getuser(),
         },
     )
+    lines = [
+        f"added connection {connection['id']}: "
+        f"//{connection['host']}/{connection['share']} -> {connection['mountpoint']}"
+    ]
+
+    if args.user:
+        password = _read_password(args, f"Password for {args.user}@{args.host}: ")
+        if password is None:
+            return EXIT_ERROR
+        client.call(
+            "connection.set_credentials",
+            {
+                "ref": connection["id"],
+                "username": args.user,
+                "password": password,
+                "domain": args.domain,
+            },
+        )
+        lines.append(f"  credentials stored for {args.user}")
+    else:
+        lines.append("  no credentials: it will mount as a guest")
+    lines.append("  it will mount on first access")
+    return _emit(args, connection, lambda: "\n".join(lines))
+
+
+def _cmd_connection_connect(client: Client, args: argparse.Namespace) -> int:
+    result = client.call("connection.connect", {"ref": args.ref})
+    return _emit(args, result, lambda: f"mounted {result['id']} ({result['unit']})")
+
+
+def _cmd_connection_disconnect(client: Client, args: argparse.Namespace) -> int:
+    result = client.call("connection.disconnect", {"ref": args.ref})
     return _emit(
         args,
-        connection,
-        lambda: f"added connection {connection['id']}: "
-        f"//{connection['host']}/{connection['share']} -> {connection['mountpoint']}",
+        result,
+        lambda: f"unmounted {result['id']}; it will remount on next access",
     )
+
+
+def _read_password(args: argparse.Namespace, prompt: str) -> str | None:
+    if getattr(args, "stdin_password", False):
+        password = sys.stdin.readline().rstrip("\n")
+    else:
+        password = getpass.getpass(prompt)
+    if not password:
+        print("smbpal: the password must not be empty", file=sys.stderr)
+        return None
+    return password
 
 
 def _cmd_connection_remove(client: Client, args: argparse.Namespace) -> int:
@@ -375,6 +441,8 @@ _COMMANDS: dict[tuple[str, str | None], Handler] = {
     ("connection", "list"): _cmd_connection_list,
     ("connection", "add"): _cmd_connection_add,
     ("connection", "remove"): _cmd_connection_remove,
+    ("connection", "connect"): _cmd_connection_connect,
+    ("connection", "disconnect"): _cmd_connection_disconnect,
 }
 
 

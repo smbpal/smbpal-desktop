@@ -1,4 +1,4 @@
-"""A stand-in for Samba that reads the files we wrote.
+"""Stand-ins for the system commands the daemon runs.
 
 Deliberately not a rubber stamp. `testparm` here parses `smb.conf`, follows the
 `include =` line, and reports the sections it actually finds — so if the include
@@ -19,7 +19,11 @@ _INCLUDE = re.compile(r"^\s*include\s*=\s*(\S+)\s*$", re.IGNORECASE)
 
 
 class FakeSamba:
-    """Callable with the CommandRunner signature."""
+    """Callable with the CommandRunner signature.
+
+    Covers `testparm`, `smbcontrol`, `smbpasswd`, `pdbedit` and `systemctl` —
+    everything the daemon shells out to.
+    """
 
     def __init__(self, smb_conf: Path) -> None:
         self.smb_conf = smb_conf
@@ -28,6 +32,9 @@ class FakeSamba:
         self.smb_users: list[str] = []
         self.reload_count = 0
         self.reload_fails = False
+        self.enabled_units: set[str] = set()
+        self.started_units: set[str] = set()
+        self.daemon_reloads = 0
 
     def __call__(
         self, argv, *, input: str | None = None, timeout: float | None = None
@@ -70,6 +77,30 @@ class FakeSamba:
             return CommandResult(argv, 0, "", "")
         listing = "".join(f"{u}:1000:\n" for u in self.smb_users)
         return CommandResult(argv, 0, listing, "")
+
+    def _systemctl(self, argv, _input) -> CommandResult:
+        verb = argv[1]
+        if verb == "daemon-reload":
+            self.daemon_reloads += 1
+            return CommandResult(argv, 0, "", "")
+        unit = argv[-1]
+        if verb == "enable":
+            self.enabled_units.add(unit)
+            if "--now" in argv:
+                self.started_units.add(unit)
+        elif verb == "disable":
+            self.enabled_units.discard(unit)
+            self.started_units.discard(unit)
+        elif verb == "start":
+            self.started_units.add(unit)
+        elif verb == "stop":
+            self.started_units.discard(unit)
+        elif verb == "is-active":
+            active = "active" if unit in self.started_units else "inactive"
+            return CommandResult(argv, 0 if unit in self.started_units else 3, active + "\n", "")
+        elif verb == "show":
+            return CommandResult(argv, 0, "ActiveState=active\nResult=success\n", "")
+        return CommandResult(argv, 0, "", "")
 
     # --- the part that makes this a real check -----------------------------
 

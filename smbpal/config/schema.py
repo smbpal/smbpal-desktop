@@ -60,6 +60,7 @@ _CONNECTION_KEYS = {
     "mountpoint",
     "credential_ref",
     "auto_connect",
+    "owner",
 }
 _TOP_KEYS = {"version", "shares", "connections"}
 
@@ -198,6 +199,7 @@ def _validate_connection(
     _check_optional_ref(
         problems, f"{where}.credential_ref", connection.get("credential_ref")
     )
+    _check_owner(problems, f"{where}.owner", connection.get("owner"))
     auto = connection.get("auto_connect")
     if auto is not None and auto not in AUTO_CONNECT_VALUES:
         problems.append(
@@ -338,6 +340,21 @@ def _check_absolute_path(problems: list[Problem], where: str, value: Any) -> Non
                 "contains a '..' component. Store the resolved path so that what is "
                 "validated is what is used.",
             )
+        )
+
+
+def _check_owner(problems: list[Problem], where: str, value: Any) -> None:
+    """The local account whose uid the mounted files appear as.
+
+    Not a remote credential — that is `credential_ref`. This is who owns the
+    files once they are mounted, which is why the daemon defaults it from the
+    peer's own uid: the person adding a connection is the person who will use it.
+    """
+    if value is None:
+        return
+    if not isinstance(value, str) or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", value):
+        problems.append(
+            Problem(where, "must be null or a POSIX user name")
         )
 
 

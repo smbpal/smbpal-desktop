@@ -28,11 +28,12 @@ smbpal/
   system/       running commands, atomic file writes
   cli/          smbpal
   daemon/       smbpald: method dispatch and the entry point
+  mounts/       systemd units, cifs credentials, the non-blocking mountpoint probe
 packaging/debian/
 tests/
 ```
 
-`mounts/`, `state/` and `gui/` arrive with M4–M6.
+`state/` and `gui/` arrive with M5 and M6.
 
 ## Running it
 
@@ -57,7 +58,7 @@ In production it is a root system service on `/run/smbpal/smbpald.sock`, mode
 0660, group `smbpal`. Root is not a preference: `passdb.tdb` is `0600 root:root`
 (M0 §2), so nothing short of root can touch Samba's credential store.
 
-## Status: M3 done
+## Status: M4 done
 
 **M1** — schema, validation, atomic writes, the socket, and a daemon that starts,
 loads, holds the socket and does nothing else.
@@ -68,7 +69,8 @@ loads, holds the socket and does nothing else.
 smbpal status
 smbpal share list | add <name> <path> --user <account> [--read-only] [--disabled]
                   | remove <ref> | make-writable <ref>
-smbpal connection list | add <host> <share> <mountpoint> [--auto ...] | remove <ref>
+smbpal connection list | add <host> <share> <mountpoint> [--user <name>] [--auto ...]
+                       | remove <ref> | connect <ref> | disconnect <ref>
 smbpal credential list | set <account> | remove <account>
 smbpal apply
 smbpal browse
@@ -86,8 +88,19 @@ share is in the effective configuration**, and reconciles the `_smbpal._tcp`
 record. Plus `smbpal apply`, `smbpal share make-writable`, and
 `smbpal credential set/list/remove`.
 
-Connections are still **recorded but not mounted** — that is M4, which is why
-`status` reports their state as `unknown` rather than guessing.
+**M4** — connections are mounted. `connection add` writes a systemd `.mount`
+and `.automount` pair, stores the remote credential in a `0600` root-owned file,
+and enables the automount so the mount happens on **first access** rather than
+during boot. Plus `connection connect` / `disconnect`.
+
+**The mountpoint is never touched to answer a question.** M0 §4 found that with
+the remote absent, a plain `ls` on a cifs mount blocked for a protracted period
+before `soft` let it fail. So `status` answers "is it mounted?" from
+`/proc/self/mountinfo`, a kernel table that cannot block. The expensive question
+— "is it reachable?" — runs on a throwaway thread with our own timeout, returns
+`checking` if it does not answer, and never starts a second probe for a
+mountpoint that already has one stuck. There is a test that fails if `plan()`
+ever calls `stat`.
 
 Three properties worth knowing:
 
@@ -109,6 +122,30 @@ Three properties worth knowing:
 - **`smbpal connect` became `smbpal connection add`.** The plan lists `connect`
   in a sentence of examples; making it a noun group symmetrical with `share`
   means one shape to learn instead of two.
+
+### Left for M5, deliberately
+
+- **The `.local`-with-an-IP-fallback rule (§3e).** Recording a fallback address
+  is trivial; *using* it only means something once there is failure handling to
+  use it, and that is M5's state machine. Recording it now would be half a
+  feature that looks like a whole one.
+- **Translating the mount errno.** M0 §4 found a rejected password reaching the
+  user as `No such device` while `Permission denied` sat in the unit's journal.
+  `systemd.show()` exists and returns what M5 needs; nothing reads it yet.
+
+### Needs one check on real hardware
+
+`escape_path` implements systemd's path escaping from the documented algorithm
+rather than shelling out to `systemd-escape`, so it is testable anywhere. It
+agrees with the one case M0 confirmed (`/mnt/m0` → `mnt-m0`). **The other cases
+— a hyphen, a leading dot, non-ASCII — are untested against real systemd.**
+Worth a one-line spot check on the Pi:
+
+```sh
+for p in /mnt/m0 /mnt/my-share /.dotdir "/srv/a b"; do
+    printf '%-16s %s\n' "$p" "$(systemd-escape -p --suffix=mount "$p")"
+done
+```
 
 ### Known interim: authorisation
 
