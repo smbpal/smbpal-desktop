@@ -37,8 +37,7 @@ def escape_path(path: str) -> str:
 
     **Verified against `systemd-escape -p --suffix=mount` on Pi OS, 20 August
     2026** for `/mnt/m0`, `/mnt/my-share`, `/.dotdir` and `/srv/a b` — all four
-    agree. Multi-byte UTF-8 is still only the documented per-byte rule and has
-    not been checked against real systemd.
+    agree, as does multi-byte UTF-8 (`/srv/\u00e9`).
     """
     collapsed = _SLASHES.sub("/", path).strip("/")
     if not collapsed:

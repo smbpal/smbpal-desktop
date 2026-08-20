@@ -146,9 +146,10 @@ all four agree, and the expected values are a fixture in `tests/test_mounts.py`:
 /srv/a b         srv-a\x20b.mount
 ```
 
-Multi-byte UTF-8 is still the documented per-byte rule only, and unverified. A
-share path with non-ASCII in it is unusual but not impossible, and the failure
-mode is a unit name systemd never matches — a mount that silently never happens.
+Multi-byte UTF-8 (`/srv/é` → `srv-\xc3\xa9.mount`) was confirmed in the same
+pass. The failure mode this was guarding against is the bad one: a unit name
+systemd never matches, so a mount that silently never happens rather than one
+that errors.
 
 ### Known interim: authorisation
 

@@ -55,8 +55,7 @@ class TestEscaping(unittest.TestCase):
         self.assertEqual(units.escape_path("/mnt/a.b"), "mnt-a.b")
 
     def test_non_ascii_escapes_per_byte(self) -> None:
-        # The documented rule only — unlike the four cases above, this one has
-        # not been checked against real systemd.
+        # Confirmed on the Pi alongside the four above.
         self.assertEqual(units.escape_path("/srv/\u00e9"), "srv-" + chr(92) + "xc3" + chr(92) + "xa9")
 
 
