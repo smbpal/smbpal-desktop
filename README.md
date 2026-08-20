@@ -48,14 +48,43 @@ In production it is a root system service on `/run/smbpal/smbpald.sock`, mode
 0660, group `smbpal`. Root is not a preference: `passdb.tdb` is `0600 root:root`
 (M0 §2), so nothing short of root can touch Samba's credential store.
 
-## Status: M1 done
+## Status: M2 done
 
-Schema, validation, atomic writes, the socket, and a daemon that starts, loads,
-holds the socket and does nothing else. Three methods — `ping`, `version`,
-`config.get`.
+**M1** — schema, validation, atomic writes, the socket, and a daemon that starts,
+loads, holds the socket and does nothing else.
 
-**One deviation from the plan's D7 example**, flagged rather than made quietly:
-its share record carries `auto_connect`, which reads as a copy-paste from the
-connection record next to it — a share is served, it does not connect to
-anything. Shares here take `enabled` instead. See `phase-1-plan.md` §2 D7.
+**M2** — the CLI, and the daemon methods behind it:
+
+```sh
+smbpal status
+smbpal share list | add <name> <path> [--read-only] [--disabled] | remove <ref>
+smbpal connection list | add <host> <share> <mountpoint> [--auto ...] | remove <ref>
+smbpal browse
+smbpal ping
+```
+
+Every command takes `--json`. Exit codes separate the cases a script cares
+about: `0` worked, `1` the daemon refused, `2` the command line was wrong, `3`
+no daemon.
+
+Shares and connections are **recorded but not yet applied** — nothing writes
+`smb.conf` or mounts anything until M3 and M4, which is why `status` reports
+their state as `unknown` rather than guessing.
+
+### Two deviations from the plan, flagged rather than made quietly
+
+- **D7's share record carried `auto_connect`**, which reads as a copy-paste from
+  the connection record next to it — a share is served, it does not connect to
+  anything. Shares take `enabled`. The plan is corrected.
+- **`smbpal connect` became `smbpal connection add`.** The plan lists `connect`
+  in a sentence of examples; making it a noun group symmetrical with `share`
+  means one shape to learn instead of two.
+
+### Known interim: authorisation
+
+Mutating methods currently accept any peer that got through the socket's `0660
+root:smbpal` guard — so *may talk* and *may act* are the same answer, which is
+not what D4 says. polkit is the plan's answer and ships with the policy file at
+M7. The seam is `Authoriser.check`, every mutation is audited to
+`smbpal.audit`, and the daemon logs the policy in force at startup.
 

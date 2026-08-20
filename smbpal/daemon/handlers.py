@@ -1,25 +1,27 @@
 """Method dispatch, and the one place authorisation happens.
 
-M1's method set is deliberately tiny — the milestone is "a daemon that starts,
-loads, holds the socket, and does nothing else". What is not tiny is the shape:
-every request is untrusted, every reply is framed, and every method passes the
-authoriser before it runs. Adding a mutating method in M3 should require no new
-security thinking, only a new entry in the table.
+Every request is untrusted, every reply is framed, and every method passes the
+authoriser before it runs. Adding a method should need a new entry in the table
+and no new security thinking.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Callable
 
 from smbpal import PROTOCOL_VERSION, __version__
 from smbpal.config import ConfigStore
-from smbpal.errors import NotPermitted, SmbpalError, UnknownMethod
+from smbpal.config import operations as ops
+from smbpal.discovery import discover
+from smbpal.errors import InvalidParams, NotPermitted, SmbpalError, UnknownMethod
 from smbpal.ipc.peer import PeerCredentials
 from smbpal.ipc.protocol import Request, encode_failure, encode_success, parse_request
 from smbpal.ipc.transport import Connection
 
 log = logging.getLogger(__name__)
+audit = logging.getLogger("smbpal.audit")
 
 Method = Callable[["Dispatcher", Request, PeerCredentials], Any]
 
@@ -27,18 +29,41 @@ Method = Callable[["Dispatcher", Request, PeerCredentials], Any]
 class Authoriser:
     """Decides *may act*, which the socket's group guard does not answer (D4).
 
-    Phase 1 has no mutating methods yet, so this currently only separates read
-    from write. **The polkit check goes here** when M3 adds the first method
-    that changes something — one place, not scattered through the handlers.
+    **Interim policy, and stated rather than implied.** The plan's answer is
+    polkit, which ships with the policy file at M7. Until then, mutating
+    methods require root or a peer that got through the socket's 0660
+    root:smbpal guard — which is to say, for now *may talk* and *may act* are
+    the same answer. The seam is this one method, so replacing it is a local
+    change, and every mutation is audited in the meantime.
     """
 
-    # Methods that only read. Everything not listed is treated as mutating.
-    READ_ONLY = frozenset({"ping", "version", "config.get"})
+    READ_ONLY = frozenset(
+        {
+            "ping",
+            "version",
+            "config.get",
+            "status",
+            "share.list",
+            "connection.list",
+            "browse",
+        }
+    )
+
+    def __init__(self, *, allow_group_mutation: bool = True) -> None:
+        self.allow_group_mutation = allow_group_mutation
+
+    def policy_note(self) -> str:
+        if self.allow_group_mutation:
+            return (
+                "authorisation: mutations allowed for any peer past the socket's "
+                "group guard (polkit lands with the policy file at M7)"
+            )
+        return "authorisation: mutations require uid 0"
 
     def check(self, peer: PeerCredentials, method: str) -> None:
         if method in self.READ_ONLY:
             return
-        if peer.uid == 0:
+        if peer.uid == 0 or self.allow_group_mutation:
             return
         raise NotPermitted(
             f"{method} requires authorisation",
@@ -50,10 +75,7 @@ class Dispatcher:
     """Turns framed bytes into framed bytes. Owns nothing it does not need to."""
 
     def __init__(
-        self,
-        store: ConfigStore,
-        *,
-        authoriser: Authoriser | None = None,
+        self, store: ConfigStore, *, authoriser: Authoriser | None = None
     ) -> None:
         self.store = store
         self.authoriser = authoriser or Authoriser()
@@ -62,12 +84,12 @@ class Dispatcher:
         request: Request | None = None
         try:
             request = parse_request(frame)
-            # Existence before permission. Answering "requires authorisation" for
-            # a method that does not exist sends someone hunting for a
+            # Existence before permission. Answering "requires authorisation"
+            # for a method that does not exist sends someone hunting for a
             # permission problem they do not have — the same failure mode M0 §4
             # found in `No such device` for a rejected password. The socket is
-            # group-guarded, so the method names are not a secret from anyone
-            # who can ask.
+            # group-guarded, so method names are not a secret from anyone who
+            # can ask.
             method = _METHODS.get(request.method)
             if method is None:
                 raise UnknownMethod(f"no such method: {request.method}")
@@ -83,13 +105,15 @@ class Dispatcher:
             )
             return encode_failure(request.id if request else None, exc)
         except Exception:  # noqa: BLE001 - a handler bug must not kill the daemon
-            log.exception("unhandled error in %s", request.method if request else "<unparsed>")
+            log.exception(
+                "unhandled error in %s", request.method if request else "<unparsed>"
+            )
             return encode_failure(
                 request.id if request else None,
                 SmbpalError("the daemon hit an internal error; see its journal"),
             )
 
-    # --- methods -----------------------------------------------------------
+    # --- diagnostics -------------------------------------------------------
 
     def _ping(self, _request: Request, _peer: PeerCredentials) -> dict[str, Any]:
         return {"pong": True}
@@ -102,9 +126,140 @@ class Dispatcher:
         # (D12), so the file and memory cannot disagree, and reading proves it.
         return self.store.load()
 
+    def _status(self, _request: Request, _peer: PeerCredentials) -> dict[str, Any]:
+        config = self.store.load()
+        return {
+            "daemon": {
+                "version": __version__,
+                "protocol": PROTOCOL_VERSION,
+                "pid": os.getpid(),
+                "config": str(self.store.path),
+            },
+            # "unknown" rather than a guess. Nothing serves or mounts yet, and
+            # a status line that claims otherwise is the lie D12 warns about.
+            # M5 replaces these with real state, pushed rather than polled.
+            "shares": [
+                {**share, "state": "unknown"} for share in config.get("shares", [])
+            ],
+            "connections": [
+                {**conn, "state": "unknown"} for conn in config.get("connections", [])
+            ],
+        }
+
+    # --- shares ------------------------------------------------------------
+
+    def _share_list(self, _request: Request, _peer: PeerCredentials) -> list[Any]:
+        return self.store.load().get("shares", [])
+
+    def _share_add(self, request: Request, peer: PeerCredentials) -> dict[str, Any]:
+        params = request.params
+        name = _require_str(params, "name")
+        path = _require_str(params, "path")
+        updated, share = ops.add_share(
+            self.store.load(),
+            name=name,
+            path=path,
+            id=_optional_str(params, "id"),
+            read_only=_optional_bool(params, "read_only", default=False),
+            credential_ref=_optional_str(params, "credential_ref"),
+            enabled=_optional_bool(params, "enabled", default=True),
+        )
+        self.store.save(updated)
+        _audit(peer, "share.add", share["id"])
+        # M3 wires this to smb.conf. Until then the record exists and nothing
+        # serves it — which is why `status` reports "unknown" rather than "up".
+        return share
+
+    def _share_remove(self, request: Request, peer: PeerCredentials) -> dict[str, Any]:
+        ref = _require_str(request.params, "ref")
+        updated, share = ops.remove_share(self.store.load(), ref)
+        self.store.save(updated)
+        _audit(peer, "share.remove", share["id"])
+        return share
+
+    # --- connections -------------------------------------------------------
+
+    def _connection_list(self, _request: Request, _peer: PeerCredentials) -> list[Any]:
+        return self.store.load().get("connections", [])
+
+    def _connection_add(self, request: Request, peer: PeerCredentials) -> dict[str, Any]:
+        params = request.params
+        updated, connection = ops.add_connection(
+            self.store.load(),
+            host=_require_str(params, "host"),
+            share=_require_str(params, "share"),
+            mountpoint=_require_str(params, "mountpoint"),
+            id=_optional_str(params, "id"),
+            credential_ref=_optional_str(params, "credential_ref"),
+            auto_connect=_optional_str(params, "auto_connect") or "on_this_network",
+        )
+        self.store.save(updated)
+        _audit(peer, "connection.add", connection["id"])
+        return connection
+
+    def _connection_remove(
+        self, request: Request, peer: PeerCredentials
+    ) -> dict[str, Any]:
+        ref = _require_str(request.params, "ref")
+        updated, connection = ops.remove_connection(self.store.load(), ref)
+        self.store.save(updated)
+        _audit(peer, "connection.remove", connection["id"])
+        return connection
+
+    # --- discovery ---------------------------------------------------------
+
+    def _browse(self, request: Request, _peer: PeerCredentials) -> list[Any]:
+        # §3e: the browse belongs to the daemon, not the GUI — the CLI needs it
+        # too, and M5 already owns a channel to push a live list over.
+        timeout = request.params.get("timeout", 5.0)
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
+            raise InvalidParams("'timeout' must be a number of seconds")
+        timeout = max(1.0, min(float(timeout), 30.0))
+        return [machine.to_wire() for machine in discover(timeout=timeout)]
+
+
+def _audit(peer: PeerCredentials, method: str, subject: str) -> None:
+    # An audit line carries who and what, never any parameter that could hold a
+    # secret. M0 §9: sudo journals the full command line, and anyone in `adm`
+    # can read it.
+    audit.info("%s %s by %s", method, subject, peer.describe())
+
+
+def _require_str(params: dict[str, Any], key: str) -> str:
+    value = params.get(key)
+    if not isinstance(value, str) or not value:
+        raise InvalidParams(f"'{key}' is required and must be a non-empty string")
+    return value
+
+
+def _optional_str(params: dict[str, Any], key: str) -> str | None:
+    value = params.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise InvalidParams(f"'{key}' must be a string when present")
+    return value
+
+
+def _optional_bool(params: dict[str, Any], key: str, *, default: bool) -> bool:
+    value = params.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise InvalidParams(f"'{key}' must be true or false when present")
+    return value
+
 
 _METHODS: dict[str, Method] = {
     "ping": Dispatcher._ping,
     "version": Dispatcher._version,
+    "status": Dispatcher._status,
     "config.get": Dispatcher._config_get,
+    "share.list": Dispatcher._share_list,
+    "share.add": Dispatcher._share_add,
+    "share.remove": Dispatcher._share_remove,
+    "connection.list": Dispatcher._connection_list,
+    "connection.add": Dispatcher._connection_add,
+    "connection.remove": Dispatcher._connection_remove,
+    "browse": Dispatcher._browse,
 }

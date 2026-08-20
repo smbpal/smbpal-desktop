@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from smbpal.errors import ConfigInvalid
 
@@ -116,16 +116,28 @@ def validate(doc: Any) -> list[Problem]:
     return problems
 
 
-def validate_or_raise(doc: Any, *, source: str) -> dict[str, Any]:
-    """Validate and return `doc`, or raise ConfigInvalid naming every problem."""
+def validate_or_raise(
+    doc: Any, *, source: str, relabel: Callable[[str], str] | None = None
+) -> dict[str, Any]:
+    """Validate and return `doc`, or raise ConfigInvalid naming every problem.
+
+    `relabel` rewrites the `where` of each problem. A caller adding one record
+    knows which one it is, and `shares[2].name` is an array index the person who
+    typed a share name never saw. Turning it into `name` is the difference
+    between a message they can act on and one they have to decode.
+    """
     problems = validate(doc)
-    if problems:
-        joined = "\n".join(f"  - {p}" for p in problems)
-        raise ConfigInvalid(
-            f"{source} is not a valid SMBPal config",
-            detail=f"{len(problems)} problem(s):\n{joined}",
-        )
-    return doc
+    if not problems:
+        return doc
+    labelled = [
+        Problem(relabel(p.where) if relabel else p.where, p.message) for p in problems
+    ]
+    count = len(labelled)
+    joined = "\n".join(f"  - {p}" for p in labelled)
+    raise ConfigInvalid(
+        source,
+        detail=f"{count} problem{'' if count == 1 else 's'}:\n{joined}",
+    )
 
 
 # --- element validators ----------------------------------------------------

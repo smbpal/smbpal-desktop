@@ -63,6 +63,28 @@ class NotPermitted(SmbpalError):
     code = "not_permitted"
 
 
+class NotFound(SmbpalError):
+    """No share or connection by that id or name."""
+
+    code = "not_found"
+
+
+class AlreadyExists(SmbpalError):
+    """A share or connection with that id or name is already configured."""
+
+    code = "already_exists"
+
+
+class Unavailable(SmbpalError):
+    """The daemon cannot answer because something it needs is not present.
+
+    Distinct from an internal error: nothing is broken, a capability is simply
+    absent — `avahi-browse` not installed, discovery not running.
+    """
+
+    code = "unavailable"
+
+
 class DaemonUnreachable(SmbpalError):
     """Client-side: no daemon at the socket.
 

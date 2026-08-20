@@ -97,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     dispatcher = Dispatcher(store)
+    log.info("%s", dispatcher.authoriser.policy_note())
     _install_signal_handlers(transport)
     _sd_notify("READY=1")
     log.info("smbpald %s ready", __version__)

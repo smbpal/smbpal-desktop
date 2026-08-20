@@ -203,20 +203,26 @@ class TestPeerAndAuthorisation(ServerTestCase):
         self.assertEqual(seen[0].uid, os.getuid())
         self.assertEqual(seen[0].gid, os.getgid())
 
-    def test_a_mutating_method_is_refused_for_a_non_root_peer(self) -> None:
-        # Nothing mutates yet, so register one to prove the gate rather than a
-        # feature: anything absent from READ_ONLY needs uid 0 until polkit
-        # lands in M3.
+    def test_the_strict_policy_refuses_a_mutation_from_a_non_root_peer(self) -> None:
         if os.getuid() == 0:
             self.skipTest("running as root; the refusal path needs a non-root peer")
-
-        from smbpal.daemon import handlers
-
-        handlers._METHODS["test.mutate"] = lambda *_a: {"changed": True}
-        self.addCleanup(handlers._METHODS.pop, "test.mutate", None)
-
+        self.dispatcher.authoriser = Authoriser(allow_group_mutation=False)
         with self.assertRaises(NotPermitted):
-            self.client().call("test.mutate")
+            self.client().call("share.add", {"name": "X", "path": "/srv/x"})
+
+    def test_the_interim_policy_allows_a_peer_past_the_socket_guard(self) -> None:
+        # Stated rather than implied: until polkit ships with the policy file at
+        # M7, *may talk* and *may act* are the same answer. This test exists so
+        # that changing the policy breaks something visible.
+        self.assertTrue(self.dispatcher.authoriser.allow_group_mutation)
+        self.assertIn("polkit", self.dispatcher.authoriser.policy_note())
+        share = self.client().call("share.add", {"name": "X", "path": "/srv/x"})
+        self.assertEqual(share["id"], "x")
+
+    def test_read_only_methods_never_reach_the_mutation_gate(self) -> None:
+        self.dispatcher.authoriser = Authoriser(allow_group_mutation=False)
+        self.assertEqual(self.client().call("ping"), {"pong": True})
+        self.assertEqual(self.client().call("share.list"), [])
 
     def test_an_unknown_method_says_so_rather_than_blaming_permissions(self) -> None:
         with self.assertRaises(UnknownMethod):
