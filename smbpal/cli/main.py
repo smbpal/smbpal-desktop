@@ -354,6 +354,8 @@ def _cmd_share_add(client: Client, args: argparse.Namespace) -> int:
     )
     def human() -> str:
         lines = [f"added share {share['name']!r} ({share['id']}) at {share['path']}"]
+        if share.get("note"):
+            lines.append(f"  {share['note']}")
         lines.extend(_read_only_notes([share]))
         return "\n".join(lines)
 

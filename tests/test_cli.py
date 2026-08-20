@@ -138,6 +138,17 @@ class TestConnections(CliTestCase):
         )
 
 
+class TestNoApply(CliTestCase):
+    def test_a_config_only_daemon_says_the_share_is_not_being_served(self) -> None:
+        # D12: a config edit the daemon has not applied is a lie. This test case
+        # runs without an applier, which is exactly --no-apply, so every add is
+        # one unless it says so.
+        code, out, _ = self.run_cli("share", "add", "Test", "/srv/test")
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("recorded only", out)
+        self.assertIn("--no-apply", out)
+
+
 class TestErrors(CliTestCase):
     def test_no_traceback_ever_reaches_the_user(self) -> None:
         code, out, err = self.run_cli("share", "add", "bad\nname", "/srv/x")

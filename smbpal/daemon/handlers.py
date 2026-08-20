@@ -168,6 +168,17 @@ class Dispatcher:
     def _describe(self, share: dict[str, Any], report: Any) -> dict[str, Any]:
         """Merge §3c's effective state into the record the caller gets back."""
         if report is None:
+            # D12: "a config edit that the daemon has not applied is a lie."
+            # Under --no-apply every edit is exactly that, so the record says so
+            # rather than reporting a bare success the caller would read as
+            # "it is being served".
+            if self.applier is None and self.mounter is None:
+                return {
+                    **share,
+                    "applied": False,
+                    "note": "recorded only — this daemon was started with "
+                    "--no-apply and is not touching Samba",
+                }
             return share
         for planned in report.shares:
             if planned.share.get("id") == share.get("id"):
