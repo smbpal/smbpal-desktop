@@ -91,6 +91,27 @@ class TestMachine(unittest.TestCase):
         self.assertEqual(state.state, machine.IDLE)
         self.assertFalse(state.is_problem)
 
+    def test_an_unarmed_automount_is_not_reported_as_ready(self) -> None:
+        # The same error class as counting autofs as mounted: claiming a state
+        # we cannot back up. If nothing is armed, nothing mounts on access.
+        state = machine.derive(
+            self.CONNECTION,
+            mounted=False,
+            unit={"ActiveState": "inactive", "Result": "success"},
+            armed=False,
+        )
+        self.assertEqual(state.state, machine.FAILED)
+        self.assertIn("smbpal apply", state.message)
+
+    def test_an_armed_automount_is_idle(self) -> None:
+        state = machine.derive(
+            self.CONNECTION,
+            mounted=False,
+            unit={"ActiveState": "inactive", "Result": "success"},
+            armed=True,
+        )
+        self.assertEqual(state.state, machine.IDLE)
+
     def test_mounted_is_connected(self) -> None:
         state = machine.derive(self.CONNECTION, mounted=True, unit=None)
         self.assertEqual(state.state, machine.CONNECTED)
@@ -133,12 +154,20 @@ class MonitorTestCase(unittest.TestCase):
         self.addCleanup(self._dir.cleanup)
         self.root = Path(self._dir.name)
         (self.root / "units").mkdir()
-        (self.root / "mountinfo").write_text("", encoding="utf-8")
+        # An applied connection has an armed automount sitting on the
+        # mountpoint. An empty table would mean nothing was armed, which is a
+        # different — and now correctly reported — situation.
+        self.mountinfo = self.root / "mountinfo"
+        self.armed = (
+            "36 25 0:31 / /mnt/nas rw,relatime shared:22 - autofs systemd-1 "
+            "rw,fd=39,pgrp=1,timeout=0,direct\n"
+        )
+        self.mountinfo.write_text(self.armed, encoding="utf-8")
         self.samba = FakeSamba(self.root / "smb.conf")
         self.mounter = Mounter(
             unit_dir=self.root / "units",
             credentials=CredentialsStore(self.root / "creds"),
-            probe=MountProbe(mountinfo=self.root / "mountinfo"),
+            probe=MountProbe(mountinfo=self.mountinfo),
             runner=self.samba,
         )
         self.store = ConfigStore(self.root / "config.json")

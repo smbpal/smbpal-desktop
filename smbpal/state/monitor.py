@@ -120,6 +120,7 @@ class StateMonitor:
     def _state_of(self, connection: dict[str, Any]) -> ConnectionState:
         mount_name, _ = units.unit_names(connection["mountpoint"])
         mounted = self.mounter.probe.is_mounted(connection["mountpoint"])
+        armed = self.mounter.probe.is_armed(connection["mountpoint"])
         unit: dict[str, str] | None
         try:
             unit = systemd.show(mount_name, runner=self.runner)
@@ -135,7 +136,9 @@ class StateMonitor:
             # Only here. The journal is the expensive read and its answer does
             # not change while the failure does not.
             cause = self._journal_cause(mount_name)
-        return derive(connection, mounted=mounted, unit=unit, cause=cause)
+        return derive(
+            connection, mounted=mounted, unit=unit, cause=cause, armed=armed
+        )
 
     def _journal_cause(self, unit_name: str) -> Cause | None:
         execute = self.runner or run

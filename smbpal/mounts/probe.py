@@ -13,6 +13,15 @@ and "is it reachable?" are different questions with different costs.**
 never touches the remote filesystem, so it cannot block, and it is the question
 almost every caller actually has.
 
+**But the mountpoint appearing in that table is not the answer.** An armed
+automount *is* a mount: autofs occupies the mountpoint from the moment the unit
+is enabled, whether or not the cifs mount underneath has ever happened. When the
+real mount succeeds, both appear, stacked on the same path. So the filesystem
+type is the thing that matters, and the first version of this module — which
+matched on the path alone — reported every armed automount as connected. It
+survived its tests because the fixture contained only `cifs` lines: it agreed
+with the assumption instead of testing it. Found on real hardware.
+
 *Reachable* requires touching the filesystem, so it can block for as long as the
 kernel decides. It runs on a throwaway thread with our own timeout, and the
 caller gets an answer — including "still checking" — within that timeout no
@@ -40,6 +49,10 @@ DEFAULT_CACHE_SECONDS = 10.0
 # mountinfo escapes space, tab, newline and backslash as octal.
 _OCTAL = re.compile(r"\\(\d{3})")
 
+# autofs is the trigger, not the filesystem. Anything else at the mountpoint is
+# a real mount.
+AUTOFS = "autofs"
+
 MOUNTED = "mounted"
 UNREACHABLE = "unreachable"
 NOT_MOUNTED = "not mounted"
@@ -53,24 +66,62 @@ class Reachability:
     checked_at: float
 
 
-def mounted_paths(mountinfo: Path | str = DEFAULT_MOUNTINFO) -> set[str] | None:
-    """Every mountpoint the kernel currently has, or None if we cannot tell.
+@dataclass(frozen=True)
+class MountEntry:
+    mountpoint: str
+    fstype: str
+    source: str
+
+
+def mount_entries(
+    mountinfo: Path | str = DEFAULT_MOUNTINFO,
+) -> list[MountEntry] | None:
+    """Every mount the kernel currently has, or None if we cannot tell.
 
     Reading this file does not touch any mounted filesystem, so a dead NAS
     cannot make this call slow. That is the whole reason it is used in
     preference to `os.path.ismount`, which stats the path and its parent.
+
+    The filesystem type comes from after the `-` separator, which is what
+    distinguishes an armed automount from a mount that actually happened.
     """
     try:
         text = Path(mountinfo).read_text(encoding="utf-8")
     except OSError:
         # No procfs — a development Mac. "Unknown" is honest; guessing is not.
         return None
-    paths: set[str] = set()
+
+    entries: list[MountEntry] = []
     for line in text.splitlines():
         fields = line.split()
-        if len(fields) >= 5:
-            paths.add(_unescape(fields[4]))
-    return paths
+        if len(fields) < 8:
+            continue
+        try:
+            # A variable number of optional fields sits between the mount
+            # options and the separator, so the separator is found rather than
+            # counted to. Searching from 6 avoids matching an earlier field
+            # that happens to be a bare "-".
+            separator = fields.index("-", 6)
+        except ValueError:
+            continue
+        if len(fields) < separator + 3:
+            continue
+        entries.append(
+            MountEntry(
+                mountpoint=_unescape(fields[4]),
+                fstype=fields[separator + 1],
+                source=_unescape(fields[separator + 2]),
+            )
+        )
+    return entries
+
+
+def mounted_paths(mountinfo: Path | str = DEFAULT_MOUNTINFO) -> set[str] | None:
+    """Mountpoints carrying a real filesystem — autofs triggers excluded."""
+    entries = mount_entries(mountinfo)
+    if entries is None:
+        return None
+    return {e.mountpoint for e in entries if e.fstype != AUTOFS}
 
 
 def _unescape(value: str) -> str:
@@ -97,10 +148,23 @@ class MountProbe:
     # --- the cheap question ------------------------------------------------
 
     def is_mounted(self, mountpoint: str) -> bool | None:
-        paths = mounted_paths(self.mountinfo)
-        if paths is None:
+        """Is a real filesystem mounted here — not merely an automount trigger."""
+        return self._has(mountpoint, autofs=False)
+
+    def is_armed(self, mountpoint: str) -> bool | None:
+        """Is an automount waiting here? Healthy, and not the same as mounted."""
+        return self._has(mountpoint, autofs=True)
+
+    def _has(self, mountpoint: str, *, autofs: bool) -> bool | None:
+        entries = mount_entries(self.mountinfo)
+        if entries is None:
             return None
-        return os.path.normpath(mountpoint) in {os.path.normpath(p) for p in paths}
+        wanted = os.path.normpath(mountpoint)
+        return any(
+            os.path.normpath(e.mountpoint) == wanted
+            and (e.fstype == AUTOFS) == autofs
+            for e in entries
+        )
 
     # --- the expensive one -------------------------------------------------
 

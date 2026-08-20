@@ -159,10 +159,17 @@ class TestProbeNeverBlocks(unittest.TestCase):
         self.addCleanup(self._dir.cleanup)
         self.root = Path(self._dir.name)
         self.mountinfo = self.root / "mountinfo"
-        self.mountinfo.write_text(
-            "26 1 0:24 / /mnt/nas rw,relatime shared:1 - cifs //r/M rw\n",
-            encoding="utf-8",
+        # Verbatim shape from a Pi: an armed automount and the cifs mount that
+        # appears under it, stacked on the same mountpoint.
+        self.armed = (
+            "36 25 0:31 / /mnt/nas rw,relatime shared:22 - autofs systemd-1 "
+            "rw,fd=39,pgrp=1,timeout=0,minproto=5,maxproto=5,direct\n"
         )
+        self.real = (
+            "83 36 0:44 / /mnt/nas rw,relatime shared:45 - cifs "
+            "//rivendell.local/Media rw,vers=3.1.1,uid=1000,forceuid\n"
+        )
+        self.mountinfo.write_text(self.armed + self.real, encoding="utf-8")
 
     def test_is_mounted_never_touches_the_filesystem(self) -> None:
         # The whole point: "is it mounted" is answered from the kernel's table,
@@ -224,10 +231,40 @@ class TestProbeNeverBlocks(unittest.TestCase):
 
     def test_a_mountpoint_with_a_space_is_matched(self) -> None:
         self.mountinfo.write_text(
-            "26 1 0:24 / /mnt/with\\040space rw - cifs //r/M rw\n", encoding="utf-8"
+            "26 1 0:24 / /mnt/with\\040space rw shared:1 - cifs //r/M rw\n",
+            encoding="utf-8",
         )
         probe = probe_module.MountProbe(mountinfo=self.mountinfo)
         self.assertTrue(probe.is_mounted("/mnt/with space"))
+
+    def test_an_armed_automount_alone_is_not_mounted(self) -> None:
+        # The bug this replaced: autofs occupies the mountpoint from the moment
+        # the unit is enabled, so matching on the path alone reported every
+        # armed automount as connected. Found on the Pi, where `status` said
+        # connected while `ls` returned `No such device`.
+        self.mountinfo.write_text(self.armed, encoding="utf-8")
+        probe = probe_module.MountProbe(mountinfo=self.mountinfo)
+        self.assertFalse(probe.is_mounted("/mnt/nas"))
+        self.assertTrue(probe.is_armed("/mnt/nas"))
+        self.assertEqual(probe.state("/mnt/nas"), probe_module.NOT_MOUNTED)
+
+    def test_the_cifs_mount_under_an_armed_automount_counts(self) -> None:
+        probe = probe_module.MountProbe(mountinfo=self.mountinfo)
+        self.assertTrue(probe.is_mounted("/mnt/nas"))
+        self.assertEqual(probe.state("/mnt/nas"), probe_module.MOUNTED)
+
+    def test_the_filesystem_type_and_source_are_read_from_past_the_separator(
+        self,
+    ) -> None:
+        entries = probe_module.mount_entries(self.mountinfo)
+        self.assertEqual(
+            [(e.fstype, e.source) for e in entries],
+            [("autofs", "systemd-1"), ("cifs", "//rivendell.local/Media")],
+        )
+
+    def test_a_line_with_no_separator_is_skipped_rather_than_misread(self) -> None:
+        self.mountinfo.write_text("garbage line with no dash field\n", encoding="utf-8")
+        self.assertEqual(probe_module.mount_entries(self.mountinfo), [])
 
 
 class TestMounter(unittest.TestCase):

@@ -71,6 +71,7 @@ def derive(
     mounted: bool | None,
     unit: dict[str, str] | None,
     cause: Cause | None = None,
+    armed: bool | None = None,
 ) -> ConnectionState:
     """Work out the state from the mount table, the unit, and the journal.
 
@@ -116,6 +117,18 @@ def derive(
             retryable=True,
         )
 
-    # Not mounted, not failed: the automount is armed and waiting for someone to
-    # look at the directory. Healthy.
+    if armed is False:
+        # Not mounted, not failed, and no autofs trigger on the mountpoint —
+        # so nothing will happen when someone looks at it. Saying "ready" here
+        # would be the same mistake as counting an armed automount as mounted:
+        # claiming a state we cannot back up.
+        return ConnectionState(
+            identifier,
+            FAILED,
+            "the automount is not running, so nothing will mount on access — "
+            "try `smbpal apply`",
+        )
+
+    # Not mounted, not failed, trigger in place: the automount is armed and
+    # waiting for someone to look at the directory. Healthy.
     return ConnectionState(identifier, IDLE, "ready; it will mount on first access")
