@@ -35,7 +35,7 @@ class TestParse(unittest.TestCase):
     def test_a_semicolon_in_a_name_does_not_shift_every_later_field(self) -> None:
         # avahi escapes rather than quotes, so a naive split(';') would tear the
         # name in half and misread the address as the domain.
-        line = "=;wlan0;IPv4;we\;ird;_smb._tcp;local;host.local;10.0.0.5;445;"
+        line = r"=;wlan0;IPv4;we\;ird;_smb._tcp;local;host.local;10.0.0.5;445;"
         service = parse(line)[0]
         self.assertEqual(service.name, "we;ird")
         self.assertEqual(service.address, "10.0.0.5")
