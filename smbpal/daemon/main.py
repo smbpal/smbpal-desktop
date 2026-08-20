@@ -21,7 +21,9 @@ from smbpal import __version__
 from smbpal.config import ConfigStore
 from smbpal.config.store import DEFAULT_CONFIG_PATH
 from smbpal.daemon.handlers import Dispatcher
+from smbpal.discovery.advertise import DEFAULT_SERVICE_FILE, Advertiser
 from smbpal.errors import SmbpalError
+from smbpal.samba.apply import DEFAULT_SMB_CONF, DEFAULT_SMBPAL_CONF, Applier
 from smbpal.ipc.server import (
     DEFAULT_SOCKET_GROUP,
     DEFAULT_SOCKET_PATH,
@@ -56,6 +58,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--check",
         action="store_true",
         help="validate the config and exit without binding anything",
+    )
+    parser.add_argument(
+        "--no-apply",
+        action="store_true",
+        help="never touch Samba or Avahi; hold config only. For development on "
+        "a machine without Samba installed.",
+    )
+    parser.add_argument(
+        "--smb-conf", type=Path, default=DEFAULT_SMB_CONF, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--smbpal-conf", type=Path, default=DEFAULT_SMBPAL_CONF, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--avahi-service", type=Path, default=DEFAULT_SERVICE_FILE, help=argparse.SUPPRESS
     )
     parser.add_argument("--version", action="version", version=f"smbpald {__version__}")
     return parser
@@ -96,7 +113,26 @@ def main(argv: list[str] | None = None) -> int:
         log.error("cannot bind %s: %s", args.socket, exc)
         return 2
 
-    dispatcher = Dispatcher(store)
+    applier: Applier | None = None
+    if not args.no_apply:
+        applier = Applier(
+            smb_conf=args.smb_conf,
+            smbpal_conf=args.smbpal_conf,
+            advertiser=Advertiser(args.avahi_service),
+        )
+        # §3f: reconcile at startup rather than trusting what is on disk. A
+        # daemon that died with shares active leaves the service file behind,
+        # and a stale record advertises a machine that may no longer be sharing.
+        try:
+            applier.advertiser.reconcile(
+                len([s for s in config.get("shares", []) if s.get("enabled", True)])
+            )
+        except SmbpalError as exc:
+            log.warning("could not reconcile the mDNS record: %s", exc.message)
+    else:
+        log.info("--no-apply: holding config only, not touching Samba or Avahi")
+
+    dispatcher = Dispatcher(store, applier=applier)
     log.info("%s", dispatcher.authoriser.policy_note())
     _install_signal_handlers(transport)
     _sd_notify("READY=1")

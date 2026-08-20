@@ -16,13 +16,12 @@ true.
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from pathlib import Path
 from typing import Any
 
 from smbpal.config.schema import empty_config, validate_or_raise
 from smbpal.errors import ConfigInvalid, ConfigIOError
+from smbpal.system import atomic
 
 DEFAULT_CONFIG_PATH = Path("/etc/smbpal/config.json")
 
@@ -78,44 +77,9 @@ class ConfigStore:
         validate_or_raise(doc, source="the new config")
         body = json.dumps(doc, indent=2, sort_keys=True) + "\n"
 
-        directory = self.path.parent
         try:
-            directory.mkdir(parents=True, exist_ok=True, mode=_CONFIG_DIR_MODE)
+            atomic.write_text(
+                self.path, body, mode=_CONFIG_MODE, dir_mode=_CONFIG_DIR_MODE
+            )
         except OSError as exc:
-            raise ConfigIOError(
-                f"cannot create {directory}", detail=str(exc)
-            ) from exc
-
-        tmp_fd, tmp_name = tempfile.mkstemp(
-            dir=directory, prefix=".config-", suffix=".json.tmp"
-        )
-        tmp_path = Path(tmp_name)
-        try:
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
-                handle.write(body)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(tmp_path, _CONFIG_MODE)
-            os.replace(tmp_path, self.path)
-        except OSError as exc:
-            tmp_path.unlink(missing_ok=True)
-            raise ConfigIOError(
-                f"cannot write {self.path}", detail=str(exc)
-            ) from exc
-
-        # Rename durability: without this the directory entry can be lost to a
-        # power cut even though the file's contents were synced.
-        self._fsync_directory(directory)
-
-    @staticmethod
-    def _fsync_directory(directory: Path) -> None:
-        try:
-            fd = os.open(directory, os.O_RDONLY)
-        except OSError:
-            return  # Best effort; the data is already synced.
-        try:
-            os.fsync(fd)
-        except OSError:
-            pass
-        finally:
-            os.close(fd)
+            raise ConfigIOError(f"cannot write {self.path}", detail=str(exc)) from exc

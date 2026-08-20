@@ -15,15 +15,17 @@ Exit codes, so scripts can tell the cases apart:
 from __future__ import annotations
 
 import argparse
+import getpass
 import sys
 from pathlib import Path
 from typing import Any, Callable
 
 from smbpal import __version__
 from smbpal.cli.format import render_json, render_table
-from smbpal.errors import DaemonUnreachable, SmbpalError
+from smbpal.errors import DaemonUnreachable, NotFound, SmbpalError
 from smbpal.ipc.client import Client
 from smbpal.ipc.server import DEFAULT_SOCKET_PATH
+from smbpal.samba.passwd import posix_user_exists
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -67,10 +69,40 @@ def build_parser() -> argparse.ArgumentParser:
     share_add.add_argument(
         "--disabled", action="store_true", help="define it without serving it"
     )
-    share_add.add_argument("--credential", help="reference to a stored credential")
+    share_add.add_argument(
+        "--user",
+        dest="credential",
+        help="the system account this share is served as (§3b). Without it the "
+        "share has no 'valid users' line and SMBPal cannot check whether the "
+        "folder is writable.",
+    )
 
     share_remove = share_cmds.add_parser("remove", help="remove a share")
     share_remove.add_argument("ref", help="share id or name")
+
+    writable = share_cmds.add_parser(
+        "make-writable",
+        help="give the share's folder to its user so the share can be written",
+    )
+    writable.add_argument("ref", help="share id or name")
+
+    commands.add_parser(
+        "apply", help="re-write Samba's config from what is configured"
+    )
+
+    credential = commands.add_parser("credential", help="SMB passwords")
+    credential_cmds = credential.add_subparsers(dest="subcommand", metavar="SUBCOMMAND")
+    credential_cmds.required = True
+    credential_cmds.add_parser("list", help="list SMB accounts")
+    credential_set = credential_cmds.add_parser("set", help="set an SMB password")
+    credential_set.add_argument("username", help="an existing system account")
+    credential_set.add_argument(
+        "--stdin", action="store_true", help="read the password from stdin"
+    )
+    credential_remove = credential_cmds.add_parser(
+        "remove", help="remove an SMB account, leaving the system account alone"
+    )
+    credential_remove.add_argument("username")
 
     connection = commands.add_parser(
         "connection", help="remote shares this machine mounts"
@@ -135,7 +167,7 @@ def _cmd_status(client: Client, args: argparse.Namespace) -> int:
             _section(
                 "Shares",
                 status["shares"],
-                ("id", "name", "path", "read_only", "enabled", "state"),
+                ("id", "name", "path", "enabled", "state"),
                 "no shares configured",
             ),
             "",
@@ -175,6 +207,90 @@ def _cmd_share_list(client: Client, args: argparse.Namespace) -> int:
     )
 
 
+def _cmd_apply(client: Client, args: argparse.Namespace) -> int:
+    report = client.call("share.apply")
+
+    def human() -> str:
+        served = ", ".join(report["served"]) or "nothing"
+        lines = [f"serving {served}"]
+        if report["advertising"]:
+            lines.append("advertising _smbpal._tcp")
+        lines.extend(_read_only_notes(report["shares"]))
+        return "\n".join(lines)
+
+    return _emit(args, report, human)
+
+
+def _cmd_share_make_writable(client: Client, args: argparse.Namespace) -> int:
+    result = client.call("share.make_writable", {"ref": args.ref})
+
+    def human() -> str:
+        # Report the resulting state rather than claiming a change: the owner
+        # is often already right and only the mode moved.
+        directory = result["directory"]
+        return (
+            f"{directory['path']} is writable by the share's user "
+            f"(owner {directory['owner']}, mode {directory['mode']})"
+        )
+
+    return _emit(args, result, human)
+
+
+def _cmd_credential_list(client: Client, args: argparse.Namespace) -> int:
+    users = client.call("credential.list")
+    return _emit(
+        args,
+        users,
+        lambda: "\n".join(users) if users else "no SMB accounts",
+    )
+
+
+def _cmd_credential_set(client: Client, args: argparse.Namespace) -> int:
+    # §3b: check the account exists *before* asking for anything. smbpasswd
+    # prompts twice and only then fails, so without this the user types a
+    # password that is thrown away and gets an error too late to mean anything.
+    # Checked here rather than over IPC because the CLI is on the same host by
+    # construction — it is a Unix socket — so it is reading the same passwd.
+    if not posix_user_exists(args.username):
+        _fail(
+            NotFound(
+                f"there is no system account called {args.username!r}",
+                detail="Samba attaches an SMB password to an existing POSIX "
+                "account; it cannot create one. Phase 1 shares as an existing "
+                "user (§3b).",
+            )
+        )
+        return EXIT_ERROR
+
+    if args.stdin:
+        password = sys.stdin.readline().rstrip("\n")
+    else:
+        # getpass, so it is never echoed, never in the shell history and never
+        # in argv (M0 §9).
+        password = getpass.getpass(f"New SMB password for {args.username}: ")
+        if password != getpass.getpass("Retype: "):
+            print("smbpal: the passwords did not match", file=sys.stderr)
+            return EXIT_ERROR
+    if not password:
+        print("smbpal: the password must not be empty", file=sys.stderr)
+        return EXIT_ERROR
+
+    result = client.call(
+        "credential.set", {"username": args.username, "password": password}
+    )
+    return _emit(args, result, lambda: f"set the SMB password for {args.username}")
+
+
+def _cmd_credential_remove(client: Client, args: argparse.Namespace) -> int:
+    result = client.call("credential.remove", {"username": args.username})
+    return _emit(
+        args,
+        result,
+        lambda: f"removed the SMB account for {args.username} "
+        "(the system account is untouched)",
+    )
+
+
 def _cmd_share_add(client: Client, args: argparse.Namespace) -> int:
     share = client.call(
         "share.add",
@@ -190,11 +306,12 @@ def _cmd_share_add(client: Client, args: argparse.Namespace) -> int:
             "credential_ref": args.credential,
         },
     )
-    return _emit(
-        args,
-        share,
-        lambda: f"added share {share['name']!r} ({share['id']}) at {share['path']}",
-    )
+    def human() -> str:
+        lines = [f"added share {share['name']!r} ({share['id']}) at {share['path']}"]
+        lines.extend(_read_only_notes([share]))
+        return "\n".join(lines)
+
+    return _emit(args, share, human)
 
 
 def _cmd_share_remove(client: Client, args: argparse.Namespace) -> int:
@@ -250,10 +367,30 @@ _COMMANDS: dict[tuple[str, str | None], Handler] = {
     ("share", "list"): _cmd_share_list,
     ("share", "add"): _cmd_share_add,
     ("share", "remove"): _cmd_share_remove,
+    ("share", "make-writable"): _cmd_share_make_writable,
+    ("apply", None): _cmd_apply,
+    ("credential", "list"): _cmd_credential_list,
+    ("credential", "set"): _cmd_credential_set,
+    ("credential", "remove"): _cmd_credential_remove,
     ("connection", "list"): _cmd_connection_list,
     ("connection", "add"): _cmd_connection_add,
     ("connection", "remove"): _cmd_connection_remove,
 }
+
+
+def _read_only_notes(shares: list[dict[str, Any]]) -> list[str]:
+    """§3c: say *why* something is read-only, because only one reason has a fix."""
+    notes = []
+    for share in shares:
+        reason = share.get("read_only_reason")
+        if not reason:
+            continue
+        notes.append(f"  {reason}")
+        # Offer the fix from the structured flag, not by matching words in our
+        # own message — a reworded reason should not silently drop the hint.
+        if (share.get("directory") or {}).get("writable") is False:
+            notes.append(f"  run: smbpal share make-writable {share['id']}")
+    return notes
 
 
 def _resolve(path: str) -> str:
