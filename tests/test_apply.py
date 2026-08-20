@@ -230,6 +230,32 @@ class TestOwnership(ApplyTestCase):
         return self.smbpal_conf.read_text(encoding="utf-8")
 
 
+class TestMakeWritableWarnsAboutLiveClients(ApplyTestCase):
+    def test_the_result_says_connected_clients_keep_the_old_permissions(self) -> None:
+        # Samba applies share parameters at tree connect, so a client that was
+        # already attached when the share was read-only keeps what it
+        # negotiated. Confirmed on the Pi: a Windows client connecting fresh
+        # could write while a Mac holding an older session could not.
+        if self.me.uid == 0:
+            self.skipTest("root can write anywhere")
+        from smbpal.config import ConfigStore
+        from smbpal.ipc.peer import PeerCredentials
+        from smbpal.ipc.protocol import Request
+
+        target = self.root / "locked"
+        target.mkdir(mode=0o500)
+        self.addCleanup(target.chmod, 0o700)
+        store = ConfigStore(self.root / "config.json")
+        store.save(self.config_with_share(path=str(target)))
+        dispatcher = Dispatcher(store, applier=self.applier)
+
+        result = dispatcher._share_make_writable(
+            Request(id="1", method="share.make_writable", params={"ref": "Media"}),
+            PeerCredentials(uid=os.getuid(), gid=os.getgid()),
+        )
+        self.assertIn("reconnect", result["note"])
+
+
 class TestRollback(ApplyTestCase):
     def test_a_failed_apply_leaves_no_record_of_an_unserved_share(self) -> None:
         # D12: "a config edit that the daemon has not applied is a lie."

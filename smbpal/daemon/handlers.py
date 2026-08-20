@@ -330,7 +330,19 @@ class Dispatcher:
         _audit(peer, "share.make_writable", share["id"])
         if self.applier is not None:
             self.applier.apply(config)
-        return {"share": share, "directory": status.to_wire()}
+        return {
+            "share": share,
+            "directory": status.to_wire(),
+            # Samba applies share parameters at tree connect. A client that was
+            # already connected when the share was read-only keeps what it
+            # negotiated, and `smbcontrol all reload-config` does not change
+            # that. Confirmed on real hardware: a Windows client connecting
+            # fresh could write while a Mac holding an older session could not.
+            # "I made it writable and it is still read-only" reads as the app
+            # being broken, so the app says it first.
+            "note": "clients already connected keep the old permissions until "
+            "they reconnect",
+        }
 
     # --- connections -------------------------------------------------------
 

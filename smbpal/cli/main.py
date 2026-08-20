@@ -274,10 +274,13 @@ def _cmd_share_make_writable(client: Client, args: argparse.Namespace) -> int:
         # Report the resulting state rather than claiming a change: the owner
         # is often already right and only the mode moved.
         directory = result["directory"]
-        return (
+        lines = [
             f"{directory['path']} is writable by the share's user "
             f"(owner {directory['owner']}, mode {directory['mode']})"
-        )
+        ]
+        if result.get("note"):
+            lines.append(f"  {result['note']}")
+        return "\n".join(lines)
 
     return _emit(args, result, human)
 
