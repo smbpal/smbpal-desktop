@@ -22,6 +22,7 @@ from smbpal.mounts.apply import Mounter
 from smbpal.samba import control, passwd
 from smbpal.samba.apply import Applier
 from smbpal.shares import ownership
+from smbpal.state.monitor import StateMonitor, fallback_hint
 from smbpal.ipc.peer import PeerCredentials
 from smbpal.ipc.protocol import Request, encode_failure, encode_success, parse_request
 from smbpal.ipc.transport import Connection
@@ -52,6 +53,7 @@ class Authoriser:
             "share.list",
             "connection.list",
             "credential.list",
+            "connection.watch",
             "browse",
         }
     )
@@ -88,6 +90,7 @@ class Dispatcher:
         authoriser: Authoriser | None = None,
         applier: Applier | None = None,
         mounter: Mounter | None = None,
+        monitor: StateMonitor | None = None,
     ) -> None:
         self.store = store
         self.authoriser = authoriser or Authoriser()
@@ -95,6 +98,7 @@ class Dispatcher:
         # Samba, and the reason --no-apply exists.
         self.applier = applier
         self.mounter = mounter
+        self.monitor = monitor
 
     def handle(self, connection: Connection, frame: bytes) -> bytes | None:
         request: Request | None = None
@@ -206,7 +210,28 @@ class Dispatcher:
         # Shallow by construction: `plan` answers from the kernel's mount table
         # and never stats a mountpoint, so a switched-off NAS cannot make
         # `status` slow (M0 §4).
-        return [planned.to_wire() for planned in self.mounter.plan(config)]
+        rows = [planned.to_wire() for planned in self.mounter.plan(config)]
+        if self.monitor is None:
+            return rows
+        # The monitor's view is the real one — it has read the unit and, where
+        # it failed, the journal. Reuse it rather than deriving a second opinion
+        # that can disagree with the events already pushed to clients.
+        for row in rows:
+            state = self.monitor.state_for(row["id"])
+            if state is None:
+                continue
+            row.update(
+                {
+                    "state": state.state,
+                    "message": state.message,
+                    "errno": state.errno,
+                    "is_problem": state.is_problem,
+                }
+            )
+            hint = fallback_hint(row, state)
+            if hint:
+                row["hint"] = hint
+        return rows
 
     def _share_states(self, config: dict[str, Any]) -> list[dict[str, Any]]:
         if self.applier is None:
@@ -313,6 +338,7 @@ class Dispatcher:
             credential_ref=_optional_str(params, "credential_ref"),
             auto_connect=_optional_str(params, "auto_connect") or "on_this_network",
             owner=_optional_str(params, "owner") or _owner_from(peer),
+            fallback_host=_optional_str(params, "fallback_host"),
         )
         self._commit(previous, updated)
         _audit(peer, "connection.add", connection["id"])
@@ -367,6 +393,54 @@ class Dispatcher:
         self._commit(previous, updated)
         _audit(peer, "connection.set_credentials", connection["id"])
         return {"id": connection["id"], "username": username}
+
+    def _connection_use_fallback(
+        self, request: Request, peer: PeerCredentials
+    ) -> dict[str, Any]:
+        """Swap `host` and `fallback_host`, because a person asked.
+
+        A swap rather than a one-way move, so the same command undoes it. §3e
+        wanted the recorded address used automatically on a resolution failure;
+        building it showed why it must not be — a DHCP lease can be reassigned,
+        and failing over silently would send the stored credentials to whatever
+        now answers on that address.
+        """
+        ref = _require_str(request.params, "ref")
+        previous = self.store.load()
+        connection = _find_connection(previous, ref)
+        fallback = connection.get("fallback_host")
+        if not fallback:
+            raise InvalidParams(
+                f"connection {connection['id']!r} has no recorded fallback address",
+                detail="Add one with --fallback, or edit the host directly.",
+            )
+        swapped = {
+            **connection,
+            "host": fallback,
+            "fallback_host": connection["host"],
+        }
+        updated = {
+            **previous,
+            "connections": [
+                swapped if c["id"] == connection["id"] else c
+                for c in previous["connections"]
+            ],
+        }
+        self._commit(previous, updated)
+        _audit(peer, "connection.use_fallback", connection["id"])
+        return swapped
+
+    def _connection_watch(
+        self, _request: Request, _peer: PeerCredentials
+    ) -> list[dict[str, Any]]:
+        """The current state of every connection, as the monitor sees it.
+
+        A client calls this once to prime itself and then listens for
+        `state.changed` events rather than calling it in a loop.
+        """
+        if self.monitor is None:
+            raise SmbpalError("this daemon is not watching connection state")
+        return [state.to_wire() for state in self.monitor.snapshot()]
 
     def _connection_connect(
         self, request: Request, peer: PeerCredentials
@@ -517,5 +591,7 @@ _METHODS: dict[str, Method] = {
     "connection.set_credentials": Dispatcher._connection_set_credentials,
     "connection.connect": Dispatcher._connection_connect,
     "connection.disconnect": Dispatcher._connection_disconnect,
+    "connection.use_fallback": Dispatcher._connection_use_fallback,
+    "connection.watch": Dispatcher._connection_watch,
     "browse": Dispatcher._browse,
 }

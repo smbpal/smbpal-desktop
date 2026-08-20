@@ -61,6 +61,7 @@ _CONNECTION_KEYS = {
     "credential_ref",
     "auto_connect",
     "owner",
+    "fallback_host",
 }
 _TOP_KEYS = {"version", "shares", "connections"}
 
@@ -200,6 +201,10 @@ def _validate_connection(
         problems, f"{where}.credential_ref", connection.get("credential_ref")
     )
     _check_owner(problems, f"{where}.owner", connection.get("owner"))
+    # §3e: the address recorded when the connection was added, kept because a
+    # `.local` name survives a DHCP change and an address does not. Offered on
+    # a resolution failure, never used automatically — the lease may have moved.
+    _check_host(problems, f"{where}.fallback_host", connection.get("fallback_host"))
     auto = connection.get("auto_connect")
     if auto is not None and auto not in AUTO_CONNECT_VALUES:
         problems.append(

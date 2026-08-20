@@ -133,6 +133,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     connection_add.add_argument("--domain", help="Windows domain, if the server wants one")
     connection_add.add_argument(
+        "--fallback",
+        help="address to fall back to if the host name stops resolving. Recorded "
+        "only — SMBPal never switches to it on its own, because the address may "
+        "since belong to a different machine.",
+    )
+    connection_add.add_argument(
         "--stdin-password", action="store_true", help="read the password from stdin"
     )
 
@@ -147,6 +153,18 @@ def build_parser() -> argparse.ArgumentParser:
         "disconnect", help="unmount now (the automount will remount on next access)"
     )
     connection_disconnect.add_argument("ref", help="connection id or mountpoint")
+
+    use_fallback = connection_cmds.add_parser(
+        "use-fallback", help="swap the host for its recorded fallback address"
+    )
+    use_fallback.add_argument("ref", help="connection id or mountpoint")
+
+    watch = commands.add_parser(
+        "watch", help="follow connection state as it changes"
+    )
+    watch.add_argument(
+        "--once", action="store_true", help="print the current state and exit"
+    )
 
     return parser
 
@@ -199,6 +217,13 @@ def _cmd_status(client: Client, args: argparse.Namespace) -> int:
                 "no connections configured",
             ),
         ]
+        # The state column is one word; anything that needs acting on gets its
+        # sentence. M0 §4's whole point: `No such device` is not a reason.
+        for connection in status["connections"]:
+            if connection.get("is_problem"):
+                blocks.append(f"  ! {connection['id']}: {connection['message']}")
+                if connection.get("hint"):
+                    blocks.append(f"    {connection['hint']}")
         return "\n".join(blocks)
 
     return _emit(args, status, human)
@@ -365,6 +390,7 @@ def _cmd_connection_add(client: Client, args: argparse.Namespace) -> int:
             # as root — and mounting a NAS as root-owned is almost never meant.
             # $SUDO_USER is the only place the real user survives.
             "owner": args.owner or os.environ.get("SUDO_USER") or getpass.getuser(),
+            "fallback_host": args.fallback,
         },
     )
     lines = [
@@ -390,6 +416,44 @@ def _cmd_connection_add(client: Client, args: argparse.Namespace) -> int:
         lines.append("  no credentials: it will mount as a guest")
     lines.append("  it will mount on first access")
     return _emit(args, connection, lambda: "\n".join(lines))
+
+
+def _cmd_connection_use_fallback(client: Client, args: argparse.Namespace) -> int:
+    connection = client.call("connection.use_fallback", {"ref": args.ref})
+    return _emit(
+        args,
+        connection,
+        lambda: f"{connection['id']} now connects to {connection['host']} "
+        f"({connection['fallback_host']} kept as the fallback)",
+    )
+
+
+def _cmd_watch(client: Client, args: argparse.Namespace) -> int:
+    states = client.call("connection.watch")
+    if args.json:
+        print(render_json(states))
+    else:
+        print(render_table(states, ("id", "state", "message")) or "nothing to watch")
+    if args.once:
+        return EXIT_OK
+
+    # Everything after this arrives unasked: the daemon pushes, we do not poll.
+    print("\nwatching — ^C to stop")
+    try:
+        for event in client.events():
+            if event.get("event") != "state.changed":
+                continue
+            data = event["data"]
+            marker = "!" if data.get("is_problem") else " "
+            print(f"{marker} {data['id']}: {data['state']} — {data['message']}")
+            if data.get("hint"):
+                print(f"    {data['hint']}")
+    except KeyboardInterrupt:
+        return 130
+    except DaemonUnreachable as exc:
+        _fail(exc)
+        return EXIT_NO_DAEMON
+    return EXIT_OK
 
 
 def _cmd_connection_connect(client: Client, args: argparse.Namespace) -> int:
@@ -443,6 +507,8 @@ _COMMANDS: dict[tuple[str, str | None], Handler] = {
     ("connection", "remove"): _cmd_connection_remove,
     ("connection", "connect"): _cmd_connection_connect,
     ("connection", "disconnect"): _cmd_connection_disconnect,
+    ("connection", "use-fallback"): _cmd_connection_use_fallback,
+    ("watch", None): _cmd_watch,
 }
 
 

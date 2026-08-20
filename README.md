@@ -29,11 +29,12 @@ smbpal/
   cli/          smbpal
   daemon/       smbpald: method dispatch and the entry point
   mounts/       systemd units, cifs credentials, the non-blocking mountpoint probe
+  state/        the connection state machine and the errno translation
 packaging/debian/
 tests/
 ```
 
-`state/` and `gui/` arrive with M5 and M6.
+`gui/` arrives with M6.
 
 ## Running it
 
@@ -58,7 +59,7 @@ In production it is a root system service on `/run/smbpal/smbpald.sock`, mode
 0660, group `smbpal`. Root is not a preference: `passdb.tdb` is `0600 root:root`
 (M0 §2), so nothing short of root can touch Samba's credential store.
 
-## Status: M4 done
+## Status: M5 done
 
 **M1** — schema, validation, atomic writes, the socket, and a daemon that starts,
 loads, holds the socket and does nothing else.
@@ -69,8 +70,9 @@ loads, holds the socket and does nothing else.
 smbpal status
 smbpal share list | add <name> <path> --user <account> [--read-only] [--disabled]
                   | remove <ref> | make-writable <ref>
-smbpal connection list | add <host> <share> <mountpoint> [--user <name>] [--auto ...]
-                       | remove <ref> | connect <ref> | disconnect <ref>
+smbpal connection list | add <host> <share> <mountpoint> [--user <name>] [--fallback <ip>]
+                       | remove <ref> | connect <ref> | disconnect <ref> | use-fallback <ref>
+smbpal watch [--once]
 smbpal credential list | set <account> | remove <account>
 smbpal apply
 smbpal browse
@@ -92,6 +94,33 @@ record. Plus `smbpal apply`, `smbpal share make-writable`, and
 and `.automount` pair, stores the remote credential in a `0600` root-owned file,
 and enables the automount so the mount happens on **first access** rather than
 during boot. Plus `connection connect` / `disconnect`.
+
+**M5** — connections have real state, pushed to clients. `smbpal watch` follows
+it live; `status` shows it. The two things M4 left are done: the errno is
+translated, and §3e's fallback is recorded and offered.
+
+A rejected password used to reach the user as `No such device` — the
+automount's answer, which says nothing about the cause and sends people hunting
+for a missing disk. `Permission denied` was only ever in the unit's journal.
+Now:
+
+```
+Connections:
+  ID                     HOST             SHARE  MOUNTPOINT  STATE
+  rivendell-local-media  rivendell.local  Media  /mnt/nas    auth_failed
+  ! rivendell-local-media: the username or password was refused by the server
+```
+
+**`idle` is not `disconnected`.** An automount nobody has touched is working
+exactly as designed — M0 §4 saw the mount happen on first access, 80 seconds
+after boot. Painting that as a problem would train people to ignore the one
+state that is.
+
+**The daemon reflects the kernel's retry policy rather than inventing one.** M0
+§4 watched an unreachable host retry seven times at five-second intervals and a
+wrong password produce exactly one attempt. That is already
+stop-on-auth-failure, retry-on-transient, so §13 Q6 needs no new policy — only
+for the distinction to reach the user.
 
 **The mountpoint is never touched to answer a question.** M0 §4 found that with
 the remote absent, a plain `ls` on a cifs mount blocked for a protracted period
@@ -123,16 +152,6 @@ Three properties worth knowing:
   in a sentence of examples; making it a noun group symmetrical with `share`
   means one shape to learn instead of two.
 
-### Left for M5, deliberately
-
-- **The `.local`-with-an-IP-fallback rule (§3e).** Recording a fallback address
-  is trivial; *using* it only means something once there is failure handling to
-  use it, and that is M5's state machine. Recording it now would be half a
-  feature that looks like a whole one.
-- **Translating the mount errno.** M0 §4 found a rejected password reaching the
-  user as `No such device` while `Permission denied` sat in the unit's journal.
-  `systemd.show()` exists and returns what M5 needs; nothing reads it yet.
-
 ### Unit naming: verified against real systemd
 
 `escape_path` implements systemd's path escaping rather than shelling out to
@@ -150,6 +169,16 @@ Multi-byte UTF-8 (`/srv/é` → `srv-\xc3\xa9.mount`) was confirmed in the same
 pass. The failure mode this was guarding against is the bad one: a unit name
 systemd never matches, so a mount that silently never happens rather than one
 that errors.
+
+### A change of mind on §3e's fallback
+
+The plan asked for the `.local` name to be preferred with the IP recorded as a
+fallback for a client whose mDNS is broken. Building it exposed why the fallback
+**must not be automatic**: a DHCP lease can be reassigned, so the address
+recorded when the connection was added may now belong to a different machine —
+and silently failing over would send the stored credentials to whatever answers
+on port 445. So the address is recorded, surfaced when the name fails to
+resolve, and used only when a person runs `smbpal connection use-fallback`.
 
 ### Known interim: authorisation
 

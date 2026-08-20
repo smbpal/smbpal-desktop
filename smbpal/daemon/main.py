@@ -26,7 +26,9 @@ from smbpal.errors import SmbpalError
 from smbpal.mounts.apply import Mounter
 from smbpal.mounts.credentials import DEFAULT_CREDENTIALS_DIR, CredentialsStore
 from smbpal.mounts.systemd import DEFAULT_UNIT_DIR
+from smbpal.ipc.protocol import encode_event
 from smbpal.samba.apply import DEFAULT_SMB_CONF, DEFAULT_SMBPAL_CONF, Applier
+from smbpal.state.monitor import DEFAULT_INTERVAL, StateMonitor
 from smbpal.ipc.server import (
     DEFAULT_SOCKET_GROUP,
     DEFAULT_SOCKET_PATH,
@@ -61,6 +63,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--check",
         action="store_true",
         help="validate the config and exit without binding anything",
+    )
+    parser.add_argument(
+        "--watch-interval",
+        type=float,
+        default=DEFAULT_INTERVAL,
+        help="seconds between connection state checks (default %(default)s)",
     )
     parser.add_argument(
         "--no-apply",
@@ -149,9 +157,22 @@ def main(argv: list[str] | None = None) -> int:
     else:
         log.info("--no-apply: holding config only, not touching Samba or Avahi")
 
-    dispatcher = Dispatcher(store, applier=applier, mounter=mounter)
+    monitor: StateMonitor | None = None
+    if mounter is not None:
+        monitor = StateMonitor(
+            store,
+            mounter,
+            # D4's push channel, finally used: clients are told when a
+            # connection changes rather than asking repeatedly.
+            broadcast=lambda event, data: transport.broadcast(encode_event(event, data)),
+            interval=args.watch_interval,
+        )
+
+    dispatcher = Dispatcher(store, applier=applier, mounter=mounter, monitor=monitor)
     log.info("%s", dispatcher.authoriser.policy_note())
     _install_signal_handlers(transport)
+    if monitor is not None:
+        monitor.start()
     _sd_notify("READY=1")
     log.info("smbpald %s ready", __version__)
 
@@ -159,6 +180,8 @@ def main(argv: list[str] | None = None) -> int:
         transport.serve_forever(dispatcher.handle)
     finally:
         _sd_notify("STOPPING=1")
+        if monitor is not None:
+            monitor.stop()
         transport.shutdown()
     return 0
 

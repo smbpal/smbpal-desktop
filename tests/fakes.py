@@ -32,6 +32,8 @@ class FakeSamba:
         self.smb_users: list[str] = []
         self.reload_count = 0
         self.reload_fails = False
+        self.journals: dict[str, str] = {}
+        self.unit_state: dict[str, dict[str, str]] = {}
         self.enabled_units: set[str] = set()
         self.started_units: set[str] = set()
         self.daemon_reloads = 0
@@ -83,7 +85,7 @@ class FakeSamba:
         if verb == "daemon-reload":
             self.daemon_reloads += 1
             return CommandResult(argv, 0, "", "")
-        unit = argv[-1]
+        unit = argv[2] if verb == "show" else argv[-1]
         if verb == "enable":
             self.enabled_units.add(unit)
             if "--now" in argv:
@@ -99,8 +101,16 @@ class FakeSamba:
             active = "active" if unit in self.started_units else "inactive"
             return CommandResult(argv, 0 if unit in self.started_units else 3, active + "\n", "")
         elif verb == "show":
-            return CommandResult(argv, 0, "ActiveState=active\nResult=success\n", "")
+            properties = self.unit_state.get(
+                unit, {"ActiveState": "inactive", "Result": "success"}
+            )
+            dump = "".join(f"{k}={v}\n" for k, v in properties.items())
+            return CommandResult(argv, 0, dump, "")
         return CommandResult(argv, 0, "", "")
+
+    def _journalctl(self, argv, _input) -> CommandResult:
+        unit = argv[argv.index("-u") + 1]
+        return CommandResult(argv, 0, self.journals.get(unit, ""), "")
 
     # --- the part that makes this a real check -----------------------------
 
