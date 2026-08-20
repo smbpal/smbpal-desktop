@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smbpal"
+version = "0.1.0"
+description = "SMB share manager — daemon, CLI and GUI in one package"
+requires-python = ">=3.11"
+
+# Deliberately empty, and it should stay that way for the daemon and CLI.
+# D11: system Python, depend don't bundle. The GUI's PyGObject and GTK4 arrive
+# as Debian packages (python3-gi, gir1.2-gtk-4.0), not from PyPI, because a
+# GTK binding installed by pip against a different GTK is how you get a
+# process that imports and then segfaults.
+dependencies = []
+
+[project.scripts]
+smbpald = "smbpal.daemon.main:main"
+
+[tool.setuptools.packages.find]
+include = ["smbpal*"]

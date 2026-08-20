@@ -1,0 +1,3 @@
+# The socket's group guard (D4). Membership says *may talk* to the daemon; the
+# daemon still decides *may act*.
+g smbpal -

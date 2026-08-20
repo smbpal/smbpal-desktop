@@ -32,4 +32,23 @@ secrets.*
 credentials.*
 *.keychain
 *.keychain-db
+
+# --- Build and interpreter artifacts ---------------------------------------
+# Nothing here is unpublishable, but §11.3 publishes full history and a repo
+# carrying __pycache__ from three machines is history nobody wants to read.
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Platform noise --------------------------------------------------------
 .DS_Store
+Thumbs.db

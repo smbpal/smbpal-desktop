@@ -1,0 +1,31 @@
+[Unit]
+Description=SMBPal daemon
+Documentation=https://github.com/smbpal/smbpal-desktop
+# The daemon does not need the network to start — it holds a Unix socket and
+# owns config. Mounting happens on demand (M0 §4: the automount triggers on
+# first access, well after NetworkManager-wait-online).
+After=local-fs.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/smbpald
+Restart=on-failure
+RestartSec=2s
+
+# systemd creates and owns /run/smbpal, so the daemon never has to.
+RuntimeDirectory=smbpal
+RuntimeDirectoryMode=0750
+
+# Root, and not by preference: /var/lib/samba/private/passdb.tdb is 0600
+# root:root (M0 §2), so no group membership short of root can touch Samba's
+# credential store. The daemon also writes /etc/samba and mounts filesystems.
+User=root
+
+# Deliberately unhardened for now. Most of the usual directives — ProtectSystem,
+# PrivateMounts, ReadOnlyPaths — collide with writing /etc/samba, running
+# smbpasswd and mounting cifs. Getting that set right is a security review, and
+# §12 Phase 5 owns it. An almost-right sandbox that silently breaks mounting is
+# worse than none.
+
+[Install]
+WantedBy=multi-user.target

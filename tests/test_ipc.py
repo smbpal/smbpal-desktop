@@ -1,0 +1,299 @@
+"""The socket end to end: a real daemon dispatcher over a real Unix socket."""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import stat
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+
+from smbpal import PROTOCOL_VERSION
+from smbpal.config import ConfigStore, empty_config
+from smbpal.daemon.handlers import Authoriser, Dispatcher
+from smbpal.errors import (
+    BadRequest,
+    DaemonUnreachable,
+    NotPermitted,
+    UnknownMethod,
+    UnsupportedVersion,
+)
+from smbpal.ipc.client import Client
+from smbpal.ipc.peer import PeerCredentials
+from smbpal.ipc.protocol import MAX_FRAME_BYTES, encode_event
+from smbpal.ipc.server import UnixSocketTransport
+
+
+class ServerTestCase(unittest.TestCase):
+    """Spins up a transport on a short temp path.
+
+    Short because sun_path is ~104 bytes and macOS's default temp directory
+    eats most of that.
+    """
+
+    def setUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory(dir="/tmp", prefix="smbpal-")
+        self.addCleanup(self._dir.cleanup)
+        root = Path(self._dir.name)
+        self.socket_path = root / "s.sock"
+        self.store = ConfigStore(root / "config.json")
+        self.dispatcher = Dispatcher(self.store)
+        # No group: tests do not run as root and must not need to.
+        self.transport = UnixSocketTransport(self.socket_path, group=None)
+        self.transport.bind()
+        self.thread = threading.Thread(
+            target=self.transport.serve_forever,
+            args=(self.dispatcher.handle,),
+            daemon=True,
+        )
+        self.thread.start()
+        self.addCleanup(self._stop)
+
+    def _stop(self) -> None:
+        self.transport.shutdown()
+        self.thread.join(timeout=5)
+
+    def client(self) -> Client:
+        client = Client(self.socket_path, timeout=5.0)
+        client.connect()
+        self.addCleanup(client.close)
+        return client
+
+    def raw(self) -> socket.socket:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(5.0)
+        sock.connect(str(self.socket_path))
+        self.addCleanup(sock.close)
+        return sock
+
+
+class TestMethods(ServerTestCase):
+    def test_ping(self) -> None:
+        self.assertEqual(self.client().call("ping"), {"pong": True})
+
+    def test_version_reports_both_versions(self) -> None:
+        result = self.client().call("version")
+        self.assertEqual(result["protocol"], PROTOCOL_VERSION)
+        self.assertIn("version", result)
+
+    def test_config_get_returns_the_stored_config(self) -> None:
+        doc = {
+            "version": 1,
+            "shares": [{"type": "os", "id": "m", "name": "M", "path": "/srv/m"}],
+            "connections": [],
+        }
+        self.store.save(doc)
+        self.assertEqual(self.client().call("config.get"), doc)
+
+    def test_config_get_on_a_first_boot_returns_an_empty_config(self) -> None:
+        self.assertEqual(self.client().call("config.get"), empty_config())
+
+    def test_several_calls_on_one_connection(self) -> None:
+        client = self.client()
+        for _ in range(5):
+            self.assertEqual(client.call("ping"), {"pong": True})
+
+    def test_concurrent_clients(self) -> None:
+        results: list[object] = []
+        errors: list[BaseException] = []
+
+        def hammer() -> None:
+            try:
+                with Client(self.socket_path, timeout=5.0) as client:
+                    for _ in range(10):
+                        results.append(client.call("ping"))
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=hammer) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 40)
+
+
+class TestErrors(ServerTestCase):
+    def test_unknown_method(self) -> None:
+        with self.assertRaises(UnknownMethod):
+            self.client().call("nope")
+
+    def test_malformed_json_is_reported_not_fatal(self) -> None:
+        sock = self.raw()
+        sock.sendall(b"{not json\n")
+        reply = json.loads(sock.recv(4096).decode("utf-8"))
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["error"]["code"], BadRequest.code)
+        # The daemon is still serving afterwards.
+        self.assertEqual(self.client().call("ping"), {"pong": True})
+
+    def test_a_wrong_protocol_version_is_refused(self) -> None:
+        sock = self.raw()
+        sock.sendall(
+            json.dumps({"v": 99, "id": "1", "method": "ping"}).encode("utf-8") + b"\n"
+        )
+        reply = json.loads(sock.recv(4096).decode("utf-8"))
+        self.assertEqual(reply["error"]["code"], UnsupportedVersion.code)
+
+    def test_a_request_without_an_id_is_refused_with_a_null_id(self) -> None:
+        sock = self.raw()
+        sock.sendall(json.dumps({"v": 1, "method": "ping"}).encode("utf-8") + b"\n")
+        reply = json.loads(sock.recv(4096).decode("utf-8"))
+        self.assertFalse(reply["ok"])
+        self.assertIsNone(reply["id"])
+
+    def test_an_unframed_flood_closes_the_connection(self) -> None:
+        # A client that never sends a newline must not be able to make the
+        # daemon buffer without bound.
+        sock = self.raw()
+        try:
+            sock.sendall(b"x" * (MAX_FRAME_BYTES + 4096))
+        except OSError:
+            pass  # The daemon may close mid-write, which is the point.
+        sock.settimeout(5.0)
+        try:
+            self.assertEqual(sock.recv(1), b"")
+        except OSError:
+            pass  # A reset is an equally good answer.
+        self.assertEqual(self.client().call("ping"), {"pong": True})
+
+    def test_a_handler_raising_does_not_kill_the_daemon(self) -> None:
+        def explode(*_args: object) -> None:
+            raise RuntimeError("boom")
+
+        from smbpal.daemon import handlers
+
+        handlers._METHODS["boom"] = explode  # type: ignore[assignment]
+        self.addCleanup(handlers._METHODS.pop, "boom", None)
+        Authoriser.READ_ONLY = frozenset(Authoriser.READ_ONLY | {"boom"})
+        self.addCleanup(
+            setattr, Authoriser, "READ_ONLY", frozenset(Authoriser.READ_ONLY - {"boom"})
+        )
+
+        client = self.client()
+        with self.assertRaises(Exception) as caught:
+            client.call("boom")
+        self.assertEqual(getattr(caught.exception, "code", None), "internal")
+        self.assertEqual(client.call("ping"), {"pong": True})
+
+
+class TestPeerAndAuthorisation(ServerTestCase):
+    def test_the_peer_identity_comes_from_the_kernel(self) -> None:
+        seen: list[PeerCredentials] = []
+        original = self.dispatcher.handle
+
+        def spy(connection: object, frame: bytes) -> bytes | None:
+            seen.append(connection.peer)  # type: ignore[attr-defined]
+            return original(connection, frame)  # type: ignore[arg-type]
+
+        self.transport.shutdown()
+        self.thread.join(timeout=5)
+        self.transport = UnixSocketTransport(self.socket_path, group=None)
+        self.transport.bind()
+        self.thread = threading.Thread(
+            target=self.transport.serve_forever, args=(spy,), daemon=True
+        )
+        self.thread.start()
+
+        self.client().call("ping")
+        self.assertEqual(seen[0].uid, os.getuid())
+        self.assertEqual(seen[0].gid, os.getgid())
+
+    def test_a_mutating_method_is_refused_for_a_non_root_peer(self) -> None:
+        # Nothing mutates yet, so register one to prove the gate rather than a
+        # feature: anything absent from READ_ONLY needs uid 0 until polkit
+        # lands in M3.
+        if os.getuid() == 0:
+            self.skipTest("running as root; the refusal path needs a non-root peer")
+
+        from smbpal.daemon import handlers
+
+        handlers._METHODS["test.mutate"] = lambda *_a: {"changed": True}
+        self.addCleanup(handlers._METHODS.pop, "test.mutate", None)
+
+        with self.assertRaises(NotPermitted):
+            self.client().call("test.mutate")
+
+    def test_an_unknown_method_says_so_rather_than_blaming_permissions(self) -> None:
+        with self.assertRaises(UnknownMethod):
+            self.client().call("definitely.not.a.method")
+
+
+class TestSocket(ServerTestCase):
+    def test_the_socket_is_removed_on_shutdown(self) -> None:
+        self.assertTrue(self.socket_path.exists())
+        self.transport.shutdown()
+        self.thread.join(timeout=5)
+        self.assertFalse(self.socket_path.exists())
+
+    def test_a_second_daemon_refuses_to_steal_a_live_socket(self) -> None:
+        rival = UnixSocketTransport(self.socket_path, group=None)
+        with self.assertRaises(OSError) as caught:
+            rival.bind()
+        self.assertIn("already listening", str(caught.exception))
+
+    def test_a_stale_socket_is_reclaimed(self) -> None:
+        self.transport.shutdown()
+        self.thread.join(timeout=5)
+        # Leave a socket file behind with nothing listening.
+        leftover = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        leftover.bind(str(self.socket_path))
+        leftover.close()
+        self.assertTrue(self.socket_path.exists())
+
+        self.transport = UnixSocketTransport(self.socket_path, group=None)
+        self.transport.bind()  # must not raise
+        self.thread = threading.Thread(
+            target=self.transport.serve_forever,
+            args=(self.dispatcher.handle,),
+            daemon=True,
+        )
+        self.thread.start()
+        self.assertEqual(self.client().call("ping"), {"pong": True})
+
+    def test_the_socket_is_not_world_accessible(self) -> None:
+        mode = stat.S_IMODE(self.socket_path.stat().st_mode)
+        self.assertEqual(mode & stat.S_IRWXO, 0, f"world bits set: {mode:04o}")
+
+
+class TestEvents(ServerTestCase):
+    def test_a_broadcast_event_reaches_a_connected_client(self) -> None:
+        # Nothing emits events yet. M5 will, and retrofitting a push channel
+        # into a request/response-only protocol is what this proves unnecessary.
+        client = self.client()
+        client.call("ping")  # ensure the connection is registered
+        self.transport.broadcast(encode_event("state.changed", {"id": "nas"}))
+        event = next(client.events())
+        self.assertEqual(event["event"], "state.changed")
+        self.assertEqual(event["data"], {"id": "nas"})
+
+    def test_an_event_arriving_mid_call_is_not_mistaken_for_the_reply(self) -> None:
+        client = self.client()
+        client.call("ping")
+        received: list[dict[str, object]] = []
+        client.on_event = received.append
+
+        # Push an event, then make a call. The client must skip the event and
+        # still return the right result.
+        self.transport.broadcast(encode_event("noise", {"n": 1}))
+        self.assertEqual(client.call("ping"), {"pong": True})
+        self.assertEqual(received, [{"v": PROTOCOL_VERSION, "event": "noise", "data": {"n": 1}}])
+
+
+class TestClientWithoutDaemon(unittest.TestCase):
+    def test_a_missing_socket_is_a_clear_error_not_a_stack_trace(self) -> None:
+        # D12's stated consequence, tested rather than hoped for.
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="smbpal-") as root:
+            client = Client(Path(root) / "absent.sock", timeout=1.0)
+            with self.assertRaises(DaemonUnreachable) as caught:
+                client.connect()
+            self.assertIn("no SMBPal daemon", caught.exception.message)
+            self.assertIn("systemctl start smbpald", caught.exception.detail or "")
+
+
+if __name__ == "__main__":
+    unittest.main()
