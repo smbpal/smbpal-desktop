@@ -413,6 +413,10 @@ class Dispatcher:
                 for c in previous["connections"]
             ],
         }
+        # The commit applies, and applying clears any latched failure — which
+        # matters here more than anywhere: this is the path someone takes after
+        # a rejected password, and new credentials are worthless against a unit
+        # systemd has stopped starting. Covered by a test so that stays true.
         self._commit(previous, updated)
         _audit(peer, "connection.set_credentials", connection["id"])
         return {"id": connection["id"], "username": username}
@@ -469,6 +473,10 @@ class Dispatcher:
         self, request: Request, peer: PeerCredentials
     ) -> dict[str, Any]:
         connection, mount_name = self._unit_for(request)
+        # Clear any latched failure first, or this "connect" is a promise we
+        # cannot keep: systemd refuses a start-limited unit without running the
+        # mount at all, and returns the same failure as before.
+        systemd.reset_failed(mount_name, runner=self._runner())
         systemd.start(mount_name, runner=self._runner())
         _audit(peer, "connection.connect", connection["id"])
         return {"id": connection["id"], "unit": mount_name}

@@ -61,6 +61,26 @@ def stop(unit: str, *, runner: CommandRunner | None = None) -> None:
     execute([SYSTEMCTL, "stop", unit])
 
 
+def reset_failed(unit: str, *, runner: CommandRunner | None = None) -> None:
+    """Clear a latched failure so systemd will try the unit again.
+
+    **A Pi run found why this has to exist.** After five failed mounts in ten
+    seconds systemd stops trying and says so:
+
+        mnt-smbpal\\x2dtest.mount: Start request repeated too quickly.
+
+    The unit is then refused *before* mount.cifs runs, so fixing the password
+    changes nothing — every later attempt fails identically and for a reason
+    that is no longer true. Only `reset-failed` clears the counter. Anything
+    that gives the mount a fresh chance must clear it first, or it is offering
+    a retry that cannot happen.
+
+    Never an error: a unit that is not failed has nothing to reset.
+    """
+    execute = runner or run
+    execute([SYSTEMCTL, "reset-failed", unit])
+
+
 def start(unit: str, *, runner: CommandRunner | None = None) -> None:
     execute = runner or run
     result = execute([SYSTEMCTL, "start", unit])

@@ -26,6 +26,21 @@ mnt-m0.mount: Failed with result 'exit-code'.
 """
 
 
+# Verbatim from a Pi run on 21 August 2026, and the reason `reset-failed`
+# exists. Note the last two lines: after five attempts systemd stops running
+# mount.cifs at all, so the errno above is a reason that is no longer being
+# reached.
+PI_START_LIMIT = """\
+mount error(13): Permission denied
+Refer to the mount.cifs(8) manual page (e.g. man mount.cifs) and kernel log messages (dmesg)
+mnt-smbpal\\x2dtest.mount: Mount process exited, code=exited, status=32/n/a
+mnt-smbpal\\x2dtest.mount: Failed with result 'exit-code'.
+Failed to mount mnt-smbpal\\x2dtest.mount - SMBPal mount of //rivendell.local/Media.
+mnt-smbpal\\x2dtest.mount: Start request repeated too quickly.
+mnt-smbpal\\x2dtest.mount: Failed with result 'exit-code'.
+"""
+
+
 class TestTranslate(unittest.TestCase):
     def test_m0s_rejected_password_becomes_a_reason_a_person_can_act_on(self) -> None:
         # The user saw `No such device`, which sends them hunting for a missing
@@ -135,6 +150,51 @@ class TestMachine(unittest.TestCase):
         )
         self.assertEqual(state.state, machine.FAILED)
         self.assertIn("32", state.message)
+
+    def test_a_start_limited_unit_says_nothing_is_retrying(self) -> None:
+        # A Pi run hit this: five rejected mounts in ten seconds and systemd
+        # stopped trying. Reporting only "the password was refused" would be
+        # true and still leave someone stuck, because fixing the password
+        # changes nothing until the latch is cleared.
+        state = machine.derive(
+            self.CONNECTION,
+            mounted=False,
+            unit={"ActiveState": "failed", "Result": "start-limit-hit"},
+            cause=translate.translate_journal(PI_START_LIMIT),
+        )
+        self.assertEqual(state.state, machine.AUTH_FAILED)
+        self.assertEqual(state.errno, 13)
+        self.assertIn("password", state.message)
+        self.assertIn("stopped retrying", state.message)
+        self.assertIn("connection connect", state.message)
+
+    def test_a_start_limited_unit_is_never_reported_as_retryable(self) -> None:
+        # `retryable` means "waiting will fix this". Nothing is waiting.
+        state = machine.derive(
+            self.CONNECTION,
+            mounted=False,
+            unit={"ActiveState": "failed", "Result": "start-limit-hit"},
+            cause=translate.Cause(
+                state=machine.UNREACHABLE, message="the server did not answer in time",
+                errno=110, retryable=True,
+            ),
+        )
+        self.assertFalse(state.retryable)
+        self.assertEqual(state.state, machine.FAILED)
+
+    def test_a_start_limited_unit_with_no_cause_still_says_it_is_stuck(self) -> None:
+        state = machine.derive(
+            self.CONNECTION,
+            mounted=False,
+            unit={
+                "ActiveState": "failed",
+                "Result": "start-limit-hit",
+                "ExecMainStatus": "32",
+            },
+        )
+        self.assertEqual(state.state, machine.FAILED)
+        self.assertFalse(state.retryable)
+        self.assertIn("stopped retrying", state.message)
 
     def test_auto_connect_never_is_disabled_not_broken(self) -> None:
         state = machine.derive(
@@ -354,3 +414,69 @@ class TestPushReachesAClient(MonitorTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestClearingALatchedUnit(MonitorTestCase):
+    """`connect` and `set_credentials` after systemd has given up.
+
+    Both are what a person reaches for once a mount has failed repeatedly, and
+    both are worthless against a unit systemd refuses to start.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # `set_credentials` commits, and a commit applies, which creates the
+        # mountpoint. /mnt/nas is not ours to create on the machine running the
+        # tests, so this connection lives under the temporary root.
+        from smbpal.mounts import units
+
+        mountpoint = str(self.root / "mnt" / "nas")
+        doc, self.connection = ops.add_connection(
+            empty_config(), host="rivendell.local", share="Media",
+            mountpoint=mountpoint,
+        )
+        self.store.save(doc)
+        self.unit, _ = units.unit_names(mountpoint)
+
+    def dispatcher(self):
+        from smbpal.daemon.handlers import Dispatcher
+
+        return Dispatcher(self.store, mounter=self.mounter, monitor=self.monitor)
+
+    def request(self, method: str, **params):
+        from smbpal.ipc.peer import PeerCredentials
+        from smbpal.ipc.protocol import Request
+
+        return (
+            Request(id="1", method=method, params=params),
+            PeerCredentials(uid=0, gid=0),
+        )
+
+    def test_connect_clears_the_latch_before_starting(self) -> None:
+        self.samba.latched.add(self.unit)
+        dispatcher = self.dispatcher()
+
+        result = dispatcher._connection_connect(
+            *self.request("connection.connect", ref=self.connection["id"])
+        )
+
+        self.assertEqual(result["unit"], self.unit)
+        self.assertIn(self.unit, self.samba.started_units)
+
+    def test_new_credentials_clear_the_latch(self) -> None:
+        # The commonest sequence there is: a rejected password, five retries,
+        # then the right password. Without this the new password is never
+        # tried and the same stale error keeps being reported.
+        self.samba.latched.add(self.unit)
+        dispatcher = self.dispatcher()
+
+        dispatcher._connection_set_credentials(
+            *self.request(
+                "connection.set_credentials",
+                ref=self.connection["id"],
+                username="luke",
+                password="throwaway-for-testing",
+            )
+        )
+
+        self.assertNotIn(self.unit, self.samba.latched)

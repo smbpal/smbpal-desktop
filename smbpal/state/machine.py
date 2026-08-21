@@ -41,6 +41,18 @@ UNKNOWN = "unknown"
 # working or on its way there.
 PROBLEM_STATES = frozenset({UNREACHABLE, UNRESOLVED, AUTH_FAILED, FAILED})
 
+# `systemctl show` reports this once a unit has failed to start too often for
+# systemd to keep trying. See systemd.reset_failed.
+START_LIMIT_HIT = "start-limit-hit"
+
+
+def _latched(message: str, identifier: str) -> str:
+    return (
+        f"{message}. systemd has stopped retrying after repeated failures, so "
+        f"nothing will happen on access until it is cleared — run "
+        f"`smbpal connection connect {identifier}`"
+    )
+
 
 @dataclass(frozen=True)
 class ConnectionState:
@@ -97,24 +109,33 @@ def derive(
         return ConnectionState(identifier, CONNECTING, "mounting", retryable=True)
 
     if active == "failed" or (result and result != "success"):
+        # `start-limit-hit` is not a reason the mount failed — it is systemd
+        # refusing to try any more. The journal still holds the real cause, so
+        # report that, and say plainly that nothing will retry on its own.
+        latched = result == START_LIMIT_HIT
         if cause is not None:
             state = cause.state
             if state == CONNECTING:
                 state = CONNECTING
             elif cause.retryable and state == FAILED:
                 state = RECONNECTING
+            if latched:
+                # Whatever the cause, it will not be retried, so the connection
+                # is not "reconnecting" — nothing is.
+                state = AUTH_FAILED if state == AUTH_FAILED else FAILED
             return ConnectionState(
                 identifier,
                 state,
-                cause.message,
+                _latched(cause.message, identifier) if latched else cause.message,
                 errno=cause.errno,
-                retryable=cause.retryable,
+                retryable=False if latched else cause.retryable,
             )
+        message = describe_exit(unit.get("ExecMainStatus"))
         return ConnectionState(
             identifier,
             FAILED,
-            describe_exit(unit.get("ExecMainStatus")),
-            retryable=True,
+            _latched(message, identifier) if latched else message,
+            retryable=not latched,
         )
 
     if armed is False:

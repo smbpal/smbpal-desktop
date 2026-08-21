@@ -123,10 +123,15 @@ class Mounter:
             systemd.daemon_reload(runner=self.runner)
 
         for connection in connections:
-            _, automount_name = units.unit_names(connection["mountpoint"])
+            mount_name, automount_name = units.unit_names(connection["mountpoint"])
             if connection.get("auto_connect") == "never":
                 systemd.disable(automount_name, runner=self.runner)
                 continue
+            # A mount that failed too often is refused before mount.cifs runs,
+            # so re-arming a latched unit would arm something that cannot fire.
+            # `apply` is the command people reach for after fixing whatever was
+            # wrong; it has to actually give the mount another chance.
+            systemd.reset_failed(mount_name, runner=self.runner)
             # `--now` starts the automount, which arms the trigger. It does not
             # mount: M0 §4 saw the mount happen on first access, which is what
             # keeps a switched-off NAS from delaying boot.

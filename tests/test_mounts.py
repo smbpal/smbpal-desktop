@@ -309,6 +309,28 @@ class TestMounter(unittest.TestCase):
         self.mounter.apply(self.config())
         self.assertTrue(all(u.endswith(".automount") for u in self.samba.enabled_units))
 
+    def test_apply_clears_a_latched_failure_before_arming(self) -> None:
+        # A Pi run left the mount unit in `start-limit-hit`, where systemd
+        # refuses it before mount.cifs runs. `apply` is what someone runs after
+        # fixing the cause, so arming a unit that cannot fire would make the
+        # command a no-op that looks like a success.
+        config = self.config()
+        mountpoint = config["connections"][0]["mountpoint"]
+        mount_name, automount_name = units.unit_names(mountpoint)
+        self.samba.latched.add(mount_name)
+
+        self.mounter.apply(config)
+
+        self.assertNotIn(mount_name, self.samba.latched)
+        reset = ("systemctl", "reset-failed", mount_name)
+        enable = [c for c in self.samba.calls if c[:2] == ("systemctl", "enable")]
+        self.assertIn(reset, self.samba.calls)
+        self.assertLess(
+            self.samba.calls.index(reset),
+            self.samba.calls.index(enable[-1]),
+            "the latch must be cleared before the automount is armed",
+        )
+
     def test_auto_connect_never_disables_the_automount(self) -> None:
         self.mounter.apply(self.config(auto_connect="never"))
         self.assertEqual(self.samba.enabled_units, set())

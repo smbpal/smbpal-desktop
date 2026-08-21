@@ -36,6 +36,10 @@ class FakeSamba:
         self.unit_state: dict[str, dict[str, str]] = {}
         self.enabled_units: set[str] = set()
         self.started_units: set[str] = set()
+        # Units systemd has given up on. A real one refuses `start`
+        # outright until `reset-failed`, so this fake does too — a fake
+        # that quietly starts them would agree with the bug.
+        self.latched: set[str] = set()
         self.daemon_reloads = 0
 
     def __call__(
@@ -94,7 +98,19 @@ class FakeSamba:
             self.enabled_units.discard(unit)
             self.started_units.discard(unit)
         elif verb == "start":
+            if unit in self.latched:
+                return CommandResult(
+                    argv, 1, "", f"Job failed. See \"journalctl -xe -u {unit}\".\n"
+                )
             self.started_units.add(unit)
+        elif verb == "reset-failed":
+            self.latched.discard(unit)
+            if unit in self.unit_state:
+                self.unit_state[unit] = {
+                    **self.unit_state[unit],
+                    "ActiveState": "inactive",
+                    "Result": "success",
+                }
         elif verb == "stop":
             self.started_units.discard(unit)
         elif verb == "is-active":
