@@ -184,6 +184,43 @@ class TestProbeNeverBlocks(unittest.TestCase):
         )
         self.mountinfo.write_text(self.armed + self.real, encoding="utf-8")
 
+    def test_a_writable_mount_is_not_read_only(self) -> None:
+        probe = probe_module.MountProbe(mountinfo=self.mountinfo)
+        self.assertIs(probe.is_read_only("/mnt/nas"), False)
+
+    def test_a_read_only_mount_is_reported_as_one(self) -> None:
+        # The `ro` that matters is field 5, the per-mount options — the same
+        # position `rw` sits in above. The superblock options after the source
+        # carry their own copy and are not what the kernel enforces on.
+        self.mountinfo.write_text(
+            self.armed
+            + "83 36 0:44 / /mnt/nas ro,relatime shared:45 - cifs "
+            "//rivendell.local/Media ro,vers=3.1.1,uid=1000,forceuid\n",
+            encoding="utf-8",
+        )
+        probe = probe_module.MountProbe(mountinfo=self.mountinfo)
+        self.assertIs(probe.is_read_only("/mnt/nas"), True)
+
+    def test_the_autofs_trigger_is_not_what_gets_asked(self) -> None:
+        # The trigger is always `rw` whatever the mount under it says, so
+        # reading the first line matching the path would answer the wrong
+        # question — the same confusion that made an armed automount look
+        # connected.
+        self.mountinfo.write_text(
+            self.armed
+            + "83 36 0:44 / /mnt/nas ro,relatime shared:45 - cifs //r/M ro\n",
+            encoding="utf-8",
+        )
+        probe = probe_module.MountProbe(mountinfo=self.mountinfo)
+        self.assertIs(probe.is_read_only("/mnt/nas"), True)
+
+    def test_an_armed_but_unmounted_path_has_no_answer(self) -> None:
+        # Not False. Nothing is mounted, so "is it read-only" has no answer,
+        # and False would read as "writable".
+        self.mountinfo.write_text(self.armed, encoding="utf-8")
+        probe = probe_module.MountProbe(mountinfo=self.mountinfo)
+        self.assertIsNone(probe.is_read_only("/mnt/nas"))
+
     def test_is_mounted_never_touches_the_filesystem(self) -> None:
         # The whole point: "is it mounted" is answered from the kernel's table,
         # so a NAS that is switched off cannot make it slow.

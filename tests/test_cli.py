@@ -14,7 +14,13 @@ import threading
 import unittest
 from pathlib import Path
 
-from smbpal.cli.main import EXIT_ERROR, EXIT_NO_DAEMON, EXIT_OK, main
+from smbpal.cli.main import (
+    EXIT_ERROR,
+    EXIT_NO_DAEMON,
+    EXIT_OK,
+    connection_notes,
+    main,
+)
 from smbpal.config import ConfigStore
 from smbpal.daemon.handlers import Dispatcher
 from smbpal.ipc.server import UnixSocketTransport
@@ -68,6 +74,37 @@ class TestBasics(CliTestCase):
         code, out, _ = self.run_cli("--json", "share", "list")
         self.assertEqual(code, EXIT_OK)
         self.assertEqual(json.loads(out)[0]["name"], "Media")
+
+
+class TestConnectionNotes(unittest.TestCase):
+    """The sentence under the one-word state."""
+
+    def test_a_problem_gets_its_reason(self) -> None:
+        notes = connection_notes(
+            [{"id": "nas", "state": "auth_failed", "is_problem": True,
+              "message": "the username or password was refused by the server"}]
+        )
+        self.assertEqual(len(notes), 1)
+        self.assertIn("password was refused", notes[0])
+
+    def test_a_read_only_mount_gets_one_even_though_it_is_not_a_problem(self) -> None:
+        # `connected` is correct and is not a problem state, so without this
+        # the table shows one reassuring word and the person goes looking at
+        # the mountpoint's ownership for an answer that is not there.
+        notes = connection_notes(
+            [{"id": "nas", "state": "connected", "is_problem": False,
+              "read_only": True,
+              "message": "mounted read-only — writes will be refused"}]
+        )
+        self.assertEqual(len(notes), 1)
+        self.assertIn("read-only", notes[0])
+
+    def test_a_healthy_connection_stays_quiet(self) -> None:
+        notes = connection_notes(
+            [{"id": "nas", "state": "connected", "is_problem": False,
+              "read_only": False, "message": "mounted"}]
+        )
+        self.assertEqual(notes, [])
 
 
 class TestShares(CliTestCase):

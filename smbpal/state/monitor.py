@@ -137,7 +137,14 @@ class StateMonitor:
             # not change while the failure does not.
             cause = self._journal_cause(mount_name)
         return derive(
-            connection, mounted=mounted, unit=unit, cause=cause, armed=armed
+            connection,
+            mounted=mounted,
+            unit=unit,
+            cause=cause,
+            armed=armed,
+            read_only=self.mounter.probe.is_read_only(connection["mountpoint"])
+            if mounted
+            else None,
         )
 
     def _journal_cause(self, unit_name: str) -> Cause | None:

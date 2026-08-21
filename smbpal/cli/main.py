@@ -217,16 +217,33 @@ def _cmd_status(client: Client, args: argparse.Namespace) -> int:
                 "no connections configured",
             ),
         ]
-        # The state column is one word; anything that needs acting on gets its
-        # sentence. M0 §4's whole point: `No such device` is not a reason.
-        for connection in status["connections"]:
-            if connection.get("is_problem"):
-                blocks.append(f"  ! {connection['id']}: {connection['message']}")
-                if connection.get("hint"):
-                    blocks.append(f"    {connection['hint']}")
+        blocks.extend(connection_notes(status["connections"]))
         return "\n".join(blocks)
 
     return _emit(args, status, human)
+
+
+def connection_notes(connections: list[dict[str, Any]]) -> list[str]:
+    """The sentence behind each one-word state, for the states that need one.
+
+    M0 §4's whole point: `No such device` is not a reason. The table's state
+    column is one word, so anything a person has to act on gets its sentence
+    underneath.
+
+    **`read_only` is here as well as `is_problem`.** A read-only mount is not a
+    failure — it is `connected`, correctly — but the one word alone hides the
+    only thing the person needs to know, and they will go looking at the
+    mountpoint's ownership instead. Same reason §3c labels a read-only share
+    with *why* rather than just showing it as served.
+    """
+    notes: list[str] = []
+    for connection in connections:
+        if not (connection.get("is_problem") or connection.get("read_only")):
+            continue
+        notes.append(f"  ! {connection['id']}: {connection['message']}")
+        if connection.get("hint"):
+            notes.append(f"    {connection['hint']}")
+    return notes
 
 
 def _cmd_browse(client: Client, args: argparse.Namespace) -> int:

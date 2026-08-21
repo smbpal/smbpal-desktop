@@ -61,6 +61,9 @@ class ConnectionState:
     message: str
     errno: int | None = None
     retryable: bool = False
+    # True only when the mount itself is read-only. Never True to mean "the
+    # server might refuse a write" — see MountProbe.is_read_only.
+    read_only: bool = False
 
     @property
     def is_problem(self) -> bool:
@@ -73,6 +76,7 @@ class ConnectionState:
             "message": self.message,
             "errno": self.errno,
             "retryable": self.retryable,
+            "read_only": self.read_only,
             "is_problem": self.is_problem,
         }
 
@@ -84,6 +88,7 @@ def derive(
     unit: dict[str, str] | None,
     cause: Cause | None = None,
     armed: bool | None = None,
+    read_only: bool | None = None,
 ) -> ConnectionState:
     """Work out the state from the mount table, the unit, and the journal.
 
@@ -97,6 +102,16 @@ def derive(
         return ConnectionState(identifier, DISABLED, "not connected automatically")
 
     if mounted:
+        if read_only:
+            return ConnectionState(
+                identifier,
+                CONNECTED,
+                "mounted read-only — writes will be refused",
+                read_only=True,
+            )
+        # Not "mounted, writable". Whether a write succeeds is the server's
+        # decision and we have not asked it; saying so would be a claim we
+        # cannot back up.
         return ConnectionState(identifier, CONNECTED, "mounted")
 
     if unit is None:

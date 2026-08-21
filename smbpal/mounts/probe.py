@@ -71,6 +71,14 @@ class MountEntry:
     mountpoint: str
     fstype: str
     source: str
+    # Field 5 of mountinfo: the per-mount options, which always begin with
+    # `ro` or `rw`. Not the same as the superblock options after the source,
+    # and it is this one that decides whether a write reaches the server.
+    options: str = ""
+
+    @property
+    def read_only(self) -> bool:
+        return "ro" in self.options.split(",")
 
 
 def mount_entries(
@@ -111,6 +119,7 @@ def mount_entries(
                 mountpoint=_unescape(fields[4]),
                 fstype=fields[separator + 1],
                 source=_unescape(fields[separator + 2]),
+                options=fields[5],
             )
         )
     return entries
@@ -154,6 +163,28 @@ class MountProbe:
     def is_armed(self, mountpoint: str) -> bool | None:
         """Is an automount waiting here? Healthy, and not the same as mounted."""
         return self._has(mountpoint, autofs=True)
+
+    def is_read_only(self, mountpoint: str) -> bool | None:
+        """Is the mount here read-only? None when we cannot tell.
+
+        **This answers less than it looks like it does, deliberately.** `False`
+        means the mount is not itself read-only — it does *not* mean a write
+        will succeed, because the server decides that and the only way to ask
+        is to try. So `True` is reported as a reason and `False` is reported as
+        nothing at all: claiming "writable" would be the same mistake as
+        claiming an armed automount is connected.
+        """
+        entries = mount_entries(self.mountinfo)
+        if entries is None:
+            return None
+        wanted = os.path.normpath(mountpoint)
+        for entry in entries:
+            if (
+                os.path.normpath(entry.mountpoint) == wanted
+                and entry.fstype != AUTOFS
+            ):
+                return entry.read_only
+        return None
 
     def _has(self, mountpoint: str, *, autofs: bool) -> bool | None:
         entries = mount_entries(self.mountinfo)

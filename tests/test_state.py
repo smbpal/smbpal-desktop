@@ -131,6 +131,25 @@ class TestMachine(unittest.TestCase):
         state = machine.derive(self.CONNECTION, mounted=True, unit=None)
         self.assertEqual(state.state, machine.CONNECTED)
 
+    def test_a_read_only_mount_says_so(self) -> None:
+        state = machine.derive(
+            self.CONNECTION, mounted=True, unit=None, read_only=True
+        )
+        self.assertEqual(state.state, machine.CONNECTED)
+        self.assertTrue(state.read_only)
+        self.assertIn("read-only", state.message)
+
+    def test_a_writable_mount_is_never_called_writable(self) -> None:
+        # Whether a write succeeds is the server's decision and we have not
+        # asked it. "mounted" is all we can prove; granting write on the NAS
+        # would not change anything we can see from here.
+        state = machine.derive(
+            self.CONNECTION, mounted=True, unit=None, read_only=False
+        )
+        self.assertEqual(state.message, "mounted")
+        self.assertFalse(state.read_only)
+        self.assertNotIn("writable", state.message)
+
     def test_a_failed_unit_with_a_cause_reports_the_cause(self) -> None:
         state = machine.derive(
             self.CONNECTION,

@@ -236,6 +236,7 @@ class Dispatcher:
                     "state": state.state,
                     "message": state.message,
                     "errno": state.errno,
+                    "read_only": state.read_only,
                     "is_problem": state.is_problem,
                 }
             )
