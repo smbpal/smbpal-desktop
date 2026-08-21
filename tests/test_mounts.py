@@ -69,6 +69,19 @@ class TestUnitContent(unittest.TestCase):
             "auto_connect": "on_this_network",
         }
 
+    def test_the_mount_unit_cannot_be_enabled(self) -> None:
+        # An `[Install]` section here is an invitation to `systemctl enable` the
+        # mount, which would mount the share during boot — the single thing the
+        # automount exists to prevent. Only the automount is installable.
+        text = units.mount_unit(self.connection, None)
+        self.assertNotIn("[Install]", text)
+        self.assertNotIn("WantedBy", text)
+
+    def test_the_automount_is_the_installable_one(self) -> None:
+        text = units.automount_unit(self.connection)
+        self.assertIn("[Install]", text)
+        self.assertIn("WantedBy=multi-user.target", text)
+
     def test_the_mount_names_the_remote_and_the_mountpoint(self) -> None:
         text = units.mount_unit(self.connection, "/etc/smbpal/credentials/nas")
         self.assertIn("What=//rivendell.local/Media", text)
