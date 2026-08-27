@@ -136,7 +136,17 @@ class Client:
                 )
                 + "\n"
             ).encode("utf-8")
-            sock.sendall(frame)
+            try:
+                sock.sendall(frame)
+            except OSError as exc:
+                # A daemon that stopped since we connected. The send is where
+                # that is discovered, and D12 is explicit that it must reach
+                # the user as a sentence rather than as a BrokenPipeError
+                # traceback out of the middle of a CLI command.
+                raise DaemonUnreachable(
+                    "the daemon closed the connection",
+                    detail="It may have been restarted. Try the command again.",
+                ) from exc
 
             # Skip events that arrive while we are waiting for our reply; they
             # are unsolicited by definition and must not be mistaken for one.

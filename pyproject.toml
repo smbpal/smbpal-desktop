@@ -18,6 +18,9 @@ dependencies = []
 [project.scripts]
 smbpal = "smbpal.cli.main:main"
 smbpald = "smbpal.daemon.main:main"
+# Imports gi, so it is the one entry point that needs python3-gi and
+# gir1.2-gtk-4.0 installed. Nothing the daemon or the CLI runs touches it.
+smbpal-gui = "smbpal.gui.app:main"
 
 [tool.setuptools.packages.find]
 include = ["smbpal*"]

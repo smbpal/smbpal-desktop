@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import unittest
 
+from smbpal.daemon import handlers
 from smbpal.gui import model
+from smbpal.mounts import apply as mounts_apply
+from smbpal.mounts import probe
+from smbpal.state import machine
 
 
 class TestConnectionRows(unittest.TestCase):
@@ -200,6 +204,161 @@ class TestPushedEvents(unittest.TestCase):
             {"id": "a", "state": "unresolved", "message": "…", "hint": "try the fallback"},
         )
         self.assertEqual(updated[0].hint, "try the fallback")
+
+
+class TestActionWiring(unittest.TestCase):
+    """`Remove` is two different methods, and the widgets must not decide which."""
+
+    def test_remove_on_a_share_and_on_a_connection_are_different_methods(self) -> None:
+        share = model.share_row({"id": "docs", "name": "Docs", "state": "serving"})
+        connection = model.connection_row({"id": "media", "state": "idle"})
+        self.assertEqual(model.method_for(share, model.REMOVE), "share.remove")
+        self.assertEqual(
+            model.method_for(connection, model.REMOVE), "connection.remove"
+        )
+
+    def test_every_offered_action_has_a_method_and_a_label(self) -> None:
+        """A button with no method behind it is a button that does nothing."""
+        rows = [
+            model.connection_row({"id": "a", "state": state, "fallback_host": "10.0.0.5"})
+            for state in _CONNECTION_STATES
+        ] + [
+            model.share_row({"id": "s", "name": "S", "read_only": True,
+                             "credential_ref": "c"}),
+            model.share_row({"id": "s", "name": "S", "state": "serving"}),
+        ]
+        for row in rows:
+            for action in row.actions:
+                with self.subTest(section=row.section, action=action):
+                    self.assertTrue(model.method_for(row, action))
+                    self.assertIn(action, model.ACTION_LABELS)
+
+    def test_an_action_the_section_does_not_have_is_a_mistake_not_a_no_op(self) -> None:
+        share = model.share_row({"id": "docs", "name": "Docs", "state": "serving"})
+        with self.assertRaises(ValueError):
+            model.method_for(share, model.DISCONNECT)
+
+
+class TestConfirmations(unittest.TestCase):
+    def test_removing_a_share_promises_the_folder_is_left_alone(self) -> None:
+        row = model.share_row({"id": "docs", "name": "Docs", "path": "/srv/docs"})
+        text = model.confirmation(row, model.REMOVE)
+        self.assertIn("stays exactly where it is", text)
+
+    def test_removing_a_connection_names_where_it_will_stop_appearing(self) -> None:
+        row = model.connection_row(
+            {"id": "media", "host": "h", "share": "s", "mountpoint": "/media/pi/Media",
+             "state": "connected"}
+        )
+        self.assertIn("/media/pi/Media", model.confirmation(row, model.REMOVE))
+
+    def test_making_a_share_writable_says_it_changes_ownership(self) -> None:
+        row = model.share_row(
+            {"id": "docs", "name": "Docs", "path": "/srv/docs", "read_only": True,
+             "credential_ref": "c"}
+        )
+        text = model.confirmation(row, model.MAKE_WRITABLE)
+        self.assertIn("changes who owns", text)
+        self.assertIn("cannot be undone", text)
+
+    def test_a_reversible_action_asks_nothing(self) -> None:
+        row = model.connection_row({"id": "media", "state": "idle"})
+        self.assertIsNone(model.confirmation(row, model.CONNECT))
+
+    def test_everything_marked_as_needing_confirming_has_something_to_say(self) -> None:
+        rows = [
+            model.connection_row({"id": "a", "state": "connected"}),
+            model.share_row({"id": "s", "name": "S", "read_only": True,
+                             "credential_ref": "c"}),
+        ]
+        for row in rows:
+            for action in row.actions:
+                if action in model.NEEDS_CONFIRMING:
+                    with self.subTest(section=row.section, action=action):
+                        self.assertTrue(model.confirmation(row, action))
+
+
+_CONNECTION_STATES = (
+    "connected", "connecting", "reconnecting", "idle", "disabled", "unknown",
+    "failed", "auth_failed", "unreachable", "unresolved",
+)
+
+
+class TestEveryStateIsAccountedFor(unittest.TestCase):
+    """The bug this pins, found by opening the window rather than by a test.
+
+    `share_row` and `connection_row` used to end in an `else` that painted an
+    unrecognised state red and used the state token as its own explanation. So
+    a share whose state was `unknown` — meaning *SMBPal could not ask Samba* —
+    appeared as a broken share, explained by the word "unknown". These walk the
+    vocabularies the daemon actually emits, so a state added there fails here
+    instead of reaching somebody as a red row saying nothing.
+    """
+
+    def test_every_connection_state_the_daemon_can_send_has_a_presentation(self) -> None:
+        # Three sources, because three things produce a connection's state: the
+        # monitor, the planner (before the monitor's first look), and the
+        # daemon itself when it was started with --no-apply.
+        states = (
+            set(machine.STATES)
+            | set(probe.STATES)
+            | {mounts_apply.OCCUPIED, mounts_apply.NO_CREDENTIALS}
+            | {handlers.NOT_APPLIED}
+        )
+        for state in sorted(states):
+            with self.subTest(state=state):
+                row = model.connection_row({"id": "a", "state": state})
+                self.assertNotEqual(
+                    (row.tone, row.message),
+                    model.UNRECOGNISED,
+                    f"{state!r} reaches the window with nothing decided about it",
+                )
+                self.assertTrue(row.message)
+
+    def test_every_share_state_the_daemon_can_send_has_a_presentation(self) -> None:
+        for state in handlers.SHARE_STATES:
+            with self.subTest(state=state):
+                row = model.share_row({"id": "s", "name": "S", "state": state})
+                self.assertNotEqual(
+                    (row.tone, row.message),
+                    model.UNRECOGNISED,
+                    f"{state!r} reaches the window with nothing decided about it",
+                )
+                self.assertTrue(row.message)
+
+    def test_a_state_nobody_planned_for_is_calm_and_says_so(self) -> None:
+        """It is our gap, not the share's fault, so it must not read as one."""
+        row = model.share_row({"id": "s", "name": "S", "state": "something new"})
+        self.assertEqual(row.tone, model.MUTED)
+        self.assertIn("does not recognise", row.message)
+
+    def test_a_share_samba_could_not_be_asked_about_is_not_shown_as_broken(self) -> None:
+        row = model.share_row({"id": "s", "name": "S", "state": "unknown"})
+        self.assertEqual(row.tone, model.MUTED)
+        self.assertIn("could not ask Samba", row.message)
+
+    def test_a_connection_with_no_stored_password_offers_to_take_one(self) -> None:
+        row = model.connection_row({"id": "a", "state": mounts_apply.NO_CREDENTIALS})
+        self.assertEqual(row.actions[0], model.SET_CREDENTIALS)
+        self.assertNotIn(model.CONNECT, row.actions)
+
+    def test_an_occupied_mountpoint_does_not_offer_a_button_that_would_fail(self) -> None:
+        row = model.connection_row({"id": "a", "state": mounts_apply.OCCUPIED})
+        self.assertNotIn(model.CONNECT, row.actions)
+        self.assertEqual(row.tone, model.PROBLEM)
+
+    def test_a_mount_the_monitor_has_not_seen_yet_is_still_shown_as_mounted(self) -> None:
+        """The planner says `mounted`; the monitor says `connected`. Both are OK."""
+        row = model.connection_row({"id": "a", "state": probe.MOUNTED})
+        self.assertEqual(row.tone, model.OK)
+        self.assertIn(model.DISCONNECT, row.actions)
+
+    def test_an_unmounted_automount_is_calm_whichever_word_arrived(self) -> None:
+        for state in (machine.IDLE, probe.NOT_MOUNTED):
+            with self.subTest(state=state):
+                row = model.connection_row({"id": "a", "state": state})
+                self.assertEqual(row.tone, model.IDLE)
+                self.assertIn(model.CONNECT, row.actions)
 
 
 if __name__ == "__main__":

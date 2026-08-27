@@ -261,6 +261,40 @@ class TestSocket(ServerTestCase):
         self.thread.start()
         self.assertEqual(self.client().call("ping"), {"pong": True})
 
+    def test_shutting_down_hangs_up_rather_than_leaving_clients_hanging(self) -> None:
+        """A stopped daemon must be *discoverably* stopped.
+
+        The client's own socket timeout would eventually notice, but a GUI that
+        held a live-looking connection to a daemon that had gone would sit
+        there for the length of that timeout showing state nobody is updating.
+        Asserting on which error arrives is the point: the timeout raises the
+        same class, so only the message tells the two apart.
+        """
+        client = Client(self.socket_path, timeout=5.0)
+        client.connect()
+        self.addCleanup(client.close)
+        self.assertEqual(client.call("ping"), {"pong": True})
+
+        self.transport.shutdown()
+        self.thread.join(timeout=5)
+        with self.assertRaises(DaemonUnreachable) as caught:
+            client.call("ping")
+        self.assertIn("closed the connection", caught.exception.message)
+
+    def test_shutting_down_with_a_client_attached_still_removes_the_socket(self) -> None:
+        """Found by the GUI: `shutdown` used to be able to raise part-way.
+
+        It recorded each client's thread before starting it, so a shutdown that
+        landed in that window joined an unstarted thread and raised
+        RuntimeError — out of the one code path that removes the socket file,
+        which then made the next start think a daemon was already running.
+        """
+        client = self.client()
+        client.call("ping")
+        self.transport.shutdown()
+        self.thread.join(timeout=5)
+        self.assertFalse(self.socket_path.exists())
+
     def test_the_socket_is_not_world_accessible(self) -> None:
         mode = stat.S_IMODE(self.socket_path.stat().st_mode)
         self.assertEqual(mode & stat.S_IRWXO, 0, f"world bits set: {mode:04o}")

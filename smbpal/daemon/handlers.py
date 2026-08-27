@@ -39,6 +39,31 @@ audit = logging.getLogger("smbpal.audit")
 
 Method = Callable[["Dispatcher", Request, PeerCredentials], Any]
 
+# The vocabulary `status` uses for a share. Public and named because a client
+# has to say something sensible about each of them, and a client cannot notice
+# a state it has never been told exists: a GUI that fell through to printing
+# the raw token would explain a share by repeating its state back. Pinned by a
+# test in tests/test_gui_model.py, so adding one here fails there.
+SHARE_SERVING = "serving"
+SHARE_READ_ONLY = "read-only"
+SHARE_NOT_SERVED = "not served"
+SHARE_DISABLED = "disabled"
+SHARE_UNKNOWN = "unknown"
+SHARE_UNMANAGED = "unmanaged"
+
+# Both lists carry this one: it is a property of the daemon, not of the record.
+NOT_APPLIED = "not applied"
+
+SHARE_STATES = (
+    SHARE_SERVING,
+    SHARE_READ_ONLY,
+    SHARE_NOT_SERVED,
+    SHARE_DISABLED,
+    SHARE_UNKNOWN,
+    SHARE_UNMANAGED,
+    NOT_APPLIED,
+)
+
 
 class Authoriser:
     """Decides *may act*, which the socket's group guard does not answer (D4).
@@ -246,7 +271,7 @@ class Dispatcher:
     def _connection_states(self, config: dict[str, Any]) -> list[dict[str, Any]]:
         if self.mounter is None:
             return [
-                {**conn, "state": "not applied"}
+                {**conn, "state": NOT_APPLIED}
                 for conn in config.get("connections", [])
             ]
         # Shallow by construction: `plan` answers from the kernel's mount table
@@ -278,7 +303,7 @@ class Dispatcher:
 
     def _share_states(self, config: dict[str, Any]) -> list[dict[str, Any]]:
         if self.applier is None:
-            return [{**s, "state": "not applied"} for s in config.get("shares", [])]
+            return [{**s, "state": NOT_APPLIED} for s in config.get("shares", [])]
 
         # Ask Samba what it is actually serving rather than assuming our own
         # writes took (M0 §1a: testparm's verdict proves nothing about our file).
@@ -292,13 +317,13 @@ class Dispatcher:
         for planned in self.applier.plan(config):
             row = planned.to_wire()
             if not planned.share.get("enabled", True):
-                row["state"] = "disabled"
+                row["state"] = SHARE_DISABLED
             elif serving is None:
-                row["state"] = "unknown"
+                row["state"] = SHARE_UNKNOWN
             elif planned.share["name"] in serving:
-                row["state"] = "read-only" if planned.read_only else "serving"
+                row["state"] = SHARE_READ_ONLY if planned.read_only else SHARE_SERVING
             else:
-                row["state"] = "not served"
+                row["state"] = SHARE_NOT_SERVED
             rows.append(row)
 
         if effective is not None:
@@ -317,7 +342,7 @@ class Dispatcher:
                         "name": name,
                         "path": path or "?",
                         "enabled": True,
-                        "state": "unmanaged",
+                        "state": SHARE_UNMANAGED,
                         "managed": False,
                     }
                 )

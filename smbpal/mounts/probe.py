@@ -63,6 +63,11 @@ NOT_MOUNTED = "not mounted"
 CHECKING = "checking"
 UNKNOWN = "unknown"
 
+# Everything `MountProbe.state` can return. These reach a client whenever the
+# state monitor has not looked at a connection yet, so they are part of the
+# vocabulary a UI has to cover and not an internal detail.
+STATES = (MOUNTED, UNREACHABLE, NOT_MOUNTED, CHECKING, UNKNOWN)
+
 
 @dataclass(frozen=True)
 class Reachability:

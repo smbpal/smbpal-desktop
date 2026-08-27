@@ -116,6 +116,7 @@ class UnixSocketTransport:
         self._listener: socket.socket | None = None
         self._connections: set[UnixSocketConnection] = set()
         self._connections_lock = threading.Lock()
+        self._threads_lock = threading.Lock()
         self._threads: list[threading.Thread] = []
         self._stopping = threading.Event()
         # shutdown() is called from both the signal handler and the serve
@@ -202,8 +203,14 @@ class UnixSocketTransport:
                 name="smbpald-client",
                 daemon=True,
             )
-            self._threads.append(thread)
+            # Started before it is recorded, and recorded under the lock.
+            # The other order has a window in which `shutdown()` on another
+            # thread joins a thread that has not started, which is a
+            # RuntimeError out of the shutdown path — and the shutdown path is
+            # what removes the socket file.
             thread.start()
+            with self._threads_lock:
+                self._threads.append(thread)
 
     def _serve_client(self, sock: socket.socket, handler: Handler) -> None:
         try:
@@ -217,6 +224,12 @@ class UnixSocketTransport:
 
         connection = UnixSocketConnection(sock, peer)
         with self._connections_lock:
+            if self._stopping.is_set():
+                # Accepted a moment before shutdown swept the connections, so
+                # this one would never be closed and the client would sit
+                # believing a stopped daemon is still there.
+                connection.close()
+                return
             self._connections.add(connection)
         log.debug("client connected: %s", peer.describe())
         try:
@@ -253,9 +266,11 @@ class UnixSocketTransport:
             targets = list(self._connections)
         for connection in targets:
             connection.close()
-        for thread in self._threads:
+        with self._threads_lock:
+            threads = list(self._threads)
+            self._threads.clear()
+        for thread in threads:
             thread.join(timeout=2.0)
-        self._threads.clear()
         # Leaving the socket behind would make the next start think a daemon is
         # running until it probes and finds nothing.
         self.path.unlink(missing_ok=True)

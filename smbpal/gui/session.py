@@ -79,7 +79,13 @@ class Session:
         self._stopping = threading.Event()
         self._threads: list[threading.Thread] = []
         self._command: Client | None = None
-        self._listener: Client | None = None
+        # Every live socket, so stop() can wake all of them. A set rather than
+        # two attributes because the bug it fixes is a race: a listener that
+        # connected *between* stop()'s sweep and its join sat out the client's
+        # full socket timeout, which turned closing the window into a five
+        # second pause and the test suite into a flake.
+        self._clients: set[Client] = set()
+        self._clients_lock = threading.Lock()
         # "Back" is only meaningful after a loss. Without this the window would
         # announce a recovery every time it opened.
         self._lost = False
@@ -103,14 +109,17 @@ class Session:
         thread.start()
 
     def stop(self, *, timeout: float = 2.0) -> None:
-        self._stopping.set()
+        # Under the lock, and before the sweep: a thread that reaches `_track`
+        # after this point is refused a socket rather than parked on one.
+        with self._clients_lock:
+            self._stopping.set()
+            live = list(self._clients)
         self._jobs.put(_STOP)
         # Both threads may be inside recv() — the listener always is, by
         # design. Setting a flag they cannot see until the socket says
         # something would make closing the window take a timeout.
-        for client in (self._command, self._listener):
-            if client is not None:
-                client.interrupt()
+        for client in live:
+            client.interrupt()
         for thread in self._threads:
             thread.join(timeout=timeout)
         self._threads.clear()
@@ -145,12 +154,10 @@ class Session:
     def _work(self) -> None:
         while not self._stopping.is_set():
             job = self._jobs.get()
-            if job is _STOP:
+            if job is _STOP or self._stopping.is_set():
                 break
             self._run(job)
-        if self._command is not None:
-            self._command.close()
-            self._command = None
+        self._drop()
 
     def _run(self, job: _Job) -> None:
         try:
@@ -196,18 +203,36 @@ class Session:
 
     def _command_client(self) -> Client:
         if self._command is None:
-            client = self._factory()
-            client.connect()
+            client = self._connect()
             self._command = client
         return self._command
 
     def _drop(self) -> None:
-        if self._command is not None:
-            try:
-                self._command.close()
-            except OSError:  # pragma: no cover - already gone
-                pass
-            self._command = None
+        client, self._command = self._command, None
+        if client is not None:
+            self._release(client)
+
+    # --- socket bookkeeping ------------------------------------------------
+
+    def _connect(self) -> Client:
+        """A live client, tracked — or nothing at all, if we are stopping."""
+        client = self._factory()
+        client.connect()
+        with self._clients_lock:
+            if self._stopping.is_set():
+                # stop() has already swept; this socket would never be woken.
+                client.close()
+                raise DaemonUnreachable("the session is closing")
+            self._clients.add(client)
+        return client
+
+    def _release(self, client: Client) -> None:
+        with self._clients_lock:
+            self._clients.discard(client)
+        try:
+            client.close()
+        except OSError:  # pragma: no cover - already gone
+            pass
 
     # --- the listener ------------------------------------------------------
 
@@ -215,9 +240,7 @@ class Session:
         while not self._stopping.is_set():
             client: Client | None = None
             try:
-                client = self._factory()
-                client.connect()
-                self._listener = client
+                client = self._connect()
                 self._marshal_back()
                 for message in client.events():
                     if self._stopping.is_set():
@@ -234,9 +257,8 @@ class Session:
                     break
                 self._lost_once(DaemonUnreachable(str(exc)))
             finally:
-                self._listener = None
                 if client is not None:
-                    client.close()
+                    self._release(client)
             # Event.wait, not sleep: stop() must not have to outlast a backoff.
             if self._stopping.wait(self._retry_seconds):
                 break

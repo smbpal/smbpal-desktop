@@ -48,6 +48,10 @@ def _where(path: Path) -> str | None:
 # state rather than as an error from systemd.
 OCCUPIED = "mountpoint in use"
 
+# A connection that names a credential file which is not there. Distinct from
+# `auth_failed`: nothing has been refused, because nothing has been offered.
+NO_CREDENTIALS = "no credentials"
+
 
 def foreign_mount(
     entry: probe_module.MountEntry | None, connection: dict[str, Any]
@@ -165,7 +169,7 @@ class Mounter:
                 # otherwise say `mounted` — about their filesystem, not ours.
                 state = OCCUPIED
             elif not has_credentials and connection.get("credential_ref"):
-                state = "no credentials"
+                state = NO_CREDENTIALS
             planned.append(
                 PlannedConnection(
                     connection=connection,

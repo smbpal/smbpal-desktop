@@ -41,24 +41,125 @@ USE_FALLBACK = "use_fallback"
 MAKE_WRITABLE = "make_writable"
 SET_CREDENTIALS = "set_credentials"
 
-# `idle` is deliberately not OK and not a problem. It is the state a healthy
-# connection spends most of its life in, and M0 §4 is why: the mount happens on
-# first access, 80 s after boot in that measurement.
-_CONNECTION_TONES = {
-    "connected": OK,
-    "connecting": BUSY,
-    "reconnecting": BUSY,
-    "idle": IDLE,
-    "disabled": MUTED,
-    "unknown": MUTED,
-    "failed": PROBLEM,
-    "auth_failed": PROBLEM,
-    "unreachable": PROBLEM,
-    "unresolved": PROBLEM,
+SHARE = "share"
+CONNECTION = "connection"
+UNACCOUNTED = "unaccounted"
+
+# What the button says. Prose belongs here with the rest of the decisions; a
+# view that chose its own wording would be a second place to look when the
+# wording is wrong.
+ACTION_LABELS = {
+    CONNECT: "Connect",
+    DISCONNECT: "Disconnect",
+    REMOVE: "Remove\u2026",
+    USE_FALLBACK: "Use the fallback address",
+    MAKE_WRITABLE: "Make writable\u2026",
+    SET_CREDENTIALS: "Set password\u2026",
 }
 
+# Everything that changes the machine and cannot be undone by pressing it again.
+NEEDS_CONFIRMING = frozenset({REMOVE, MAKE_WRITABLE})
+
+_METHODS = {
+    (CONNECTION, CONNECT): "connection.connect",
+    (CONNECTION, DISCONNECT): "connection.disconnect",
+    (CONNECTION, REMOVE): "connection.remove",
+    (CONNECTION, USE_FALLBACK): "connection.use_fallback",
+    (CONNECTION, SET_CREDENTIALS): "connection.set_credentials",
+    (SHARE, REMOVE): "share.remove",
+    (SHARE, MAKE_WRITABLE): "share.make_writable",
+}
+
+# What each connection state looks like, and what it says when the daemon has
+# not said anything better. **Two vocabularies meet here.** A connection the
+# state monitor has looked at carries one of `smbpal.state.machine`'s words; a
+# connection it has not looked at yet — one added a moment ago — carries the
+# planner's, straight from the mount table. Both reach this window, so both are
+# in this table, and a test pins that.
+#
+# `idle` is deliberately neither OK nor a problem. It is the state a healthy
+# connection spends most of its life in, and M0 §4 is why: the mount happens on
+# first access, 80 s after boot in that measurement.
+_READY = "ready — it will connect when you open it"
+
+_CONNECTION_PRESENTATION: dict[str, tuple[str, str]] = {
+    # From the state monitor.
+    "connected": (OK, "mounted"),
+    "connecting": (BUSY, "mounting"),
+    "reconnecting": (BUSY, "it failed, and systemd is trying again"),
+    "idle": (IDLE, _READY),
+    "disabled": (MUTED, "not connected automatically"),
+    "unknown": (MUTED, "SMBPal cannot tell whether this is connected"),
+    "failed": (PROBLEM, "it did not connect"),
+    "auth_failed": (PROBLEM, "the server refused the username or password"),
+    "unreachable": (PROBLEM, "the server did not answer"),
+    "unresolved": (PROBLEM, "that name did not resolve to an address"),
+    # From the planner, before the monitor has had a look.
+    "mounted": (OK, "mounted"),
+    "not mounted": (IDLE, _READY),
+    "checking": (BUSY, "checking"),
+    "mountpoint in use": (
+        PROBLEM,
+        "something else is mounted here, and SMBPal will not mount on top of it",
+    ),
+    "no credentials": (PROBLEM, "no password is stored for this connection"),
+    # From the daemon itself.
+    "not applied": (MUTED, "in the config; this daemon is not mounting anything"),
+}
+
+_CONNECTED = frozenset({"connected", "mounted"})
+
+# Where offering Connect is honest. Not `mountpoint in use` — pressing it would
+# fail for a reason the button cannot fix — and not `no credentials`, which
+# wants the password first.
 _NOT_CONNECTED = frozenset(
-    {"idle", "failed", "auth_failed", "unreachable", "unresolved", "unknown"}
+    {
+        "idle",
+        "not mounted",
+        "failed",
+        "auth_failed",
+        "unreachable",
+        "unresolved",
+        "unknown",
+    }
+)
+
+# States where the password is the thing to change. `auth_failed` because
+# retrying will reproduce the refusal; `no credentials` because there is
+# nothing to retry with.
+_WANTS_CREDENTIALS = frozenset({"auth_failed", "no credentials"})
+
+# What each share state looks like, and what it says. **A table rather than a
+# chain of `elif`s with an `else`**, because the else was the bug: a state the
+# presenter had not been told about came out red, with the raw state token as
+# its own explanation. Neither half of that was true — `unknown` means we could
+# not ask Samba, which is not the share being broken, and "not served" is not a
+# sentence.
+_SHARE_PRESENTATION: dict[str, tuple[str, str]] = {
+    "serving": (OK, "shared"),
+    "read-only": (ATTENTION, ""),  # §3c fills this in; it has a reason to give
+    "not served": (
+        PROBLEM,
+        "in the config, but Samba is not serving it — run `smbpal apply`",
+    ),
+    "disabled": (MUTED, "switched off; still in the config, but not shared"),
+    "unknown": (
+        MUTED,
+        "SMBPal could not ask Samba what it is serving, so this may or may not "
+        "be shared",
+    ),
+    "unmanaged": (MUTED, "not created by SMBPal, and not modified by it"),
+    "not applied": (
+        MUTED,
+        "this daemon is holding the config only and is not serving anything",
+    ),
+}
+
+# What a state nobody planned for looks like. Public so a test can assert that
+# nothing the daemon emits lands on it.
+UNRECOGNISED = (
+    MUTED,
+    "SMBPal does not recognise this state, so it cannot say what it means",
 )
 
 
@@ -74,6 +175,10 @@ class Row:
     tone: str = MUTED
     actions: tuple[str, ...] = ()
     hint: str | None = None
+    # Which list this row came from. `Remove` means two different daemon
+    # methods depending on the answer, and the view must not be the thing that
+    # knows which.
+    section: str = CONNECTION
 
     @property
     def needs_attention(self) -> bool:
@@ -107,6 +212,7 @@ class Screen:
 def connection_row(connection: dict[str, Any]) -> Row:
     """One connection, as the window shows it."""
     state = connection.get("state") or "unknown"
+    tone, default = _CONNECTION_PRESENTATION.get(state, UNRECOGNISED)
     host = connection.get("host", "?")
     share = connection.get("share", "?")
     return Row(
@@ -114,36 +220,68 @@ def connection_row(connection: dict[str, Any]) -> Row:
         title=f"//{host}/{share}",
         subtitle=connection.get("mountpoint", ""),
         state=state,
-        message=connection.get("message") or _default_message(state),
-        tone=_CONNECTION_TONES.get(state, MUTED),
+        # The daemon's own message wins when it has one: it has read the unit
+        # and, where that failed, the journal. This table is what a row falls
+        # back to, never a second opinion competing with the first.
+        message=connection.get("message") or default,
+        tone=tone,
         actions=_connection_actions(connection, state),
         hint=connection.get("hint"),
+        section=CONNECTION,
     )
 
 
+def method_for(row: Row, action: str) -> str:
+    """The daemon method one of a row's buttons calls."""
+    try:
+        return _METHODS[(row.section, action)]
+    except KeyError:
+        raise ValueError(f"{action!r} is not an action on a {row.section}") from None
+
+
+def confirmation(row: Row, action: str) -> str | None:
+    """What to ask before doing it, or None when there is nothing to ask.
+
+    Named as the consequence rather than as the verb. "Are you sure?" tells
+    somebody nothing they did not already know when they pressed the button.
+    """
+    if action == REMOVE and row.section == SHARE:
+        return (
+            f"Stop sharing {row.title}?\n\nThe folder and everything in it "
+            f"stays exactly where it is. Anyone connected to it now will lose "
+            f"the connection."
+        )
+    if action == REMOVE and row.section == CONNECTION:
+        return (
+            f"Remove {row.title}?\n\nIt will be unmounted and will no longer "
+            f"appear at {row.subtitle}. Nothing on the server is changed."
+        )
+    if action == MAKE_WRITABLE:
+        return (
+            f"Allow writing to {row.title}?\n\nThis changes who owns "
+            f"{row.subtitle} on this computer. It cannot be undone by SMBPal."
+        )
+    return None
+
+
 def _default_message(state: str) -> str:
-    # `status` carries a message for every state the monitor derived. A row
-    # built from `connection.list` has none, and a blank second line reads as
-    # missing information rather than as nothing to say.
-    return {
-        "idle": "ready — it will connect when you open it",
-        "connected": "mounted",
-        "disabled": "not connected automatically",
-    }.get(state, state)
+    """What a row says when the event or reply carried no message of its own."""
+    return _CONNECTION_PRESENTATION.get(state, UNRECOGNISED)[1]
 
 
 def _connection_actions(connection: dict[str, Any], state: str) -> tuple[str, ...]:
     actions: list[str] = []
-    if state == "connected":
+    if state in _WANTS_CREDENTIALS:
+        # First, because it is the only one of these that changes the outcome.
+        # A Connect button here would reproduce the failure and look like the
+        # app not listening.
+        actions.append(SET_CREDENTIALS)
+    if state in _CONNECTED:
         # The only place this works. A file manager's eject cannot unmount a
         # systemd mount: it runs `umount` as the user and the kernel refuses.
         actions.append(DISCONNECT)
     elif state in _NOT_CONNECTED:
         actions.append(CONNECT)
-    if state == "auth_failed":
-        # Retrying will not help; the password is the thing to change, so offer
-        # that rather than a Connect button that reproduces the failure.
-        actions.insert(0, SET_CREDENTIALS)
     if state == "unresolved" and connection.get("fallback_host"):
         # §3e: offered, never taken automatically — the address may since
         # belong to a different machine.
@@ -155,47 +293,44 @@ def _connection_actions(connection: dict[str, Any], state: str) -> tuple[str, ..
 def share_row(share: dict[str, Any]) -> Row:
     """One share, with §3c's reason attached rather than implied."""
     state = share.get("state") or "unknown"
-    read_only = bool(share.get("read_only"))
-    actions: list[str] = []
-    message = state
+    read_only = bool(share.get("read_only")) or state == "read-only"
+    tone, message = _SHARE_PRESENTATION.get(state, UNRECOGNISED)
 
     if state == "unmanaged":
         # §8 parks adopting these. Visible, marked, and no action offered —
         # there is nothing SMBPal may correctly do to it.
-        message = "not created by SMBPal, and not modified by it"
         return Row(
             id=share.get("id", "-"),
             title=share.get("name", "?"),
             subtitle=share.get("path", ""),
             state=state,
             message=message,
-            tone=MUTED,
+            tone=tone,
+            section=SHARE,
         )
 
-    if read_only or state == "read-only":
+    actions: list[str] = []
+    if read_only:
+        # Read-only is not a failure — it is §3c working — but it is the one
+        # thing about the share a person needs told, so it asks for attention
+        # without claiming to be broken.
+        tone = ATTENTION
         message = share.get("read_only_reason") or (
             "shared read-only because the folder belongs to someone else"
         )
         if share.get("credential_ref"):
             actions.append(MAKE_WRITABLE)
-    elif state == "serving":
-        message = "shared"
-    elif state == "not served":
-        message = "configured, but Samba is not serving it"
-
     actions.append(REMOVE)
+
     return Row(
         id=share.get("id", "-"),
         title=share.get("name", "?"),
         subtitle=share.get("path", ""),
         state=state,
         message=message,
-        # Read-only is not a failure — it is §3c working — but it is the one
-        # thing about the share a person needs told, so it asks for attention
-        # without claiming to be broken.
-        tone=ATTENTION if (read_only or state == "read-only") else
-        {"serving": OK, "disabled": MUTED}.get(state, PROBLEM),
+        tone=tone,
         actions=tuple(actions),
+        section=SHARE,
     )
 
 
@@ -211,6 +346,7 @@ def unaccounted_row(finding: dict[str, Any]) -> Row:
         # An orphan is ours and is still mounting on access with nothing in the
         # config saying so. Somebody else's mount is information, not a task.
         tone=ATTENTION if orphaned else MUTED,
+        section=UNACCOUNTED,
     )
 
 
@@ -245,11 +381,12 @@ def apply_event(rows: list[Row], data: dict[str, Any]) -> list[Row]:
                 subtitle=data.get("mountpoint") or row.subtitle,
                 state=state,
                 message=data.get("message") or _default_message(state),
-                tone=_CONNECTION_TONES.get(state, MUTED),
+                tone=_CONNECTION_PRESENTATION.get(state, UNRECOGNISED)[0],
                 actions=_connection_actions(
                     {"fallback_host": None, **data}, state
                 ),
                 hint=data.get("hint"),
+                section=row.section,
             )
         )
     return updated

@@ -38,6 +38,22 @@ FAILED = "failed"
 DISABLED = "disabled"
 UNKNOWN = "unknown"
 
+# Every state `derive` can return. Public because a client has to be able to
+# say something about each one, and a client cannot notice a state nobody told
+# it about — the GUI's test walks this tuple for exactly that reason.
+STATES = (
+    IDLE,
+    CONNECTING,
+    CONNECTED,
+    RECONNECTING,
+    UNREACHABLE,
+    UNRESOLVED,
+    AUTH_FAILED,
+    FAILED,
+    DISABLED,
+    UNKNOWN,
+)
+
 # The states a person should be shown as a problem. Everything else is either
 # working or on its way there.
 PROBLEM_STATES = frozenset({UNREACHABLE, UNRESOLVED, AUTH_FAILED, FAILED})
