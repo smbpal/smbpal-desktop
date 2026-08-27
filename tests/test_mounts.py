@@ -526,6 +526,30 @@ class TestMounter(unittest.TestCase):
         self.mounter.apply(empty_config())
         self.assertEqual(list(self.unit_dir.iterdir()), [])
 
+    def test_a_commit_removes_what_that_change_dropped(self) -> None:
+        config = self.config()
+        self.mounter.apply(config)
+        self.mounter.apply(empty_config(), previous=config)
+        self.assertEqual(list(self.unit_dir.iterdir()), [])
+
+    def test_a_commit_leaves_alone_what_its_config_never_mentioned(self) -> None:
+        # The 27 August Pi case. The daemon opened --config
+        # /tmp/smbpal-test.json, which does not exist, while the real
+        # connection sat in /etc/smbpal/config.json. One `connection add`
+        # against that empty document must not reap a working setup.
+        config = self.config()
+        self.mounter.apply(config)
+        before = {p.name for p in self.unit_dir.iterdir()}
+        self.mounter.apply(empty_config(), previous=empty_config())
+        self.assertEqual({p.name for p in self.unit_dir.iterdir()}, before)
+
+    def test_an_explicit_apply_still_sweeps(self) -> None:
+        # No `previous` means a person typed `smbpal apply`, which is the
+        # command for exactly this. Deliberate, so it is allowed.
+        self.mounter.apply(self.config())
+        self.mounter.apply(empty_config())
+        self.assertEqual(list(self.unit_dir.iterdir()), [])
+
     def test_credentials_reach_the_unit_as_a_path(self) -> None:
         config = self.config(credential_ref="nas")
         self.mounter.credentials.write("nas", username="pi", password="hunter2")

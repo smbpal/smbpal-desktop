@@ -318,6 +318,20 @@ class TestUnaccounted(CliTestCase):
         self.assertEqual(code, EXIT_OK)
         self.assertIn("nothing on this machine is unaccounted for", out)
 
+    def test_a_commit_does_not_reap_units_this_config_never_knew(self) -> None:
+        # The 27 August near-miss, end to end. The daemon is looking at a
+        # config that has never mentioned this unit; adding an unrelated
+        # connection must not tear the existing one down.
+        # Nothing mounted, so the only thing that can protect the unit is the
+        # diff rule — not the "do not destroy the evidence" check, which needs
+        # a live mount to fire.
+        self.mountinfo.write_text("", encoding="utf-8")
+        root = Path(self._dir.name)
+        other = str((root / "mnt" / "other").resolve())
+        code, _, err = self.run_cli("connection", "add", "moria.local", "Backups", other)
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertTrue((self.unit_dir / "mnt-smbpal.mount").exists())
+
     def test_a_configured_connection_is_not_reported_as_unaccounted(self) -> None:
         self.run_cli(
             "connection", "add", "rivendell.local", "Media", self.mountpoint

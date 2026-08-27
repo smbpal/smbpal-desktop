@@ -160,7 +160,28 @@ class Mounter:
 
     # --- applying ----------------------------------------------------------
 
-    def apply(self, config: dict[str, Any]) -> MountReport:
+    def apply(
+        self, config: dict[str, Any], *, previous: dict[str, Any] | None = None
+    ) -> MountReport:
+        """Reconcile the units on disk against `config`.
+
+        **`previous` decides what may be removed, and that is the whole point
+        of it.** Without it, reaping means "delete every unit we wrote that is
+        not in this config" — which is correct for an `smbpal apply` a person
+        typed, and catastrophic for a daemon that opened the wrong config file.
+        A Pi run on 27 August 2026 started against `--config
+        /tmp/smbpal-test.json`, a path that does not survive a reboot, while
+        the real connection sat in `/etc/smbpal/config.json`. One `connection
+        add` would have committed against the empty document and reaped a
+        working setup.
+
+        So a commit passes the document it is replacing, and only mountpoints
+        that *this change* dropped are removed. Units the config has never
+        mentioned are left alone and reported by `inventory.survey` instead —
+        the same rule `store.py` already states for the config file itself:
+        starting empty looks exactly like "everything is gone", and acting on
+        it makes that true.
+        """
         connections = config.get("connections", [])
         wanted: set[str] = set()
         blocked: set[str] = set()
@@ -189,7 +210,7 @@ class Mounter:
             self._write_unit(mount_name, units.mount_unit(resolved, credentials_path))
             self._write_unit(automount_name, units.automount_unit(resolved))
 
-        removed = self._remove_stale_units(wanted)
+        removed = self._remove_stale_units(wanted, keep=self._untouched(config, previous))
         if wanted or removed:
             systemd.daemon_reload(runner=self.runner)
 
@@ -213,6 +234,24 @@ class Mounter:
             systemd.enable(automount_name, runner=self.runner)
 
         return MountReport(connections=self.plan(config))
+
+    @staticmethod
+    def _untouched(
+        config: dict[str, Any], previous: dict[str, Any] | None
+    ) -> set[str] | None:
+        """Mountpoints this change is not entitled to remove.
+
+        None means "no restriction" — an explicit apply, sweeping everything.
+        """
+        if previous is None:
+            return None
+        known = {
+            os.path.normpath(c["mountpoint"])
+            for doc in (config, previous)
+            for c in doc.get("connections", [])
+            if c.get("mountpoint")
+        }
+        return known
 
     def teardown(self) -> None:
         removed = self._remove_stale_units(set())
@@ -280,11 +319,17 @@ class Mounter:
                 f"cannot write {self.unit_dir / name}", detail=str(exc)
             ) from exc
 
-    def _remove_stale_units(self, wanted: set[str]) -> list[str]:
+    def _remove_stale_units(
+        self, wanted: set[str], keep: set[str] | None = None
+    ) -> list[str]:
         """Remove units we generated that are no longer configured.
 
         Identified by the marker in the file, never by the name: a hand-written
         `mnt-media.mount` that happens to collide is not ours to delete.
+
+        `keep` is the set of mountpoints the caller is entitled to touch — see
+        `apply`. A unit outside it is somebody else's business even though we
+        wrote it, and it is reported rather than removed.
         """
         removed = []
         if not self.unit_dir.is_dir():
@@ -297,11 +342,19 @@ class Mounter:
                     continue
             except OSError:
                 continue
+            where = _where(path)
+            if keep is not None and os.path.normpath(where or "") not in keep:
+                # This config has never mentioned the mountpoint, so this
+                # change did not remove it — something else wrote it, or an
+                # earlier run of SMBPal against a different config did.
+                log.info(
+                    "leaving %s alone: %s is not part of this change", path.name, where
+                )
+                continue
             if path.suffix == ".automount":
                 systemd.disable(path.name, runner=self.runner)
             else:
                 systemd.stop(path.name, runner=self.runner)
-                where = _where(path)
                 if where and self.probe.is_mounted(where):
                     # The unmount did not take — something has the mountpoint
                     # busy. Unlinking now would delete the marker, and the

@@ -17,12 +17,11 @@ from smbpal.config import ConfigStore
 from smbpal.config import operations as ops
 from smbpal.discovery import discover
 from smbpal.errors import InvalidParams, NotFound, NotPermitted, SmbpalError, UnknownMethod
-from smbpal.mounts import systemd, units
+from smbpal.mounts import inventory, systemd, units
 from smbpal.mounts.apply import Mounter
 from smbpal.samba import control, passwd
 from smbpal.samba.apply import Applier
 from smbpal.shares import ownership
-from smbpal.mounts import inventory
 from smbpal.state.monitor import StateMonitor, fallback_hint
 from smbpal.ipc.peer import PeerCredentials
 from smbpal.ipc.protocol import Request, encode_failure, encode_success, parse_request
@@ -153,7 +152,10 @@ class Dispatcher:
         try:
             report = self.applier.apply(updated) if self.applier else None
             if self.mounter is not None:
-                self.mounter.apply(updated)
+                # `previous` bounds what this change may remove. Without it a
+                # commit against a config that never mentioned the units on
+                # disk would reap them — see Mounter.apply.
+                self.mounter.apply(updated, previous=previous)
             return report
         except SmbpalError:
             log.warning("apply failed; rolling the config back")
@@ -162,7 +164,7 @@ class Dispatcher:
                 if self.applier is not None:
                     self.applier.apply(previous)
                 if self.mounter is not None:
-                    self.mounter.apply(previous)
+                    self.mounter.apply(previous, previous=updated)
             except SmbpalError:
                 log.exception("could not re-apply the previous config after rollback")
             raise
