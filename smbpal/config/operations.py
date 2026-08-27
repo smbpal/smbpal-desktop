@@ -13,13 +13,123 @@ from __future__ import annotations
 
 import copy
 import re
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from smbpal.config.schema import validate_or_raise
-from smbpal.errors import AlreadyExists, NotFound
+from smbpal.errors import AlreadyExists, InvalidParams, NotFound
 
 _SLUG_STRIP = re.compile(r"[^a-z0-9]+")
 _MAX_ID_LEN = 64
+
+
+@dataclass(frozen=True)
+class MountpointStyle:
+    """Where a platform's file manager expects a network volume to live.
+
+    Not a cosmetic preference. On Linux the *path* decides whether the volume
+    is shown at all: GIO displays a mount only under `/media/`,
+    `/run/media/$USER/` or `$HOME` (3h), and `/mnt` is invisible. So the
+    derived default has to land somewhere GIO will admit, or the connection
+    works and nobody can see it.
+
+    macOS reaches the same place by a different road. `/Volumes` is the
+    convention, but visibility there is a *mount option* rather than a
+    location: `mount_smbfs`'s `nobrowse` is what hides a volume from Finder
+    and the Desktop, and every system mount sets it. A path rule alone would
+    not port.
+
+    Windows has no entry, deliberately. A mapped share is a drive letter, not
+    a path, and `mountpoint` is schema-checked as absolute — widening that is
+    Phase 2's problem and should be an explicit decision rather than a default
+    that quietly stops meaning anything.
+    """
+
+    root: str
+    # Whether the platform namespaces volumes per user. Debian-family udisks2
+    # does (`/media/<user>/`); macOS's /Volumes is machine-wide.
+    per_user: bool
+
+
+STYLES = {
+    "linux": MountpointStyle(root="/media", per_user=True),
+    "darwin": MountpointStyle(root="/Volumes", per_user=False),
+}
+
+
+def platform_style(platform: str | None = None) -> MountpointStyle:
+    """The style for a platform, defaulting to Linux for anything unlisted.
+
+    Linux is the fallback because it is what Phase 1 ships and what the daemon
+    runs on; a development Mac deriving a Linux path is harmless, and a Mac
+    silently deriving a `/Volumes` path for a Pi's config would not be.
+    """
+    return STYLES.get(platform or "linux", STYLES["linux"])
+
+
+def _volume_name(share: str) -> str:
+    """The share name, made safe to be the last component of a mountpoint.
+
+    **Leading dots are the one that bites.** GIO hides any mount whose path
+    contains `/.`, so a share called `.private` would mount somewhere the file
+    manager refuses to show — the exact failure choosing `/media` exists to
+    avoid. Finder hides them too.
+    """
+    cleaned = share.strip().strip(".").strip()
+    return cleaned or "share"
+
+
+def default_mountpoint(
+    share: str,
+    owner: str | None,
+    taken: set[str],
+    *,
+    host: str | None = None,
+    style: MountpointStyle | None = None,
+) -> str:
+    """Where a connection goes when the caller does not say.
+
+    **The basename is not incidental — it is the name of the drive.** Both GIO
+    and Finder label a volume by the last component of its mountpoint, and
+    neither can be told otherwise from here: `x-gvfs-name=` is read from
+    `/etc/fstab`, and `x-` options never reach the kernel, so a systemd unit
+    cannot carry one. Naming the share therefore names the drive, which is why
+    the share name is the default rather than the connection id.
+
+    Collisions disambiguate by *host* before falling back to a number, because
+    two machines exporting `Media` is the common case and `Media on rivendell`
+    answers "which one" where `Media 2` does not.
+
+    Only mountpoints already in the config are avoided. A directory that
+    merely exists on disk is not consulted — these are pure functions with no
+    filesystem underneath, and the runtime case that actually matters (another
+    filesystem already mounted there) is caught by `foreign_mount` at apply
+    time, where it can be reported rather than guessed at.
+    """
+    style = style or platform_style()
+    if style.per_user and not owner:
+        raise InvalidParams(
+            "cannot work out where to mount this",
+            detail=(
+                f"{style.root}/<user> needs a local account and this connection "
+                "has no owner. Pass a mountpoint instead."
+            ),
+        )
+    base = f"{style.root}/{owner}" if style.per_user else style.root
+    name = _volume_name(share)
+
+    candidates = [name]
+    if host:
+        candidates.append(f"{name} on {host}")
+    for candidate in candidates:
+        if f"{base}/{candidate}" not in taken:
+            return f"{base}/{candidate}"
+
+    stem = candidates[-1]
+    suffix = 2
+    while f"{base}/{stem} {suffix}" in taken:
+        suffix += 1
+    return f"{base}/{stem} {suffix}"
 
 
 def make_id(name: str, taken: set[str]) -> str:
@@ -114,7 +224,7 @@ def add_connection(
     *,
     host: str,
     share: str,
-    mountpoint: str,
+    mountpoint: str | None = None,
     id: str | None = None,
     credential_ref: str | None = None,
     auto_connect: str = "on_this_network",
@@ -123,6 +233,20 @@ def add_connection(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     result = copy.deepcopy(doc)
     connections = result.setdefault("connections", [])
+
+    if mountpoint is None:
+        # Derived here rather than in the CLI so that the GUI and any other
+        # client get the same answer (D12: the daemon owns the config). The
+        # result is written into the document explicitly — defaulting is an
+        # input convenience, and a stored config whose mountpoint depends on
+        # which version of this function last ran would not be a record of
+        # anything.
+        mountpoint = default_mountpoint(
+            share,
+            owner,
+            {c.get("mountpoint") for c in connections},
+            host=host,
+        )
 
     for existing in connections:
         if existing.get("mountpoint") == mountpoint:

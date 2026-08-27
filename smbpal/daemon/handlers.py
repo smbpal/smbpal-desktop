@@ -357,7 +357,9 @@ class Dispatcher:
             previous,
             host=_require_str(params, "host"),
             share=_require_str(params, "share"),
-            mountpoint=_require_str(params, "mountpoint"),
+            # Optional: omitted means "put it where the file manager will
+            # show it", which only the daemon can work out (3h).
+            mountpoint=_optional_str(params, "mountpoint"),
             id=_optional_str(params, "id"),
             credential_ref=_optional_str(params, "credential_ref"),
             auto_connect=_optional_str(params, "auto_connect") or "on_this_network",

@@ -168,6 +168,24 @@ class TestConnections(CliTestCase):
         code, _, _ = self.run_cli("connection", "remove", "/mnt/nas")
         self.assertEqual(code, EXIT_OK)
 
+    def test_the_mountpoint_can_be_left_out(self) -> None:
+        # The whole path: an omitted positional must not become a resolved
+        # path from the CLI's working directory on the way to the daemon.
+        code, out, _ = self.run_cli(
+            "connection", "add", "rivendell.local", "Media", "--owner", "pi"
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("-> /media/pi/Media", out)
+        self.assertEqual(
+            self.store.load()["connections"][0]["mountpoint"], "/media/pi/Media"
+        )
+
+    def test_a_given_mountpoint_is_still_used(self) -> None:
+        self.run_cli("connection", "add", "rivendell.local", "Media", "/srv/backups")
+        self.assertEqual(
+            self.store.load()["connections"][0]["mountpoint"], "/srv/backups"
+        )
+
     def test_auto_connect_defaults_to_on_this_network(self) -> None:
         self.run_cli("connection", "add", "h", "S", "/mnt/x")
         self.assertEqual(

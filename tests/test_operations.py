@@ -6,7 +6,7 @@ import unittest
 
 from smbpal.config import empty_config
 from smbpal.config import operations as ops
-from smbpal.errors import AlreadyExists, ConfigInvalid, NotFound
+from smbpal.errors import AlreadyExists, ConfigInvalid, InvalidParams, NotFound
 
 
 class TestIds(unittest.TestCase):
@@ -127,6 +127,108 @@ class TestIdsAreSharedAcrossKinds(unittest.TestCase):
             doc, host="rivendell.local", share="Media", mountpoint="/mnt/nas"
         )
         self.assertEqual(connection["id"], "rivendell-local-media-2")
+
+
+class TestDerivedMountpoints(unittest.TestCase):
+    """Where a connection goes when nobody says — 3h."""
+
+    LINUX = ops.STYLES["linux"]
+    MACOS = ops.STYLES["darwin"]
+
+    def test_linux_lands_somewhere_the_file_manager_will_show(self) -> None:
+        # /mnt is invisible to GIO however correct the mount is, so the whole
+        # point of deriving is landing under one of the three prefixes it
+        # admits. This test is the reason the function exists.
+        path = ops.default_mountpoint("Media", "pi", set(), style=self.LINUX)
+        self.assertEqual(path, "/media/pi/Media")
+        self.assertTrue(path.startswith("/media/"))
+
+    def test_macos_uses_volumes_and_has_no_user_level(self) -> None:
+        path = ops.default_mountpoint("Media", "luke", set(), style=self.MACOS)
+        self.assertEqual(path, "/Volumes/Media")
+
+    def test_macos_needs_no_owner(self) -> None:
+        # /Volumes is machine-wide, so a connection with no owner is still
+        # placeable there. On Linux it is not, and saying so beats guessing.
+        self.assertEqual(
+            ops.default_mountpoint("Media", None, set(), style=self.MACOS),
+            "/Volumes/Media",
+        )
+
+    def test_linux_without_an_owner_says_so_rather_than_guessing(self) -> None:
+        with self.assertRaises(InvalidParams):
+            ops.default_mountpoint("Media", None, set(), style=self.LINUX)
+
+    def test_a_collision_disambiguates_by_host_not_by_number(self) -> None:
+        # Two NASes both exporting `Media` is the common case, and the useful
+        # question is which one.
+        path = ops.default_mountpoint(
+            "Media",
+            "pi",
+            {"/media/pi/Media"},
+            host="rivendell.local",
+            style=self.LINUX,
+        )
+        self.assertEqual(path, "/media/pi/Media on rivendell.local")
+
+    def test_a_second_collision_falls_back_to_a_number(self) -> None:
+        path = ops.default_mountpoint(
+            "Media",
+            "pi",
+            {"/media/pi/Media", "/media/pi/Media on rivendell.local"},
+            host="rivendell.local",
+            style=self.LINUX,
+        )
+        self.assertEqual(path, "/media/pi/Media on rivendell.local 2")
+
+    def test_a_leading_dot_is_stripped_because_it_would_hide_the_mount(self) -> None:
+        # GIO hides any mount whose path contains "/." — deriving
+        # /media/pi/.private would be the failure this all exists to prevent.
+        self.assertEqual(
+            ops.default_mountpoint(".private", "pi", set(), style=self.LINUX),
+            "/media/pi/private",
+        )
+
+    def test_a_share_name_of_nothing_usable_still_yields_a_path(self) -> None:
+        self.assertEqual(
+            ops.default_mountpoint("...", "pi", set(), style=self.LINUX),
+            "/media/pi/share",
+        )
+
+    def test_an_unknown_platform_falls_back_to_linux(self) -> None:
+        # The daemon runs on Linux. A development Mac deriving a Linux path is
+        # harmless; a Mac deriving /Volumes into a Pi's config would not be.
+        self.assertEqual(ops.platform_style("plan9"), self.LINUX)
+        self.assertEqual(ops.platform_style(None), self.LINUX)
+
+    def test_add_connection_writes_the_derived_path_into_the_document(self) -> None:
+        # Stored explicitly: a config whose mountpoint depends on which version
+        # of the derivation last ran is not a record of anything.
+        doc, connection = ops.add_connection(
+            empty_config(), host="rivendell.local", share="Media", owner="pi"
+        )
+        self.assertEqual(connection["mountpoint"], "/media/pi/Media")
+        self.assertEqual(doc["connections"][0]["mountpoint"], "/media/pi/Media")
+
+    def test_an_explicit_mountpoint_still_wins(self) -> None:
+        _, connection = ops.add_connection(
+            empty_config(),
+            host="rivendell.local",
+            share="Media",
+            mountpoint="/srv/backups",
+            owner="pi",
+        )
+        self.assertEqual(connection["mountpoint"], "/srv/backups")
+
+    def test_two_connections_to_the_same_share_name_do_not_collide(self) -> None:
+        doc, first = ops.add_connection(
+            empty_config(), host="rivendell.local", share="Media", owner="pi"
+        )
+        _, second = ops.add_connection(
+            doc, host="moria.local", share="Media", owner="pi"
+        )
+        self.assertEqual(first["mountpoint"], "/media/pi/Media")
+        self.assertEqual(second["mountpoint"], "/media/pi/Media on moria.local")
 
 
 if __name__ == "__main__":

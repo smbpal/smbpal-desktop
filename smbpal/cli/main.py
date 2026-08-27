@@ -115,7 +115,12 @@ def build_parser() -> argparse.ArgumentParser:
     connection_add = connection_cmds.add_parser("add", help="define a connection")
     connection_add.add_argument("host", help="hostname or address of the server")
     connection_add.add_argument("share", help="share name on that server")
-    connection_add.add_argument("mountpoint", help="where to mount it locally")
+    connection_add.add_argument(
+        "mountpoint",
+        nargs="?",
+        help="where to mount it locally. Omit and SMBPal picks a place the "
+        "file manager will show it, named after the share.",
+    )
     connection_add.add_argument("--id", help="stable id (derived if omitted)")
     connection_add.add_argument(
         "--auto",
@@ -405,7 +410,10 @@ def _cmd_connection_add(client: Client, args: argparse.Namespace) -> int:
         {
             "host": args.host,
             "share": args.share,
-            "mountpoint": _resolve(args.mountpoint),
+            # Left out entirely when the user did not give one, so the daemon
+            # derives it. Resolving None here would invent a path from the
+            # CLI's working directory.
+            "mountpoint": _resolve(args.mountpoint) if args.mountpoint else None,
             "id": args.id,
             "auto_connect": args.auto,
             # The daemon can read the peer uid, but a CLI run under sudo arrives
