@@ -262,6 +262,38 @@ class TestBrowse(CliTestCase):
         self.assertEqual(out.count("RASPBERRYPI"), 1)
 
 
+class TestTeardownConfirmation(CliTestCase):
+    """A destructive verb asks first, and takes silence for no."""
+
+    def run_with_input(self, answer: str | None, *argv: str):
+        import builtins
+
+        def fake_input(prompt: str = "") -> str:
+            if answer is None:
+                raise EOFError
+            return answer
+
+        original = builtins.input
+        builtins.input = fake_input
+        self.addCleanup(setattr, builtins, "input", original)
+        return self.run_cli(*argv)
+
+    def test_declining_changes_nothing(self) -> None:
+        code, out, _ = self.run_with_input("n", "teardown")
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("cancelled", out)
+
+    def test_piped_silence_is_not_consent(self) -> None:
+        # `yes '' | smbpal teardown` and a closed stdin must not tear down.
+        code, out, _ = self.run_with_input(None, "teardown")
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("cancelled", out)
+
+    def test_the_warning_says_the_config_survives(self) -> None:
+        _, out, _ = self.run_with_input("n", "teardown")
+        self.assertIn("configuration is kept", out)
+
+
 class TestUnaccounted(CliTestCase):
     """A share mounting on access that the config knows nothing about."""
 

@@ -159,21 +159,27 @@ class Applier:
         )
         return report
 
-    def teardown(self) -> None:
+    def teardown(self) -> dict[str, Any]:
         """Undo everything outside the config. §6's reversibility claim.
 
         `smb.conf` comes back byte-identical because the block is removed as a
         block — M0's line-based removal left a blank line behind and the diff
         blamed it.
+
+        Reports what it changed, because "it worked" is not something a person
+        can check and a list of files is.
         """
         try:
             original = self.smb_conf.read_text(encoding="utf-8")
         except FileNotFoundError:
             original = None
+        include_removed = False
         if original is not None:
             stripped = include.remove_include(original, include_line=self.include_line)
             if stripped != original:
                 self._write(self.smb_conf, stripped, mode=self._mode_of(self.smb_conf))
+                include_removed = True
+        smbpal_conf_removed = self.smbpal_conf.exists()
         self.smbpal_conf.unlink(missing_ok=True)
         self.advertiser.withdraw()
         try:
@@ -182,6 +188,11 @@ class Applier:
             # Nothing left to serve either way; a Samba that will not reload is
             # worth reporting but not worth failing an uninstall over.
             log.warning("could not reload Samba after teardown: %s", exc.message)
+        return {
+            "smb_conf": str(self.smb_conf),
+            "include_removed": include_removed,
+            "smbpal_conf_removed": smbpal_conf_removed,
+        }
 
     # --- pieces ------------------------------------------------------------
 

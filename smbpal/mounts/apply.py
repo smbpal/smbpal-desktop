@@ -272,10 +272,16 @@ class Mounter:
         }
         return known
 
-    def teardown(self) -> None:
+    def teardown(self) -> list[str]:
+        """Remove every unit we wrote, and the mountpoints we chose with them.
+
+        No `keep`: this is the deliberate sweep, the thing `apply`'s diff-bound
+        reaping exists to *not* be.
+        """
         removed = self._remove_stale_units(set())
         if removed:
             systemd.daemon_reload(runner=self.runner)
+        return removed
 
     def forget_credentials(self, ref: str) -> None:
         self.credentials.remove(ref)

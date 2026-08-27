@@ -92,6 +92,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="re-apply the whole config: Samba's shares and the mount units both",
     )
 
+    teardown = commands.add_parser(
+        "teardown",
+        help="undo everything SMBPal put outside its config, keeping the config",
+    )
+    teardown.add_argument(
+        "--yes", action="store_true", help="do not ask for confirmation"
+    )
+
     credential = commands.add_parser("credential", help="SMB passwords")
     credential_cmds = credential.add_subparsers(dest="subcommand", metavar="SUBCOMMAND")
     credential_cmds.required = True
@@ -330,6 +338,45 @@ def _cmd_apply(client: Client, args: argparse.Namespace) -> int:
         return "\n".join(lines)
 
     return _emit(args, report, human)
+
+
+_TEARDOWN_WARNING = """\
+This removes SMBPal's include block from smb.conf, the smbpal.conf it
+generates, its mount units and mountpoints, and its mDNS record.
+
+Your configuration is kept — `smbpal apply` puts all of it back."""
+
+
+def _confirm(prompt: str) -> bool:
+    try:
+        answer = input(f"{prompt} [y/N] ")
+    except EOFError:
+        # Piped in with nothing to say. Silence is not consent for this one.
+        return False
+    return answer.strip().lower() in {"y", "yes"}
+
+
+def _cmd_teardown(client: Client, args: argparse.Namespace) -> int:
+    if not args.yes:
+        print(_TEARDOWN_WARNING)
+        if not _confirm("Continue?"):
+            print("cancelled; nothing was changed")
+            return EXIT_OK
+    result = client.call("teardown")
+
+    def human() -> str:
+        lines = []
+        if result.get("include_removed"):
+            lines.append(f"removed the include block from {result['smb_conf']}")
+        if result.get("smbpal_conf_removed"):
+            lines.append("removed the generated smbpal.conf")
+        for unit in result.get("units_removed", []):
+            lines.append(f"removed {unit}")
+        # Naming the files is the point: "done" is not something anyone can
+        # check, and `diff` against a pristine smb.conf is.
+        return "\n".join(lines) or "nothing to undo"
+
+    return _emit(args, result, human)
 
 
 def _connection_summary(connections: list[dict[str, Any]]) -> str:
@@ -598,6 +645,7 @@ _COMMANDS: dict[tuple[str, str | None], Handler] = {
     ("connection", "disconnect"): _cmd_connection_disconnect,
     ("connection", "use-fallback"): _cmd_connection_use_fallback,
     ("connection", "live"): _cmd_connection_live,
+    ("teardown", None): _cmd_teardown,
     ("watch", None): _cmd_watch,
 }
 

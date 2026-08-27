@@ -423,5 +423,88 @@ class TestConnectionSummary(unittest.TestCase):
         self.assertEqual(_connection_summary([]), "")
 
 
+class TestTeardownIsReachable(ApplyTestCase):
+    """§6's reversibility claim, from the wire rather than from a unit test.
+
+    Both teardowns existed and nothing called them: no IPC method, no CLI verb,
+    no shutdown path. The claim was implemented, unit-tested and unreachable,
+    so it had never run against a real smb.conf. Found on a Pi on 27 August
+    2026 by running the runbook's teardown step and getting the include block
+    back in the diff.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.unit_dir = self.root / "units"
+        self.unit_dir.mkdir()
+        self.mountinfo = self.root / "mountinfo"
+        self.mountinfo.write_text("", encoding="utf-8")
+        self.mounter = Mounter(
+            unit_dir=self.unit_dir,
+            credentials=CredentialsStore(self.root / "creds"),
+            probe=MountProbe(mountinfo=self.mountinfo),
+            runner=self.samba,
+            managed_roots=frozenset({str(self.root)}),
+        )
+        self.store = ConfigStore(self.root / "config.json")
+        self.dispatcher = Dispatcher(
+            self.store, applier=self.applier, mounter=self.mounter
+        )
+        self.pristine = self.smb_conf.read_text(encoding="utf-8")
+
+    def teardown_call(self) -> dict:
+        return self.dispatcher._teardown(
+            Request(id=1, method="teardown", params={}), _PEER
+        )
+
+    def test_smb_conf_comes_back_byte_identical(self) -> None:
+        # The claim itself. Removed as a block, because M0's line-based removal
+        # left a blank line behind and the diff blamed it.
+        self.applier.apply(self.config_with_share())
+        self.assertNotEqual(self.smb_conf.read_text(encoding="utf-8"), self.pristine)
+        self.teardown_call()
+        self.assertEqual(self.smb_conf.read_text(encoding="utf-8"), self.pristine)
+
+    def test_it_takes_the_generated_file_and_the_units(self) -> None:
+        doc, _ = ops.add_connection(
+            self.config_with_share(),
+            host="rivendell.local",
+            share="Media",
+            mountpoint=str(self.root / "mnt" / "nas"),
+        )
+        self.applier.apply(doc)
+        self.mounter.apply(doc)
+        self.assertTrue(self.smbpal_conf.exists())
+        self.assertEqual(len(list(self.unit_dir.iterdir())), 2)
+
+        result = self.teardown_call()
+        self.assertFalse(self.smbpal_conf.exists())
+        self.assertEqual(list(self.unit_dir.iterdir()), [])
+        self.assertEqual(len(result["units_removed"]), 2)
+        self.assertTrue(result["include_removed"])
+
+    def test_the_config_is_kept(self) -> None:
+        # Side effects, not intent. A later apply has to put it all back.
+        self.store.save(self.config_with_share())
+        self.teardown_call()
+        self.assertEqual(len(self.store.load()["shares"]), 1)
+
+    def test_apply_after_teardown_restores_everything(self) -> None:
+        config = self.config_with_share()
+        self.store.save(config)
+        self.applier.apply(config)
+        self.teardown_call()
+        self.dispatcher._apply(Request(id=2, method="apply", params={}), _PEER)
+        self.assertTrue(self.smbpal_conf.exists())
+        self.assertIn("smbpal", self.smb_conf.read_text(encoding="utf-8"))
+
+    def test_tearing_down_twice_is_not_an_error(self) -> None:
+        self.applier.apply(self.config_with_share())
+        self.teardown_call()
+        second = self.teardown_call()
+        self.assertFalse(second["include_removed"])
+        self.assertEqual(self.smb_conf.read_text(encoding="utf-8"), self.pristine)
+
+
 if __name__ == "__main__":
     unittest.main()

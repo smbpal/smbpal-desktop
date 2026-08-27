@@ -430,6 +430,29 @@ class Dispatcher:
         )
         return wire
 
+    def _teardown(self, _request: Request, peer: PeerCredentials) -> dict[str, Any]:
+        """Undo everything SMBPal put outside the config. §6's claim, reachable.
+
+        **Both teardowns existed and nothing called them.** They were written
+        for §6 — `Applier.teardown` removes the include as a *block*, precisely
+        because M0's line-based removal left a blank line behind and the diff
+        blamed it — and until 27 August 2026 there was no IPC method, no CLI
+        verb and no shutdown path that reached either. The reversibility claim
+        was implemented, unit-tested and unreachable, so it had never run
+        against a real `smb.conf`. M7's `prerm` would have found the same hole.
+
+        **The config is deliberately kept.** This undoes side effects, not
+        intent: a later `apply` puts everything back. Removing the record of
+        what someone configured is a different act and should be a different
+        command.
+        """
+        if self.applier is None and self.mounter is None:
+            raise SmbpalError("this daemon was started with --no-apply")
+        samba = self.applier.teardown() if self.applier is not None else {}
+        units_removed = self.mounter.teardown() if self.mounter is not None else []
+        _audit(peer, "teardown", f"{len(units_removed)} unit(s)")
+        return {**samba, "units_removed": units_removed}
+
     def _share_make_writable(
         self, request: Request, peer: PeerCredentials
     ) -> dict[str, Any]:
@@ -741,6 +764,7 @@ _METHODS: dict[str, Method] = {
     "share.add": Dispatcher._share_add,
     "share.remove": Dispatcher._share_remove,
     "apply": Dispatcher._apply,
+    "teardown": Dispatcher._teardown,
     "share.make_writable": Dispatcher._share_make_writable,
     "credential.list": Dispatcher._credential_list,
     "credential.set": Dispatcher._credential_set,
