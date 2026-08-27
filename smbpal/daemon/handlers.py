@@ -486,6 +486,11 @@ class Dispatcher:
             auto_connect=_optional_str(params, "auto_connect") or "on_this_network",
             owner=_optional_str(params, "owner") or _owner_from(peer),
             fallback_host=_optional_str(params, "fallback_host"),
+            # Only the daemon can see what is already mounted, and a derived
+            # mountpoint that lands on a USB stick is one apply will refuse.
+            in_use=(
+                self.mounter.occupied_mountpoints() if self.mounter is not None else None
+            ),
         )
         self._commit(previous, updated)
         _audit(peer, "connection.add", connection["id"])

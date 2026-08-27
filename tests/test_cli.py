@@ -332,6 +332,27 @@ class TestUnaccounted(CliTestCase):
         self.assertEqual(code, EXIT_OK, err)
         self.assertTrue((self.unit_dir / "mnt-smbpal.mount").exists())
 
+    def test_the_daemon_tells_the_derivation_what_is_mounted(self) -> None:
+        # The derivation cannot see the filesystem — that is deliberate, these
+        # are pure functions — so the daemon has to hand it the live
+        # mountpoints. Unit tests over add_connection cannot catch the handler
+        # forgetting to.
+        from smbpal.daemon import handlers
+
+        seen: dict = {}
+        original = handlers.ops.add_connection
+
+        def spy(*args, **kwargs):
+            seen.update(kwargs)
+            return original(*args, **kwargs)
+
+        handlers.ops.add_connection = spy
+        self.addCleanup(setattr, handlers.ops, "add_connection", original)
+
+        other = str((Path(self._dir.name) / "mnt" / "other").resolve())
+        self.run_cli("connection", "add", "moria.local", "Backups", other)
+        self.assertIn(self.mountpoint, seen.get("in_use") or set())
+
     def test_a_configured_connection_is_not_reported_as_unaccounted(self) -> None:
         self.run_cli(
             "connection", "add", "rivendell.local", "Media", self.mountpoint

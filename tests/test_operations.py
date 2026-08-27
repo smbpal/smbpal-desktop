@@ -210,6 +210,45 @@ class TestDerivedMountpoints(unittest.TestCase):
         self.assertEqual(connection["mountpoint"], "/media/pi/Media")
         self.assertEqual(doc["connections"][0]["mountpoint"], "/media/pi/Media")
 
+    def test_a_path_something_is_mounted_on_is_skipped(self) -> None:
+        # A USB stick labelled Media sits on /media/pi/Media. Deriving that
+        # same path gives a connection apply will refuse — udisks2 picks
+        # another name in this situation and so should we.
+        path = ops.default_mountpoint(
+            "Media",
+            "pi",
+            {"/media/pi/Media"},
+            host="rivendell.local",
+            style=self.LINUX,
+        )
+        self.assertEqual(path, "/media/pi/Media on rivendell.local")
+
+    def test_add_connection_avoids_a_mountpoint_in_use(self) -> None:
+        _, connection = ops.add_connection(
+            empty_config(),
+            host="rivendell.local",
+            share="Media",
+            owner="pi",
+            in_use={"/media/pi/Media"},
+        )
+        self.assertEqual(
+            connection["mountpoint"], "/media/pi/Media on rivendell.local"
+        )
+
+    def test_an_explicit_mountpoint_is_not_second_guessed(self) -> None:
+        # A mount can go away a second later. `foreign_mount` reports an
+        # occupied mountpoint at apply time; refusing to record the connection
+        # would be a harsher answer to a more temporary fact.
+        _, connection = ops.add_connection(
+            empty_config(),
+            host="rivendell.local",
+            share="Media",
+            mountpoint="/media/pi/Media",
+            owner="pi",
+            in_use={"/media/pi/Media"},
+        )
+        self.assertEqual(connection["mountpoint"], "/media/pi/Media")
+
     def test_an_explicit_mountpoint_still_wins(self) -> None:
         _, connection = ops.add_connection(
             empty_config(),

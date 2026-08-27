@@ -100,11 +100,19 @@ def default_mountpoint(
     two machines exporting `Media` is the common case and `Media on rivendell`
     answers "which one" where `Media 2` does not.
 
-    Only mountpoints already in the config are avoided. A directory that
-    merely exists on disk is not consulted — these are pure functions with no
-    filesystem underneath, and the runtime case that actually matters (another
-    filesystem already mounted there) is caught by `foreign_mount` at apply
-    time, where it can be reported rather than guessed at.
+    `taken` is whatever the caller can prove is unavailable. The config's own
+    mountpoints always; the daemon adds the paths something is currently
+    mounted on, which it can see and these pure functions cannot. **That
+    second part came from a Pi run on 27 August 2026**: a USB stick labelled
+    `Media` lands in `/media/<user>/Media`, and without it a connection to a
+    share of the same name derives the one path it cannot use — apply then
+    refuses, correctly, and the connection is stuck until somebody removes the
+    stick or supplies a path by hand. udisks2 solves this by picking another
+    name, and so should we.
+
+    An *explicitly given* mountpoint is never second-guessed this way. A mount
+    can go away a second later, and `foreign_mount` reports an occupied
+    mountpoint at apply time rather than refusing to record the connection.
     """
     style = style or platform_style()
     if style.per_user and not owner:
@@ -230,6 +238,7 @@ def add_connection(
     auto_connect: str = "on_this_network",
     owner: str | None = None,
     fallback_host: str | None = None,
+    in_use: set[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     result = copy.deepcopy(doc)
     connections = result.setdefault("connections", [])
@@ -244,7 +253,7 @@ def add_connection(
         mountpoint = default_mountpoint(
             share,
             owner,
-            {c.get("mountpoint") for c in connections},
+            {c.get("mountpoint") for c in connections} | (in_use or set()),
             host=host,
         )
 

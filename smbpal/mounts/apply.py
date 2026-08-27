@@ -117,6 +117,19 @@ class Mounter:
         self.probe = probe or probe_module.MountProbe()
         self.runner = runner
 
+    def occupied_mountpoints(self) -> set[str]:
+        """Every path something is really mounted on. autofs triggers excluded.
+
+        Offered to `add_connection` so a derived mountpoint skips a path that
+        is already in use — the config cannot see this and the daemon can.
+        """
+        entries = probe_module.mount_entries(self.probe.mountinfo) or []
+        return {
+            os.path.normpath(e.mountpoint)
+            for e in entries
+            if e.fstype != probe_module.AUTOFS
+        }
+
     def foreign_occupant(
         self, connection: dict[str, Any]
     ) -> probe_module.MountEntry | None:
