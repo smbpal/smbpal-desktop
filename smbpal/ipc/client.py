@@ -92,6 +92,23 @@ class Client:
             self._sock.close()
             self._sock = None
 
+    def interrupt(self) -> None:
+        """Wake a thread parked in `events()`, from another thread.
+
+        `close()` is not enough and not safe: the reader is inside `recv()`,
+        and closing the descriptor out from under it frees a number the kernel
+        may hand to something else. `shutdown()` is the call that makes the
+        recv return — after which the reader sees a closed connection and
+        unwinds through its own error path, which is where it knows what to do.
+        """
+        sock = self._sock
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass  # already gone; the reader will find that out for itself
+
     def __enter__(self) -> "Client":
         self.connect()
         return self
