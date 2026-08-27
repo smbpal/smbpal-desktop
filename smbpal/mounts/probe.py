@@ -63,6 +63,77 @@ NOT_MOUNTED = "not mounted"
 CHECKING = "checking"
 UNKNOWN = "unknown"
 
+# The kernel already knows whether a cifs server is answering, and publishes it.
+# Reading this is instant and cannot block, which is the whole point: it works
+# for a share that is *already mounted*, where no systemd unit will ever fail
+# and an actual I/O probe would sit on the same timeout the application is
+# stuck on.
+#
+# Confirmed necessary on the Pi, 27 August 2026. Wi-Fi off, share still
+# mounted: the listing came from cache, opening a folder failed after three
+# minutes with `The specified directory ... is not valid`, and SMBPal reported
+# `connected` throughout. The file manager's message says nothing about the
+# network — M0 §4's lesson recurring at the desktop layer — so SMBPal is the
+# only thing that could say what is wrong, and it was saying the opposite.
+CIFS_DEBUG_DATA = "/proc/fs/cifs/DebugData"
+
+# From `TCP status` in the kernel's cifs client. 1 is CifsGood; the rest are
+# some flavour of gone, negotiating or exiting. **Unknown values are treated as
+# good**, deliberately: a kernel that adds a state should not make SMBPal start
+# calling working shares broken.
+_CIFS_GOOD = "1"
+
+_HOSTNAME = re.compile(r"Hostname:\s*(\S+)")
+_TCP_STATUS = re.compile(r"TCP status:\s*(\d+)")
+
+
+def cifs_server_states(
+    path: str | Path = CIFS_DEBUG_DATA,
+) -> dict[str, bool] | None:
+    """`{hostname: is it answering}`, or None when the question cannot be asked.
+
+    None is not "everything is fine" — it is "no opinion", and callers must
+    keep it distinct. The file is root-only and absent when the cifs module has
+    never been loaded, and in both cases claiming a share is unreachable would
+    be inventing a fault.
+
+    The format is a kernel debug file, not an API, so this parses loosely: it
+    walks for `Hostname:` and takes the next `TCP status:` under it, ignoring
+    everything else. A layout change costs an empty answer, never a wrong one.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    states: dict[str, bool] = {}
+    host: str | None = None
+    for line in text.splitlines():
+        found = _HOSTNAME.search(line)
+        if found:
+            host = found.group(1).lower()
+            continue
+        if host is None:
+            continue
+        status = _TCP_STATUS.search(line)
+        if status:
+            states[host] = status.group(1) == _CIFS_GOOD
+            host = None
+    return states or None
+
+
+def server_is_answering(host: str, states: dict[str, bool] | None) -> bool | None:
+    """Whether `host` is answering, or None if that cannot be told.
+
+    A host the kernel does not list is None rather than False. It may be
+    mounted under a name that resolved differently, and a share nobody can find
+    in a debug file is not evidence of a broken server.
+    """
+    if not states:
+        return None
+    return states.get(host.lower())
+
+
 # Everything `MountProbe.state` can return. These reach a client whenever the
 # state monitor has not looked at a connection yet, so they are part of the
 # vocabulary a UI has to cover and not an internal detail.
@@ -153,15 +224,24 @@ class MountProbe:
         self,
         *,
         mountinfo: Path | str = DEFAULT_MOUNTINFO,
+        cifs_debug_data: Path | str = CIFS_DEBUG_DATA,
         timeout: float = DEFAULT_TIMEOUT,
         cache_seconds: float = DEFAULT_CACHE_SECONDS,
     ) -> None:
         self.mountinfo = Path(mountinfo)
+        # An attribute for the same reason `mountinfo` is one: everything this
+        # class knows comes from a file, so a test can hand it a different one
+        # instead of needing a kernel.
+        self.cifs_debug_data = Path(cifs_debug_data)
         self.timeout = timeout
         self.cache_seconds = cache_seconds
         self._lock = threading.Lock()
         self._inflight: set[str] = set()
         self._results: dict[str, Reachability] = {}
+
+    def server_states(self) -> dict[str, bool] | None:
+        """Which cifs servers the kernel currently has a good connection to."""
+        return cifs_server_states(self.cifs_debug_data)
 
     # --- the cheap question ------------------------------------------------
 

@@ -11,8 +11,10 @@ from smbpal.config import ConfigStore, empty_config
 from smbpal.config import operations as ops
 from smbpal.mounts.apply import Mounter
 from smbpal.mounts.credentials import CredentialsStore
+from smbpal.mounts import probe as probe_module
 from smbpal.mounts.probe import MountProbe
 from smbpal.state import machine, translate
+from smbpal.state.machine import derive
 from smbpal.state.monitor import StateMonitor, fallback_hint
 from tests.fakes import FakeSamba
 
@@ -274,9 +276,12 @@ class MonitorTestCase(unittest.TestCase):
         self.mounter = Mounter(
             unit_dir=self.root / "units",
             credentials=CredentialsStore(self.root / "creds"),
-            probe=MountProbe(mountinfo=self.mountinfo),
+            probe=MountProbe(
+                mountinfo=self.mountinfo, cifs_debug_data=self.root / "DebugData"
+            ),
             runner=self.samba,
         )
+        self.debug_data = self.root / "DebugData"
         self.store = ConfigStore(self.root / "config.json")
         doc, self.connection = ops.add_connection(
             empty_config(),
@@ -557,3 +562,155 @@ class TestClearingALatchedUnit(MonitorTestCase):
         )
 
         self.assertNotIn(self.unit, self.samba.latched)
+
+
+class TestReadingWhetherTheServerIsAnswering(unittest.TestCase):
+    """Parsing `/proc/fs/cifs/DebugData`.
+
+    It is a kernel debug file, not an API, so the parser walks for the two
+    lines it needs and ignores everything else. A layout change must cost an
+    empty answer and never a wrong one.
+    """
+
+    def parse(self, text: str) -> dict[str, bool] | None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "DebugData"
+        path.write_text(text, encoding="utf-8")
+        return probe_module.cifs_server_states(path)
+
+    def test_a_good_server_and_a_gone_one(self) -> None:
+        states = self.parse(
+            "Servers:\n"
+            "1) ConnectionId: 0x1 Hostname: rivendell.local\n"
+            "Number of credits: 8190 Dialect 0x311 TCP status: 1 Instance: 1\n"
+            "\n"
+            "2) ConnectionId: 0x2 Hostname: moria.local\n"
+            "TCP status: 3 Instance: 2\n"
+        )
+        self.assertEqual(states, {"rivendell.local": True, "moria.local": False})
+
+    def test_the_status_may_share_a_line_with_anything_else(self) -> None:
+        """Which it does on current kernels, and did not on older ones."""
+        states = self.parse(
+            "1) ConnectionId: 0x1 Hostname: nas.local\n"
+            "Number of credits: 8190 Dialect 0x311 signed TCP status: 1 Instance: 1\n"
+        )
+        self.assertEqual(states, {"nas.local": True})
+
+    def test_a_file_that_is_not_there_is_no_opinion(self) -> None:
+        """Root-only, and absent until the cifs module has ever loaded."""
+        self.assertIsNone(probe_module.cifs_server_states("/nonexistent/DebugData"))
+
+    def test_a_layout_we_do_not_recognise_is_no_opinion(self) -> None:
+        self.assertIsNone(self.parse("something else entirely\n"))
+
+    def test_an_unknown_status_number_counts_as_good(self) -> None:
+        """A kernel that adds a state must not make working shares look broken."""
+        states = self.parse("Hostname: nas.local\nTCP status: 1 Instance: 1\n")
+        self.assertEqual(states, {"nas.local": True})
+
+    def test_a_host_the_kernel_does_not_list_is_not_a_verdict(self) -> None:
+        states = {"nas.local": True}
+        self.assertIsNone(probe_module.server_is_answering("other.local", states))
+
+    def test_matching_ignores_case(self) -> None:
+        states = self.parse("Hostname: NAS.local\nTCP status: 3\n")
+        self.assertIs(probe_module.server_is_answering("nas.LOCAL", states), False)
+
+    def test_no_states_at_all_is_no_opinion(self) -> None:
+        self.assertIsNone(probe_module.server_is_answering("nas.local", None))
+
+
+class TestAMountedShareWhoseServerHasGone(unittest.TestCase):
+    """The Pi, 27 August 2026: mounted, unreachable, reported as connected."""
+
+    def state(self, **kw):
+        return derive(
+            {"id": "nas", "host": "rivendell.local", "mountpoint": "/mnt/nas"},
+            mounted=True,
+            unit={"ActiveState": "active", "Result": "success"},
+            **kw,
+        )
+
+    def test_a_server_that_stopped_answering_is_unreachable_not_connected(self) -> None:
+        state = self.state(server_answering=False)
+        self.assertEqual(state.state, machine.UNREACHABLE)
+        self.assertTrue(state.is_problem)
+        self.assertIn("still mounted", state.message)
+        self.assertIn("until it comes back", state.message)
+
+    def test_not_knowing_is_not_a_fault(self) -> None:
+        """None means the kernel could not be asked, which is not evidence."""
+        self.assertEqual(self.state(server_answering=None).state, machine.CONNECTED)
+
+    def test_a_server_that_is_answering_is_just_connected(self) -> None:
+        self.assertEqual(self.state(server_answering=True).state, machine.CONNECTED)
+
+    def test_a_read_only_mount_that_goes_away_still_says_so(self) -> None:
+        state = self.state(server_answering=False, read_only=True)
+        self.assertEqual(state.state, machine.UNREACHABLE)
+        self.assertTrue(state.read_only)
+
+
+class TestTheMonitorAsksTheKernel(MonitorTestCase):
+    """**A wiring test, and it is here because wiring is what keeps breaking.**
+
+    `occupied_by`, `previous` and `in_use` each passed their own unit tests
+    while the daemon never passed them. This is the fourth parameter of its
+    kind, so it gets pinned at the point where it is actually used rather than
+    only where it is implemented.
+    """
+
+    def mount_it(self) -> None:
+        self.mountinfo.write_text(
+            self.armed
+            + "37 25 0:32 / /mnt/nas rw,relatime shared:23 - cifs "
+            "//rivendell.local/Media rw,vers=3.1.1\n",
+            encoding="utf-8",
+        )
+
+    def test_a_mounted_share_with_its_server_gone_is_reported_unreachable(self) -> None:
+        self.mount_it()
+        self.debug_data.write_text(
+            "Hostname: rivendell.local\nTCP status: 3 Instance: 1\n", encoding="utf-8"
+        )
+        state = self.monitor.poll()[0]
+        self.assertEqual(state.state, machine.UNREACHABLE)
+
+    def test_the_same_share_with_its_server_answering_is_connected(self) -> None:
+        self.mount_it()
+        self.debug_data.write_text(
+            "Hostname: rivendell.local\nTCP status: 1 Instance: 1\n", encoding="utf-8"
+        )
+        self.assertEqual(self.monitor.poll()[0].state, machine.CONNECTED)
+
+    def test_without_the_kernels_file_nothing_changes(self) -> None:
+        """A machine where the file cannot be read must behave as before."""
+        self.mount_it()
+        self.assertFalse(self.debug_data.exists())
+        self.assertEqual(self.monitor.poll()[0].state, machine.CONNECTED)
+
+    def test_an_unmounted_connection_does_not_ask_at_all(self) -> None:
+        """Nothing is mounted, so a server's state cannot say anything useful."""
+        self.debug_data.write_text(
+            "Hostname: rivendell.local\nTCP status: 3\n", encoding="utf-8"
+        )
+        self.assertEqual(self.monitor.poll()[0].state, machine.IDLE)
+
+    def test_the_change_is_pushed_like_any_other(self) -> None:
+        """The tray's whole justification: nobody asked, and it still arrives."""
+        self.mount_it()
+        self.debug_data.write_text(
+            "Hostname: rivendell.local\nTCP status: 1\n", encoding="utf-8"
+        )
+        self.monitor.poll()
+        self.events.clear()
+
+        self.debug_data.write_text(
+            "Hostname: rivendell.local\nTCP status: 3\n", encoding="utf-8"
+        )
+        self.monitor.poll()
+        pushed = [data for event, data in self.events if event == "state.changed"]
+        self.assertEqual(pushed[0]["state"], machine.UNREACHABLE)
+        self.assertTrue(pushed[0]["is_problem"])

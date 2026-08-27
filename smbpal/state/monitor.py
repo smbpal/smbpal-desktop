@@ -24,6 +24,7 @@ from typing import Any, Callable
 
 from smbpal.config import ConfigStore
 from smbpal.errors import SmbpalError
+from smbpal.mounts import probe as probe_module
 from smbpal.mounts import systemd, units
 from smbpal.mounts.apply import Mounter
 from smbpal.state.machine import ConnectionState, derive
@@ -99,8 +100,13 @@ class StateMonitor:
         current: dict[str, ConnectionState] = {}
         changes: list[tuple[ConnectionState | None, ConnectionState]] = []
 
+        # Once for the whole poll: it is one small read, and asking per
+        # connection would give two connections to the same server answers
+        # taken a moment apart.
+        servers = self.mounter.probe.server_states()
+
         for connection in config.get("connections", []):
-            state = self._state_of(connection)
+            state = self._state_of(connection, servers)
             current[state.id] = state
             with self._lock:
                 previous = self._states.get(state.id)
@@ -117,7 +123,11 @@ class StateMonitor:
             self._push("connection.removed", {"id": connection_id})
         return list(current.values())
 
-    def _state_of(self, connection: dict[str, Any]) -> ConnectionState:
+    def _state_of(
+        self,
+        connection: dict[str, Any],
+        servers: dict[str, bool] | None = None,
+    ) -> ConnectionState:
         mount_name, _ = units.unit_names(connection["mountpoint"])
         # Asked first: when it answers, `mounted` is True about a filesystem
         # that is not ours, and every question after it is the wrong one.
@@ -150,6 +160,11 @@ class StateMonitor:
             else None,
             occupied_by=f"{intruder.source} ({intruder.fstype})"
             if intruder is not None
+            else None,
+            server_answering=probe_module.server_is_answering(
+                connection.get("host", ""), servers
+            )
+            if mounted
             else None,
         )
 

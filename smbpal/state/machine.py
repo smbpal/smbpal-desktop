@@ -107,6 +107,7 @@ def derive(
     armed: bool | None = None,
     read_only: bool | None = None,
     occupied_by: str | None = None,
+    server_answering: bool | None = None,
 ) -> ConnectionState:
     """Work out the state from the mount table, the unit, and the journal.
 
@@ -134,6 +135,26 @@ def derive(
         )
 
     if mounted:
+        if server_answering is False:
+            # **Mounted and gone.** Confirmed on the Pi, 27 August 2026: with
+            # Wi-Fi off the share stayed in the mount table, the file manager
+            # served a cached listing and then failed with `The specified
+            # directory ... is not valid`, and SMBPal said `connected` for the
+            # whole three minutes. Nothing else on the machine can name this —
+            # no unit fails, because the mount already succeeded — so if this
+            # is not said here it is not said anywhere.
+            #
+            # `None` is not this case. It means the kernel could not be asked,
+            # and reporting a fault on the strength of not knowing would be the
+            # opposite mistake.
+            return ConnectionState(
+                identifier,
+                UNREACHABLE,
+                "still mounted, but the server has stopped answering — files "
+                "will fail until it comes back",
+                retryable=True,
+                read_only=bool(read_only),
+            )
         if read_only:
             return ConnectionState(
                 identifier,
