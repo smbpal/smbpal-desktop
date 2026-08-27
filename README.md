@@ -106,9 +106,9 @@ Now:
 
 ```
 Connections:
-  ID                     HOST             SHARE  MOUNTPOINT  STATE
-  rivendell-local-media  rivendell.local  Media  /mnt/nas    auth_failed
-  ! rivendell-local-media: the username or password was refused by the server
+  ID               HOST       SHARE  MOUNTPOINT  STATE
+  nas-local-media  nas.local  Media  /mnt/nas    auth_failed
+  ! nas-local-media: the username or password was refused by the server
 ```
 
 **`idle` is not `disconnected`.** An automount nobody has touched is working

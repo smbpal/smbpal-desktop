@@ -100,5 +100,58 @@ class TestNoNameIsDefinedTwice(unittest.TestCase):
         self.assertEqual(failures, [], "\n" + "\n".join(failures))
 
 
+class TestNoPrivateNamesReachAUser(unittest.TestCase):
+    """A rule made on 27 August 2026: end users see `nas.local`, never a real
+    machine from the author's network.
+
+    It got in as a placeholder in the "Connect to a share" dialog, where a
+    placeholder reads as a suggestion, and it was spotted on the Pi rather than
+    in review. **Docstrings and comments are deliberately exempt**: two of them
+    quote M0's actual `findmnt` output, and replacing a real capture with an
+    invented one makes it a worse record. Nobody running SMBPal reads those.
+
+    So this checks string *literals* only — the things that can be printed,
+    logged, or drawn.
+    """
+
+    # Not secret; the git history is full of it and that was decided to be
+    # fine. The rule is about what reaches a screen.
+    PRIVATE = ("rivendell",)
+
+    def test_no_string_literal_in_the_package_names_a_private_machine(self) -> None:
+        for path in sorted((ROOT / "smbpal").rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                    continue
+                if _is_docstring(tree, node):
+                    continue
+                for name in self.PRIVATE:
+                    with self.subTest(file=path.name, line=node.lineno):
+                        self.assertNotIn(
+                            name,
+                            node.value.lower(),
+                            f"{path.relative_to(ROOT)}:{node.lineno} puts a real "
+                            f"machine name somewhere a user could see it",
+                        )
+
+
+def _is_docstring(tree: ast.Module, node: ast.Constant) -> bool:
+    """True for a module, class or function docstring anywhere in the tree."""
+    for parent in ast.walk(tree):
+        if not isinstance(
+            parent, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            continue
+        body = getattr(parent, "body", [])
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and body[0].value is node
+        ):
+            return True
+    return False
+
+
 if __name__ == "__main__":
     unittest.main()
