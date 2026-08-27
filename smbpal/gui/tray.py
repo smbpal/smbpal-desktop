@@ -101,9 +101,19 @@ class Tray:
     """One StatusNotifierItem, fed by the same `Session` the window uses."""
 
     def __init__(
-        self, session: Session, *, launch: str | list[str] = "smbpal-gui"
+        self,
+        session: Session,
+        *,
+        launch: str | list[str] = "smbpal-gui",
+        icon: str | None = None,
     ) -> None:
         self.session = session
+        # An override for one name, used for every state. SMBPal's own icons do
+        # not exist until M7 installs them under hicolor, and a panel that
+        # cannot resolve a name may draw nothing at all — which is
+        # indistinguishable from the item not being there. Pointing this at an
+        # icon the theme certainly has separates the two.
+        self.icon_override = icon
         # A list, always. Before M7 there is no `smbpal-gui` on PATH — the Pi
         # runs from a source tree because Trixie refuses `pip install` (PEP
         # 668) — so the command has to be able to be `python3 -m
@@ -171,6 +181,8 @@ class Tray:
 
     @property
     def icon_name(self) -> str:
+        if self.icon_override:
+            return self.icon_override
         return ICONS.get(self.indicator.status, "smbpal")
 
     # --- D-Bus -------------------------------------------------------------
@@ -310,6 +322,13 @@ def main(argv: list[str] | None = None) -> int:
         "tree needs the whole line: "
         "--gui 'python3 -m smbpal.gui.app --socket /run/smbpald.sock'",
     )
+    parser.add_argument(
+        "--icon",
+        help="use this themed icon name for every state, instead of SMBPal's "
+        "own. SMBPal's are installed by M7; until then a panel that cannot "
+        "resolve a name may draw nothing, which looks the same as the item "
+        "not being registered. Try --icon folder-remote.",
+    )
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
     logging.basicConfig(
@@ -324,7 +343,7 @@ def main(argv: list[str] | None = None) -> int:
             lambda: (callback(), GLib.SOURCE_REMOVE)[1]
         ),
     )
-    tray = Tray(session, launch=shlex.split(args.gui))
+    tray = Tray(session, launch=shlex.split(args.gui), icon=args.icon)
 
     def owned(connection: Gio.DBusConnection, _name: str) -> None:
         tray.register(connection)
