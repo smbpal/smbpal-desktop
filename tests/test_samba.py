@@ -198,5 +198,95 @@ class TestCredentials(unittest.TestCase):
         self.assertNotIn("-w", self.samba.calls[-1])
 
 
+# Verbatim from M0's run 2 on the Pi (`m0/results/run2-session.clean.log`),
+# Samba 4.22.10. Hand-written test fixtures for this would agree with whatever
+# the parser assumes; this does not.
+TESTPARM_DUMP = """\
+Load smb config files from /etc/samba/smb.conf
+Loaded services file OK.
+Weak crypto is allowed by GnuTLS (e.g. NTLM as a compatibility fallback)
+
+Server role: ROLE_STANDALONE
+
+# Global parameters
+[global]
+\tidmap config * : backend = tdb
+\tinclude = /etc/samba/smbpal.conf
+
+
+[m0test]
+\tpath = /srv/m0test
+\tread only = No
+
+
+[homes]
+\tbrowseable = No
+\tcomment = Home Directories
+\tvalid users = %S
+
+
+[printers]
+\tbrowseable = No
+\tpath = /var/tmp
+\tprintable = Yes
+
+
+[print$]
+\tcomment = Printer Drivers
+\tpath = /var/lib/samba/printers
+"""
+
+
+class DumpRunner:
+    """A runner that answers `testparm -s` with the capture above."""
+
+    def __init__(self, dump: str = TESTPARM_DUMP) -> None:
+        self.dump = dump
+
+    def __call__(self, argv, *, input=None, timeout=None):
+        from smbpal.system.run import CommandResult
+
+        return CommandResult(tuple(argv), 0, self.dump, "Loaded services file OK.\n")
+
+
+class TestEffectiveShares(unittest.TestCase):
+    def test_paths_come_back_with_the_names(self) -> None:
+        shares = control.effective_shares(runner=DumpRunner())
+        self.assertEqual(shares["m0test"], "/srv/m0test")
+        self.assertEqual(shares["print$"], "/var/lib/samba/printers")
+
+    def test_a_section_with_no_path_is_still_a_section(self) -> None:
+        # [homes] has no path line. Dropping it would understate what Samba
+        # serves, which is the opposite of the point.
+        self.assertEqual(control.effective_shares(runner=DumpRunner())["homes"], "")
+
+    def test_global_is_not_given_a_path_by_a_later_section(self) -> None:
+        # [global]'s only `=` line here is an include. A parser that carried
+        # state across sections would hand it /srv/m0test.
+        self.assertEqual(control.effective_shares(runner=DumpRunner())["global"], "")
+
+    def test_names_still_available_on_their_own(self) -> None:
+        self.assertIn("m0test", control.effective_share_names(runner=DumpRunner()))
+
+
+class TestUnmanagedShares(unittest.TestCase):
+    def test_a_share_we_did_not_write_is_reported(self) -> None:
+        unmanaged = control.unmanaged_shares([], runner=DumpRunner())
+        self.assertEqual(unmanaged, {"m0test": "/srv/m0test"})
+
+    def test_our_own_shares_are_not(self) -> None:
+        self.assertEqual(control.unmanaged_shares(["m0test"], runner=DumpRunner()), {})
+
+    def test_the_comparison_is_case_insensitive(self) -> None:
+        # Samba resolves share names case-insensitively, so [media] shadowing
+        # [Media] is the same collision to a client.
+        self.assertEqual(control.unmanaged_shares(["M0Test"], runner=DumpRunner()), {})
+
+    def test_sambas_own_sections_are_not_shares(self) -> None:
+        unmanaged = control.unmanaged_shares([], runner=DumpRunner())
+        for reserved in ("global", "homes", "printers", "print$"):
+            self.assertNotIn(reserved, unmanaged)
+
+
 if __name__ == "__main__":
     unittest.main()

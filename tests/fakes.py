@@ -15,6 +15,7 @@ from pathlib import Path
 from smbpal.system.run import CommandResult
 
 _SECTION = re.compile(r"^\s*\[([^\]]+)\]\s*$")
+_PATH = re.compile(r"^path\s*=\s*(.*)$", re.IGNORECASE)
 _INCLUDE = re.compile(r"^\s*include\s*=\s*(\S+)\s*$", re.IGNORECASE)
 
 
@@ -56,9 +57,15 @@ class FakeSamba:
     # --- commands ----------------------------------------------------------
 
     def _testparm(self, argv, _input) -> CommandResult:
-        sections = self._resolve_sections()
-        dump = "\n".join(f"[{name}]" for name in sections)
-        return CommandResult(argv, 0, dump + "\n", "Loaded services file OK.\n")
+        # Paths as well as names, because real `testparm -s` emits them and a
+        # fake that leaves out a field the code reads hides whatever depends
+        # on it. See TESTPARM_DUMP in tests/test_samba.py for the real shape.
+        lines: list[str] = []
+        for name, path in self._resolve_sections():
+            lines.append(f"[{name}]")
+            if path:
+                lines.append(f"\tpath = {path}")
+        return CommandResult(argv, 0, "\n".join(lines) + "\n", "Loaded services file OK.\n")
 
     def _smbcontrol(self, argv, _input) -> CommandResult:
         if self.reload_fails:
@@ -130,11 +137,11 @@ class FakeSamba:
 
     # --- the part that makes this a real check -----------------------------
 
-    def _resolve_sections(self) -> list[str]:
+    def _resolve_sections(self) -> list[tuple[str, str]]:
         """Parse smb.conf the way Samba would: sections, following one include."""
         return self._sections_of(self.smb_conf, depth=0)
 
-    def _sections_of(self, path: Path, depth: int) -> list[str]:
+    def _sections_of(self, path: Path, depth: int) -> list[tuple[str, str]]:
         if depth > 4:
             return []
         try:
@@ -143,11 +150,16 @@ class FakeSamba:
             # M0 §1a: a missing include is silent. Samba starts, testparm says
             # OK, and the share simply is not there.
             return []
-        found: list[str] = []
+        found: list[tuple[str, str]] = []
         for line in text.splitlines():
             section = _SECTION.match(line)
             if section:
-                found.append(section.group(1))
+                found.append((section.group(1), ""))
+                continue
+            path_line = _PATH.match(line.strip())
+            if path_line and found:
+                name, _ = found[-1]
+                found[-1] = (name, path_line.group(1).strip())
                 continue
             included = _INCLUDE.match(line)
             if included:

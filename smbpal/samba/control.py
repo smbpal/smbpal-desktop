@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import Iterable
 
+from smbpal.config.schema import RESERVED_SHARE_NAMES
 from smbpal.errors import SmbpalError
 from smbpal.system.run import CommandRunner, run
 
@@ -26,6 +28,7 @@ TESTPARM = "testparm"
 SMBCONTROL = "smbcontrol"
 
 _SECTION = re.compile(r"^\[([^\]]+)\]\s*$")
+_PATH = re.compile(r"^path\s*=\s*(.*)$", re.IGNORECASE)
 
 
 class ReloadFailed(SmbpalError):
@@ -38,20 +41,62 @@ class ShareNotServed(SmbpalError):
     code = "share_not_served"
 
 
-def effective_share_names(*, runner: CommandRunner | None = None) -> set[str]:
-    """Every section Samba is actually serving, from `testparm -s`.
+def effective_shares(*, runner: CommandRunner | None = None) -> dict[str, str]:
+    """Every section Samba is serving, mapped to its path, from `testparm -s`.
 
     `-s` suppresses the "Press enter" prompt. Diagnostics go to stderr and the
     dump to stdout, so only stdout is parsed.
+
+    The path is read because a share name on its own does not tell anyone which
+    directory a hand-written section is exposing, and that is the first thing
+    they will want to know about one they did not create.
     """
     execute = runner or run
     result = execute([TESTPARM, "-s"]).check()
-    names: set[str] = set()
+    shares: dict[str, str] = {}
+    current: str | None = None
     for line in result.stdout.splitlines():
-        match = _SECTION.match(line.strip())
+        stripped = line.strip()
+        match = _SECTION.match(stripped)
         if match:
-            names.add(match.group(1))
-    return names
+            current = match.group(1)
+            shares.setdefault(current, "")
+            continue
+        if current is None:
+            continue
+        path = _PATH.match(stripped)
+        if path:
+            shares[current] = path.group(1).strip()
+    return shares
+
+
+def effective_share_names(*, runner: CommandRunner | None = None) -> set[str]:
+    """Every section Samba is actually serving."""
+    return set(effective_shares(runner=runner))
+
+
+def unmanaged_shares(
+    configured: Iterable[str], *, runner: CommandRunner | None = None
+) -> dict[str, str]:
+    """Sections Samba serves that SMBPal did not write.
+
+    **§8 parks adopting these, which is not the same as ignoring them.** The
+    definition of done requires that a hand-written share is visible and marked
+    rather than quietly absent — someone looking at a list that shows two of
+    their five shares will conclude SMBPal broke the other three.
+
+    Samba's own sections are excluded: `[global]` is not a share, and `homes`,
+    `printers` and `print$` are machinery.
+
+    Names compare case-insensitively, because Samba resolves them that way and
+    a `[media]` that shadows a `[Media]` is the same collision to a client.
+    """
+    mine = {name.lower() for name in configured}
+    return {
+        name: path
+        for name, path in effective_shares(runner=runner).items()
+        if name.lower() not in mine and name.lower() not in RESERVED_SHARE_NAMES
+    }
 
 
 def reload_config(*, runner: CommandRunner | None = None) -> None:

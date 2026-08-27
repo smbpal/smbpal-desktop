@@ -34,7 +34,10 @@ _SHARE_NAME_MAX = 80
 
 # Section names Samba gives its own meaning. A share called `global` would not be
 # a share.
-_RESERVED_SHARE_NAMES = frozenset({"global", "homes", "printers", "print$"})
+# Public: `samba.control` needs the same list to tell Samba's own machinery
+# apart from a share somebody wrote by hand.
+RESERVED_SHARE_NAMES = frozenset({"global", "homes", "printers", "print$"})
+_RESERVED_SHARE_NAMES = RESERVED_SHARE_NAMES
 
 # A host may be a name or an address. Reject anything that could carry structure
 # into a UNC path or a mount command line.

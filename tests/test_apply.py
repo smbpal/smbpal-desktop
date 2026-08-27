@@ -17,7 +17,14 @@ from smbpal.samba import control, include
 from smbpal.samba.apply import Applier
 from smbpal.shares import ownership
 from tests.fakes import FakeSamba
+from smbpal.config import ConfigStore
+from smbpal.daemon.handlers import Dispatcher
+from smbpal.errors import AlreadyExists
+from smbpal.ipc.peer import PeerCredentials
+from smbpal.ipc.protocol import Request
 from tests.test_samba import STOCK
+
+_PEER = PeerCredentials(uid=0, gid=0, pid=1)
 
 
 class ApplyTestCase(unittest.TestCase):
@@ -286,6 +293,59 @@ def _username() -> str:
     import getpass
 
     return getpass.getuser()
+
+
+class TestUnmanagedShares(ApplyTestCase):
+    """§8 parks adopting a hand-written share. That is not the same as hiding it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.smb_conf.write_text(
+            self.smb_conf.read_text(encoding="utf-8")
+            + "\n[Legacy]\n   path = /srv/legacy\n",
+            encoding="utf-8",
+        )
+        self.store = ConfigStore(self.root / "config.json")
+        self.dispatcher = Dispatcher(self.store, applier=self.applier)
+
+    def status(self) -> dict:
+        return self.dispatcher._status(None, None)
+
+    def test_a_hand_written_share_appears_marked(self) -> None:
+        # A list showing two of someone's five shares reads as SMBPal having
+        # broken the other three.
+        rows = {r["name"]: r for r in self.status()["shares"]}
+        self.assertIn("Legacy", rows)
+        self.assertEqual(rows["Legacy"]["state"], "unmanaged")
+        self.assertIs(rows["Legacy"]["managed"], False)
+
+    def test_sambas_own_sections_are_not_listed_as_shares(self) -> None:
+        names = {r["name"] for r in self.status()["shares"]}
+        self.assertNotIn("global", names)
+        self.assertNotIn("printers", names)
+
+    def test_adding_a_share_that_would_shadow_one_is_refused(self) -> None:
+        # SMBPal cannot edit their section — it only writes smbpal.conf — but
+        # it can append a second [Legacy] after it, and Samba takes the last
+        # one. Their share stops working and nothing says so.
+        Path(self.root / "mine").mkdir()
+        with self.assertRaises(AlreadyExists) as caught:
+            self.dispatcher._share_add(
+                Request(id=1, method="share.add",
+                        params={"name": "legacy", "path": str(self.root / "mine")}),
+                _PEER,
+            )
+        self.assertIn("SMBPal did not create", caught.exception.message)
+        self.assertIn("/srv/legacy", caught.exception.detail)
+
+    def test_an_unrelated_name_is_still_allowed(self) -> None:
+        Path(self.root / "mine").mkdir()
+        share = self.dispatcher._share_add(
+            Request(id=1, method="share.add",
+                    params={"name": "Media", "path": str(self.root / "mine")}),
+            _PEER,
+        )
+        self.assertEqual(share["name"], "Media")
 
 
 if __name__ == "__main__":

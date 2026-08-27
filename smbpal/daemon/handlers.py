@@ -16,7 +16,14 @@ from smbpal import PROTOCOL_VERSION, __version__
 from smbpal.config import ConfigStore
 from smbpal.config import operations as ops
 from smbpal.discovery import discover
-from smbpal.errors import InvalidParams, NotFound, NotPermitted, SmbpalError, UnknownMethod
+from smbpal.errors import (
+    AlreadyExists,
+    InvalidParams,
+    NotFound,
+    NotPermitted,
+    SmbpalError,
+    UnknownMethod,
+)
 from smbpal.mounts import inventory, systemd, units
 from smbpal.mounts.apply import Mounter
 from smbpal.samba import control, passwd
@@ -276,9 +283,10 @@ class Dispatcher:
         # Ask Samba what it is actually serving rather than assuming our own
         # writes took (M0 §1a: testparm's verdict proves nothing about our file).
         try:
-            serving = control.effective_share_names(runner=self.applier.runner)
+            effective = control.effective_shares(runner=self.applier.runner)
         except SmbpalError:
-            serving = None
+            effective = None
+        serving = None if effective is None else set(effective)
 
         rows = []
         for planned in self.applier.plan(config):
@@ -292,6 +300,27 @@ class Dispatcher:
             else:
                 row["state"] = "not served"
             rows.append(row)
+
+        if effective is not None:
+            # §8 parks adopting these; it does not license hiding them. A list
+            # showing two of someone's five shares reads as SMBPal having
+            # broken the other three.
+            configured = [s.get("name", "") for s in config.get("shares", [])]
+            for name, path in sorted(
+                control.unmanaged_shares(
+                    configured, runner=self.applier.runner
+                ).items()
+            ):
+                rows.append(
+                    {
+                        "id": "-",
+                        "name": name,
+                        "path": path or "?",
+                        "enabled": True,
+                        "state": "unmanaged",
+                        "managed": False,
+                    }
+                )
         return rows
 
     # --- shares ------------------------------------------------------------
@@ -304,6 +333,7 @@ class Dispatcher:
         name = _require_str(params, "name")
         path = _require_str(params, "path")
         previous = self.store.load()
+        self._refuse_to_shadow(name, previous)
         updated, share = ops.add_share(
             previous,
             name=name,
@@ -316,6 +346,41 @@ class Dispatcher:
         report = self._commit(previous, updated)
         _audit(peer, "share.add", share["id"])
         return self._describe(share, report)
+
+    def _refuse_to_shadow(self, name: str, config: dict[str, Any]) -> None:
+        """Do not write a section that shadows one somebody else wrote.
+
+        **This is the enforcing half of "never modified".** SMBPal only ever
+        writes `smbpal.conf`, so it cannot edit a hand-written section — but it
+        can add a second `[Media]` after theirs, and Samba resolves a duplicate
+        by taking the last one. Their share stops working and nothing says so.
+        The config's own duplicate check cannot see this: it only knows about
+        shares SMBPal put there.
+        """
+        if self.applier is None:
+            return
+        try:
+            unmanaged = control.unmanaged_shares(
+                [s.get("name", "") for s in config.get("shares", [])],
+                runner=self.applier.runner,
+            )
+        except SmbpalError:
+            # Cannot ask, so cannot prove a collision. Refusing on a failed
+            # testparm would make an unrelated Samba problem look like a name
+            # clash.
+            return
+        for existing in unmanaged:
+            if existing.lower() == name.lower():
+                raise AlreadyExists(
+                    f"Samba is already serving a share called {existing!r} that "
+                    f"SMBPal did not create",
+                    detail=(
+                        f"It is at {unmanaged[existing] or 'an unrecorded path'}. "
+                        "Adding a second section with this name would shadow it — "
+                        "Samba takes the last one — and SMBPal does not adopt or "
+                        "modify shares it did not write. Choose another name."
+                    ),
+                )
 
     def _share_remove(self, request: Request, peer: PeerCredentials) -> dict[str, Any]:
         ref = _require_str(request.params, "ref")
