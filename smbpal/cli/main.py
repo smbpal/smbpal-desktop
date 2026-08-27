@@ -159,6 +159,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     connection_disconnect.add_argument("ref", help="connection id or mountpoint")
 
+    connection_cmds.add_parser(
+        "live",
+        help="mounts and units on this machine that the config does not describe",
+    )
+
     use_fallback = connection_cmds.add_parser(
         "use-fallback", help="swap the host for its recorded fallback address"
     )
@@ -223,6 +228,7 @@ def _cmd_status(client: Client, args: argparse.Namespace) -> int:
             ),
         ]
         blocks.extend(connection_notes(status["connections"]))
+        blocks.extend(unaccounted_notes(status.get("unaccounted", [])))
         return "\n".join(blocks)
 
     return _emit(args, status, human)
@@ -249,6 +255,36 @@ def connection_notes(connections: list[dict[str, Any]]) -> list[str]:
         if connection.get("hint"):
             notes.append(f"    {connection['hint']}")
     return notes
+
+
+def unaccounted_notes(findings: list[dict[str, Any]]) -> list[str]:
+    """What is on the machine that the config does not describe.
+
+    **Printed by `status` rather than waiting to be asked for.** The Pi run
+    that produced this had an empty config, a correct `connection list`, and a
+    share mounting on access — and the only reason it was noticed was that the
+    person already knew the mountpoint. A report you have to suspect something
+    to run is not a report.
+    """
+    if not findings:
+        return []
+    lines = ["", f"Not in the config ({len(findings)}):"]
+    for finding in findings:
+        source = finding.get("source") or "nothing mounted"
+        lines.append(f"  ! {finding['mountpoint']} <- {source}")
+        lines.append(f"    {finding['message']}")
+    return lines
+
+
+def _cmd_connection_live(client: Client, args: argparse.Namespace) -> int:
+    findings = client.call("connection.live")
+
+    def human() -> str:
+        if not findings:
+            return "nothing on this machine is unaccounted for"
+        return "\n".join(unaccounted_notes(findings)).lstrip("\n")
+
+    return _emit(args, findings, human)
 
 
 def _cmd_browse(client: Client, args: argparse.Namespace) -> int:
@@ -538,6 +574,7 @@ _COMMANDS: dict[tuple[str, str | None], Handler] = {
     ("connection", "connect"): _cmd_connection_connect,
     ("connection", "disconnect"): _cmd_connection_disconnect,
     ("connection", "use-fallback"): _cmd_connection_use_fallback,
+    ("connection", "live"): _cmd_connection_live,
     ("watch", None): _cmd_watch,
 }
 

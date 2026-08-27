@@ -22,6 +22,7 @@ from smbpal.mounts.apply import Mounter
 from smbpal.samba import control, passwd
 from smbpal.samba.apply import Applier
 from smbpal.shares import ownership
+from smbpal.mounts import inventory
 from smbpal.state.monitor import StateMonitor, fallback_hint
 from smbpal.ipc.peer import PeerCredentials
 from smbpal.ipc.protocol import Request, encode_failure, encode_success, parse_request
@@ -52,6 +53,7 @@ class Authoriser:
             "status",
             "share.list",
             "connection.list",
+            "connection.live",
             "credential.list",
             "connection.watch",
             "browse",
@@ -210,7 +212,27 @@ class Dispatcher:
             },
             "shares": self._share_states(config),
             "connections": self._connection_states(config),
+            # Reported without being asked for. The case this exists for is one
+            # nobody would think to ask about: a connection removed from the
+            # config whose automount is still enabled and still mounting.
+            "unaccounted": self._unaccounted(config),
         }
+
+    def _unaccounted(self, config: dict[str, Any]) -> list[dict[str, Any]]:
+        """Mounts and units on this machine that `config` does not describe."""
+        if self.mounter is None:
+            return []
+        findings = inventory.survey(
+            config,
+            unit_dir=self.mounter.unit_dir,
+            mountinfo=self.mounter.probe.mountinfo,
+        )
+        return [{**f.to_wire(), "message": f.message} for f in findings]
+
+    def _connection_live(
+        self, _request: Request, _peer: PeerCredentials
+    ) -> list[dict[str, Any]]:
+        return self._unaccounted(self.store.load())
 
     def _connection_states(self, config: dict[str, Any]) -> list[dict[str, Any]]:
         if self.mounter is None:
@@ -626,6 +648,7 @@ _METHODS: dict[str, Method] = {
     "connection.connect": Dispatcher._connection_connect,
     "connection.disconnect": Dispatcher._connection_disconnect,
     "connection.use_fallback": Dispatcher._connection_use_fallback,
+    "connection.live": Dispatcher._connection_live,
     "connection.watch": Dispatcher._connection_watch,
     "browse": Dispatcher._browse,
 }

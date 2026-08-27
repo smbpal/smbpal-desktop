@@ -13,6 +13,7 @@ from pathlib import Path
 from smbpal.config import empty_config
 from smbpal.config import operations as ops
 from smbpal.errors import InvalidParams
+from smbpal.mounts import inventory
 from smbpal.mounts import probe as probe_module
 from smbpal.mounts import units
 from smbpal.mounts.apply import MARKER, OCCUPIED, Mounter, foreign_mount
@@ -501,6 +502,30 @@ class TestMounter(unittest.TestCase):
         self.assertEqual(len(list(self.unit_dir.iterdir())), 2)
         self.assertEqual(self.mounter.plan(config)[0].state, probe_module.MOUNTED)
 
+    def test_a_unit_is_kept_while_its_mount_is_still_up(self) -> None:
+        # The marker in the unit file is the only evidence a mount was ours —
+        # a cifs line in mountinfo says nothing about who made it. Unlinking
+        # while the unmount has not taken would demote an orphan we may clean
+        # up into an unmanaged mount we may not touch.
+        config = self.config()
+        mountpoint = config["connections"][0]["mountpoint"]
+        self.mounter.apply(config)
+        self.occupy(
+            mountpoint,
+            f"83 36 0:44 / {mountpoint} rw,relatime shared:45 - cifs "
+            "//rivendell.local/Media rw,vers=3.1.1\n",
+        )
+        self.mounter.apply(empty_config())
+        kept = [p.name for p in self.unit_dir.iterdir()]
+        self.assertIn("mount", "".join(kept))
+        self.assertTrue(any(n.endswith(".mount") for n in kept))
+
+    def test_a_unit_whose_mount_went_away_is_removed(self) -> None:
+        config = self.config()
+        self.mounter.apply(config)
+        self.mounter.apply(empty_config())
+        self.assertEqual(list(self.unit_dir.iterdir()), [])
+
     def test_credentials_reach_the_unit_as_a_path(self) -> None:
         config = self.config(credential_ref="nas")
         self.mounter.credentials.write("nas", username="pi", password="hunter2")
@@ -555,6 +580,105 @@ class TestForeignMountDetection(unittest.TestCase):
 
     def test_nothing_mounted_is_not_foreign(self) -> None:
         self.assertIsNone(foreign_mount(None, self.connection))
+
+
+class TestInventory(unittest.TestCase):
+    """Three classes, because the action a person can take differs."""
+
+    def setUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.root = Path(self._dir.name)
+        self.unit_dir = self.root / "units"
+        self.unit_dir.mkdir()
+        self.mountinfo = self.root / "mountinfo"
+        self.mountinfo.write_text("", encoding="utf-8")
+
+    def write_unit(self, name: str, mountpoint: str, identifier: str) -> None:
+        (self.unit_dir / name).write_text(
+            f"{MARKER}{identifier}. Do not edit.\n[Mount]\nWhere={mountpoint}\n",
+            encoding="utf-8",
+        )
+
+    def mount(self, mountpoint: str, source: str, fstype: str = "cifs") -> None:
+        self.mountinfo.write_text(
+            self.mountinfo.read_text(encoding="utf-8")
+            + f"83 36 0:44 / {mountpoint} rw,relatime shared:45 - {fstype} "
+            f"{source} rw,vers=3.1.1\n",
+            encoding="utf-8",
+        )
+
+    def survey(self, config: dict) -> list[inventory.Finding]:
+        return inventory.survey(
+            config, unit_dir=self.unit_dir, mountinfo=self.mountinfo
+        )
+
+    def config(self, *mountpoints: str) -> dict:
+        return {
+            "connections": [
+                {"id": f"c{i}", "mountpoint": m} for i, m in enumerate(mountpoints)
+            ]
+        }
+
+    def test_a_configured_connection_is_not_reported(self) -> None:
+        self.write_unit("mnt-nas.mount", "/mnt/nas", "nas")
+        self.mount("/mnt/nas", "//rivendell.local/Media")
+        self.assertEqual(self.survey(self.config("/mnt/nas")), [])
+
+    def test_our_unit_with_no_config_entry_is_an_orphan(self) -> None:
+        # The Pi case: connection gone from the config, automount still
+        # enabled, share still mounting on access.
+        self.write_unit("mnt-nas.mount", "/mnt/nas", "nas")
+        self.mount("/mnt/nas", "//rivendell.local/Media")
+        finding = self.survey(self.config())[0]
+        self.assertEqual(finding.kind, inventory.ORPHANED)
+        self.assertEqual(finding.connection_id, "nas")
+        self.assertTrue(finding.mounted)
+        self.assertIn("no longer in the config", finding.message)
+
+    def test_an_orphan_that_has_never_mounted_is_still_found(self) -> None:
+        # Nothing in mountinfo but autofs, which identifies nothing. The unit
+        # is the only place this is visible, and it will mount on the next ls.
+        self.write_unit("mnt-nas.automount", "/mnt/nas", "nas")
+        finding = self.survey(self.config())[0]
+        self.assertEqual(finding.kind, inventory.ORPHANED)
+        self.assertFalse(finding.mounted)
+        self.assertIn("will mount on access", finding.message)
+
+    def test_a_cifs_mount_that_is_not_ours_is_unmanaged(self) -> None:
+        self.mount("/mnt/theirs", "//elsewhere/Stuff")
+        finding = self.survey(self.config())[0]
+        self.assertEqual(finding.kind, inventory.UNMANAGED)
+        self.assertIsNone(finding.connection_id)
+        self.assertIn("left alone", finding.message)
+
+    def test_an_orphan_is_not_also_counted_as_unmanaged(self) -> None:
+        self.write_unit("mnt-nas.mount", "/mnt/nas", "nas")
+        self.mount("/mnt/nas", "//rivendell.local/Media")
+        findings = self.survey(self.config())
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].kind, inventory.ORPHANED)
+
+    def test_both_units_for_one_orphan_report_once(self) -> None:
+        self.write_unit("mnt-nas.mount", "/mnt/nas", "nas")
+        self.write_unit("mnt-nas.automount", "/mnt/nas", "nas")
+        self.assertEqual(len(self.survey(self.config())), 1)
+
+    def test_a_non_smb_mount_is_not_our_business(self) -> None:
+        # Reporting every stray ext4 mount would be noise dressed as diligence.
+        self.mount("/mnt/disk", "/dev/sda1", fstype="ext4")
+        self.assertEqual(self.survey(self.config()), [])
+
+    def test_an_unmarked_unit_is_not_claimed_as_ours(self) -> None:
+        (self.unit_dir / "mnt-theirs.mount").write_text(
+            "[Mount]\nWhere=/mnt/theirs\n", encoding="utf-8"
+        )
+        self.assertEqual(self.survey(self.config()), [])
+
+    def test_the_marker_is_the_one_in_apply(self) -> None:
+        # Two copies of this string would mean units written by one and never
+        # recognised by the other.
+        self.assertEqual(inventory.MARKER, MARKER)
 
 
 if __name__ == "__main__":

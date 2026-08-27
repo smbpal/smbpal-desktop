@@ -22,8 +22,12 @@ from smbpal.cli.main import (
     main,
 )
 from smbpal.config import ConfigStore
+from smbpal.mounts.apply import MARKER, Mounter
+from smbpal.mounts.credentials import CredentialsStore
+from smbpal.mounts.probe import MountProbe
 from smbpal.daemon.handlers import Dispatcher
 from smbpal.ipc.server import UnixSocketTransport
+from tests.fakes import FakeSamba
 
 
 class CliTestCase(unittest.TestCase):
@@ -256,6 +260,70 @@ class TestBrowse(CliTestCase):
         self.assertIn("192.168.0.210", out)
         self.assertNotIn("127.0.0.1", out)
         self.assertEqual(out.count("RASPBERRYPI"), 1)
+
+
+class TestUnaccounted(CliTestCase):
+    """A share mounting on access that the config knows nothing about."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        root = Path(self._dir.name)
+        self.unit_dir = root / "units"
+        self.unit_dir.mkdir()
+        # A real path under the temp root rather than /mnt, so that adding the
+        # same connection back can actually create it.
+        # resolve(): the CLI resolves the path it sends, and on macOS /tmp is a
+        # symlink to /private/tmp. The fixture has to agree with what the
+        # daemon will store or the mountpoints compare unequal for a reason
+        # that has nothing to do with what is being tested.
+        self.mountpoint = str((root / "mnt" / "smbpal-test").resolve())
+        self.mountinfo = root / "mountinfo"
+        self.mountinfo.write_text(
+            f"83 36 0:44 / {self.mountpoint} rw,relatime shared:45 - cifs "
+            "//rivendell.local/Media rw,vers=3.1.1\n",
+            encoding="utf-8",
+        )
+        (self.unit_dir / "mnt-smbpal.mount").write_text(
+            f"{MARKER}rivendell-local-media. Do not edit.\n"
+            f"[Mount]\nWhere={self.mountpoint}\n",
+            encoding="utf-8",
+        )
+        self.dispatcher.mounter = Mounter(
+            unit_dir=self.unit_dir,
+            credentials=CredentialsStore(root / "creds"),
+            probe=MountProbe(mountinfo=self.mountinfo),
+            runner=FakeSamba(root / "smb.conf"),
+        )
+
+    def test_status_says_so_without_being_asked(self) -> None:
+        # The Pi run that produced this had an empty config, a correct
+        # `connection list`, and a share mounting on access. Nothing surfaced
+        # it, so nothing was going to be noticed.
+        code, out, _ = self.run_cli("status")
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("no connections configured", out)
+        self.assertIn("Not in the config (1)", out)
+        self.assertIn(self.mountpoint, out)
+        self.assertIn("rivendell-local-media", out)
+
+    def test_connection_live_lists_it(self) -> None:
+        code, out, _ = self.run_cli("connection", "live")
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("//rivendell.local/Media", out)
+
+    def test_connection_live_is_quiet_when_there_is_nothing(self) -> None:
+        self.mountinfo.write_text("", encoding="utf-8")
+        (self.unit_dir / "mnt-smbpal.mount").unlink()
+        code, out, _ = self.run_cli("connection", "live")
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("nothing on this machine is unaccounted for", out)
+
+    def test_a_configured_connection_is_not_reported_as_unaccounted(self) -> None:
+        self.run_cli(
+            "connection", "add", "rivendell.local", "Media", self.mountpoint
+        )
+        _, out, _ = self.run_cli("status")
+        self.assertNotIn("Not in the config", out)
 
 
 if __name__ == "__main__":
