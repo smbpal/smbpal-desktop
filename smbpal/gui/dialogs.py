@@ -165,9 +165,11 @@ class AddShareDialog(_Form):
         """The native folder picker.
 
         `Gtk.FileChooserNative` rather than `Gtk.FileDialog`, which arrived in
-        GTK 4.10 and does not exist on Pi OS's 4.8. Native is what routes the
-        request through xdg-desktop-portal where one is running, and falls back
-        to GTK's own dialog where one is not.
+        GTK 4.10 — present on the Pi's 4.18 and absent on bookworm's 4.8 and
+        Ubuntu 22.04's 4.6, which are the versions that set the floor (see
+        `window.confirm`). Native is deprecated and works on all three, and it
+        is also what routes the request through xdg-desktop-portal where one is
+        running, falling back to GTK's own dialog where one is not.
         """
         chooser = Gtk.FileChooserNative.new(
             "Choose a folder to share",

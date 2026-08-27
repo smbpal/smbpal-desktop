@@ -66,8 +66,9 @@ def install_css() -> None:
     try:
         provider.load_from_data(CSS)
     except TypeError:
-        # GTK 4.12 replaced the bytes-taking form. Pi OS ships 4.8, so both
-        # have to work rather than one being chosen at packaging time.
+        # GTK 4.12 replaced the bytes-taking form, so both have to work rather
+        # than one being chosen at packaging time. See `confirm` for which
+        # GTK this floor is actually set by — it is not the Pi.
         provider.load_from_string(CSS.decode("utf-8"))
     Gtk.StyleContext.add_provider_for_display(
         display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
@@ -310,9 +311,16 @@ def confirm(
 ) -> None:
     """Ask before something that cannot be undone by pressing the button again.
 
-    A plain window rather than `Gtk.MessageDialog`, which is deprecated from
-    GTK 4.10 while Pi OS ships 4.8 — the replacement does not exist there and
-    the original warns here.
+    A plain window rather than `Gtk.MessageDialog` or its 4.10 replacement
+    `Gtk.AlertDialog`, because **the oldest GTK we intend to run on is not the
+    Pi's**. Pi OS is on trixie and GTK 4.18.6 (confirmed 27 August 2026), which
+    is comfortably above the floor; Debian bookworm is 4.8 and Ubuntu 22.04 is
+    4.6, and §1 says Phase 1 is Linux and the Pi rather than the Pi alone. A
+    plain window needs neither and works on all of them.
+
+    Worth stating because the tempting deletion is easy to justify wrongly:
+    somebody checks the Pi, finds 4.18, and removes compatibility the Pi was
+    never the reason for.
     """
     dialog = Gtk.Window(transient_for=parent, modal=True, title=verb.rstrip("…"))
     dialog.set_default_size(420, -1)
