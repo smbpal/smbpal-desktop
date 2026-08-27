@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shlex
 import shutil
 import sys
 from typing import Any
@@ -99,9 +100,15 @@ INTROSPECTION = """
 class Tray:
     """One StatusNotifierItem, fed by the same `Session` the window uses."""
 
-    def __init__(self, session: Session, *, launch: str = "smbpal-gui") -> None:
+    def __init__(
+        self, session: Session, *, launch: str | list[str] = "smbpal-gui"
+    ) -> None:
         self.session = session
-        self.launch = launch
+        # A list, always. Before M7 there is no `smbpal-gui` on PATH — the Pi
+        # runs from a source tree because Trixie refuses `pip install` (PEP
+        # 668) — so the command has to be able to be `python3 -m
+        # smbpal.gui.app --socket …`, which is four words and not one.
+        self.launch = [launch] if isinstance(launch, str) else list(launch)
         self.indicator = model.indicator(model.Screen())
         self._screen = model.Screen()
         self._connection: Gio.DBusConnection | None = None
@@ -269,11 +276,12 @@ class Tray:
     # --- the click ---------------------------------------------------------
 
     def open_window(self) -> None:
-        program = shutil.which(self.launch) or self.launch
+        argv = list(self.launch)
+        argv[0] = shutil.which(argv[0]) or argv[0]
         try:
-            Gio.Subprocess.new([program], Gio.SubprocessFlags.NONE)
+            Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE)
         except GLib.Error as exc:
-            log.error("could not start %s: %s", program, exc.message)
+            log.error("could not start %s: %s", " ".join(argv), exc.message)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -281,7 +289,14 @@ def main(argv: list[str] | None = None) -> int:
         prog="smbpal-tray", description="SMBPal's tray icon (session process)"
     )
     parser.add_argument("--socket", default=str(DEFAULT_SOCKET_PATH))
-    parser.add_argument("--gui", default="smbpal-gui", help="what a click runs")
+    parser.add_argument(
+        "--gui",
+        default="smbpal-gui",
+        help="the command a click runs, as a shell-style string. Defaults to "
+        "the installed entry point; before M7 there is not one, so a source "
+        "tree needs the whole line: "
+        "--gui 'python3 -m smbpal.gui.app --socket /run/smbpald.sock'",
+    )
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
     logging.basicConfig(
@@ -296,7 +311,7 @@ def main(argv: list[str] | None = None) -> int:
             lambda: (callback(), GLib.SOURCE_REMOVE)[1]
         ),
     )
-    tray = Tray(session, launch=args.gui)
+    tray = Tray(session, launch=shlex.split(args.gui))
 
     def owned(connection: Gio.DBusConnection, _name: str) -> None:
         tray.register(connection)
