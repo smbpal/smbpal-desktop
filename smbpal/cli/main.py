@@ -88,7 +88,8 @@ def build_parser() -> argparse.ArgumentParser:
     writable.add_argument("ref", help="share id or name")
 
     commands.add_parser(
-        "apply", help="re-write Samba's config from what is configured"
+        "apply",
+        help="re-apply the whole config: Samba's shares and the mount units both",
     )
 
     credential = commands.add_parser("credential", help="SMB passwords")
@@ -312,17 +313,39 @@ def _cmd_share_list(client: Client, args: argparse.Namespace) -> int:
 
 
 def _cmd_apply(client: Client, args: argparse.Namespace) -> int:
-    report = client.call("share.apply")
+    report = client.call("apply")
 
     def human() -> str:
         served = ", ".join(report["served"]) or "nothing"
         lines = [f"serving {served}"]
         if report["advertising"]:
             lines.append("advertising _smbpal._tcp")
+        # Apply does both halves. Reporting only the Samba one made `serving
+        # nothing` look like "did nothing" on a machine with two connections
+        # mounted, which is how the missing half was found.
+        summary = _connection_summary(report.get("connections", []))
+        if summary:
+            lines.append(summary)
         lines.extend(_read_only_notes(report["shares"]))
         return "\n".join(lines)
 
     return _emit(args, report, human)
+
+
+def _connection_summary(connections: list[dict[str, Any]]) -> str:
+    """`connections: 2 mounted` — counted by state, or nothing to say.
+
+    Counts rather than names, because the states are what a person is checking
+    after an apply and `status` is where the per-connection detail lives.
+    """
+    if not connections:
+        return ""
+    counts: dict[str, int] = {}
+    for connection in connections:
+        state = connection.get("state") or "unknown"
+        counts[state] = counts.get(state, 0) + 1
+    parts = [f"{count} {state}" for state, count in sorted(counts.items())]
+    return "connections: " + ", ".join(parts)
 
 
 def _cmd_share_make_writable(client: Client, args: argparse.Namespace) -> int:

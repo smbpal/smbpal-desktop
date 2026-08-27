@@ -390,13 +390,45 @@ class Dispatcher:
         _audit(peer, "share.remove", share["id"])
         return share
 
-    def _share_apply(self, _request: Request, peer: PeerCredentials) -> dict[str, Any]:
-        """Re-apply the whole config. Idempotent, and the retry after a failure."""
+    def _apply(self, _request: Request, peer: PeerCredentials) -> dict[str, Any]:
+        """Re-apply the whole config. Idempotent, and the retry after a failure.
+
+        **It has to mean the whole config, and until 27 August 2026 it did
+        not.** This only ever called the Samba applier, so `smbpal apply` did
+        nothing at all to connections — while three separate messages told
+        people to run it for exactly that:
+
+        - the state machine, when an automount is not armed: *"nothing will
+          mount on access — try `smbpal apply`"*
+        - `inventory`, for an orphaned unit: *"`smbpal apply` removes it"*
+        - `Mounter.apply` itself clears a latched unit with `reset-failed`,
+          on the reasoning that apply is "the command people reach for after
+          fixing whatever was wrong"
+
+        None of those worked. A Pi run made it visible from the other side:
+        `s apply` answered `serving nothing` with two connections mounted,
+        which was true about shares and silent about everything it had not
+        done.
+
+        No `previous` is passed: a person typed this, so the full sweep is
+        what they asked for. See `Mounter.apply`.
+        """
         if self.applier is None:
             raise SmbpalError("this daemon was started with --no-apply")
-        report = self.applier.apply(self.store.load())
-        _audit(peer, "share.apply", f"{len(report.served)} share(s)")
-        return report.to_wire()
+        config = self.store.load()
+        report = self.applier.apply(config)
+        wire = report.to_wire()
+        wire["connections"] = (
+            self.mounter.apply(config).to_wire()["connections"]
+            if self.mounter is not None
+            else []
+        )
+        _audit(
+            peer,
+            "apply",
+            f"{len(report.served)} share(s), {len(wire['connections'])} connection(s)",
+        )
+        return wire
 
     def _share_make_writable(
         self, request: Request, peer: PeerCredentials
@@ -703,7 +735,7 @@ _METHODS: dict[str, Method] = {
     "share.list": Dispatcher._share_list,
     "share.add": Dispatcher._share_add,
     "share.remove": Dispatcher._share_remove,
-    "share.apply": Dispatcher._share_apply,
+    "apply": Dispatcher._apply,
     "share.make_writable": Dispatcher._share_make_writable,
     "credential.list": Dispatcher._credential_list,
     "credential.set": Dispatcher._credential_set,

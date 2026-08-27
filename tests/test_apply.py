@@ -8,16 +8,22 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from smbpal.cli.main import _connection_summary
 from smbpal.config import ConfigStore, empty_config
 from smbpal.config import operations as ops
 from smbpal.daemon.handlers import Dispatcher
 from smbpal.discovery.advertise import Advertiser
-from smbpal.errors import SmbpalError
+from smbpal.errors import AlreadyExists, SmbpalError
+from smbpal.ipc.peer import PeerCredentials
+from smbpal.ipc.protocol import Request
+from smbpal.mounts import units
+from smbpal.mounts.apply import Mounter
+from smbpal.mounts.credentials import CredentialsStore
+from smbpal.mounts.probe import MountProbe
 from smbpal.samba import control, include
 from smbpal.samba.apply import Applier
 from smbpal.shares import ownership
 from tests.fakes import FakeSamba
-from smbpal.config import ConfigStore
 from smbpal.daemon.handlers import Dispatcher
 from smbpal.errors import AlreadyExists
 from smbpal.ipc.peer import PeerCredentials
@@ -245,9 +251,6 @@ class TestMakeWritableWarnsAboutLiveClients(ApplyTestCase):
         # could write while a Mac holding an older session could not.
         if self.me.uid == 0:
             self.skipTest("root can write anywhere")
-        from smbpal.config import ConfigStore
-        from smbpal.ipc.peer import PeerCredentials
-        from smbpal.ipc.protocol import Request
 
         target = self.root / "locked"
         target.mkdir(mode=0o500)
@@ -346,6 +349,78 @@ class TestUnmanagedShares(ApplyTestCase):
             _PEER,
         )
         self.assertEqual(share["name"], "Media")
+
+
+class TestApplyDoesBothHalves(ApplyTestCase):
+    """`smbpal apply` is the command three messages tell people to run."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.unit_dir = self.root / "units"
+        self.unit_dir.mkdir()
+        self.mountinfo = self.root / "mountinfo"
+        self.mountinfo.write_text("", encoding="utf-8")
+        self.mounter = Mounter(
+            unit_dir=self.unit_dir,
+            credentials=CredentialsStore(self.root / "creds"),
+            probe=MountProbe(mountinfo=self.mountinfo),
+            runner=self.samba,
+        )
+        self.store = ConfigStore(self.root / "config.json")
+        doc, self.connection = ops.add_connection(
+            empty_config(),
+            host="rivendell.local",
+            share="Media",
+            mountpoint=str(self.root / "mnt" / "nas"),
+        )
+        self.store.save(doc)
+        self.dispatcher = Dispatcher(
+            self.store, applier=self.applier, mounter=self.mounter
+        )
+
+    def apply(self) -> dict:
+        return self.dispatcher._apply(
+            Request(id=1, method="apply", params={}), _PEER
+        )
+
+    def test_it_writes_the_mount_units(self) -> None:
+        # Before this, `smbpal apply` called only the Samba applier, so it did
+        # nothing whatever to connections.
+        self.apply()
+        self.assertEqual(len(list(self.unit_dir.iterdir())), 2)
+
+    def test_it_arms_the_automount(self) -> None:
+        self.apply()
+        self.assertTrue(
+            any(u.endswith(".automount") for u in self.samba.enabled_units)
+        )
+
+    def test_it_clears_a_latched_unit(self) -> None:
+        # Mounter.apply calls reset-failed on the reasoning that apply is the
+        # command people reach for after fixing whatever was wrong. That was
+        # only true for a commit; a typed `apply` never reached it.
+        mount_name, _ = units.unit_names(self.connection["mountpoint"])
+        self.samba.latched.add(mount_name)
+        self.apply()
+        self.assertNotIn(mount_name, self.samba.latched)
+
+    def test_the_report_carries_the_connections(self) -> None:
+        # `serving nothing` with two connections mounted is how the missing
+        # half was found: true about shares, silent about everything else.
+        report = self.apply()
+        self.assertEqual(len(report["connections"]), 1)
+        self.assertEqual(report["connections"][0]["id"], self.connection["id"])
+
+
+class TestConnectionSummary(unittest.TestCase):
+    def test_states_are_counted(self) -> None:
+        summary = _connection_summary(
+            [{"state": "mounted"}, {"state": "mounted"}, {"state": "not mounted"}]
+        )
+        self.assertEqual(summary, "connections: 2 mounted, 1 not mounted")
+
+    def test_nothing_configured_says_nothing(self) -> None:
+        self.assertEqual(_connection_summary([]), "")
 
 
 if __name__ == "__main__":
