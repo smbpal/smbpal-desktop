@@ -195,6 +195,20 @@ class TestDerivedMountpoints(unittest.TestCase):
             "/media/pi/share",
         )
 
+    def test_a_derived_root_is_ours_to_tidy(self) -> None:
+        for path in ("/media/pi/Media", "/run/media/pi/Media", "/Volumes/Media"):
+            with self.subTest(path=path):
+                self.assertTrue(ops.in_managed_root(path))
+
+    def test_somewhere_a_person_chose_is_not(self) -> None:
+        for path in ("/srv/backups", "/mnt/nas", "/home/pi/share"):
+            with self.subTest(path=path):
+                self.assertFalse(ops.in_managed_root(path))
+
+    def test_the_root_itself_is_not_a_mountpoint_of_ours(self) -> None:
+        # /media is udisks2's folder, not a path we would ever derive.
+        self.assertFalse(ops.in_managed_root("/media"))
+
     def test_an_unknown_platform_falls_back_to_linux(self) -> None:
         # The daemon runs on Linux. A development Mac deriving a Linux path is
         # harmless; a Mac deriving /Volumes into a Pi's config would not be.

@@ -550,6 +550,37 @@ class TestMounter(unittest.TestCase):
         self.mounter.apply(empty_config())
         self.assertEqual(list(self.unit_dir.iterdir()), [])
 
+    def test_an_empty_mountpoint_we_chose_is_cleared_up(self) -> None:
+        # Observed on a Pi: with the connection removed and nothing mounted, a
+        # stick labelled Media still went to Media1, because udisks2 picks its
+        # mountpoint by testing whether the directory exists.
+        self.mounter.managed_roots = frozenset({str(self.root)})
+        config = self.config()
+        mountpoint = Path(config["connections"][0]["mountpoint"])
+        self.mounter.apply(config)
+        self.assertTrue(mountpoint.is_dir())
+        self.mounter.apply(empty_config())
+        self.assertFalse(mountpoint.exists())
+
+    def test_a_mountpoint_outside_our_roots_is_left_alone(self) -> None:
+        # An empty directory at /srv/backups harms nobody and was probably
+        # there before SMBPal was. Whose namespace it is, not who made it.
+        config = self.config()
+        mountpoint = Path(config["connections"][0]["mountpoint"])
+        self.mounter.apply(config)
+        self.mounter.apply(empty_config())
+        self.assertTrue(mountpoint.is_dir())
+
+    def test_a_mountpoint_with_anything_in_it_survives(self) -> None:
+        # rmdir is the whole check: it refuses, and we take the refusal.
+        self.mounter.managed_roots = frozenset({str(self.root)})
+        config = self.config()
+        mountpoint = Path(config["connections"][0]["mountpoint"])
+        self.mounter.apply(config)
+        (mountpoint / "someones-file").write_text("x", encoding="utf-8")
+        self.mounter.apply(empty_config())
+        self.assertTrue((mountpoint / "someones-file").exists())
+
     def test_credentials_reach_the_unit_as_a_path(self) -> None:
         config = self.config(credential_ref="nas")
         self.mounter.credentials.write("nas", username="pi", password="hunter2")

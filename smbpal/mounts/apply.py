@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from smbpal.config import operations
 from smbpal.errors import SmbpalError
 from smbpal.mounts import inventory
 from smbpal.mounts import probe as probe_module
@@ -111,11 +112,16 @@ class Mounter:
         credentials: CredentialsStore | None = None,
         probe: probe_module.MountProbe | None = None,
         runner: CommandRunner | None = None,
+        managed_roots: frozenset[str] | None = None,
     ) -> None:
         self.unit_dir = Path(unit_dir)
         self.credentials = credentials or CredentialsStore()
         self.probe = probe or probe_module.MountProbe()
         self.runner = runner
+        # Where a leftover mountpoint is ours to clear up. Injected for the
+        # same reason unit_dir and mountinfo are: the real values are absolute
+        # paths no test may write to.
+        self.managed_roots = managed_roots or operations.MANAGED_ROOTS
 
     def occupied_mountpoints(self) -> set[str]:
         """Every path something is really mounted on. autofs triggers excluded.
@@ -390,4 +396,27 @@ class Mounter:
                 continue
             removed.append(path.name)
             log.info("removed %s", path.name)
+            if where and operations.in_managed_root(where, self.managed_roots):
+                self._remove_empty_mountpoint(where)
         return removed
+
+    def _remove_empty_mountpoint(self, mountpoint: str) -> None:
+        """Clear up a mountpoint we chose, once nothing is using it.
+
+        **Only inside a root we derive into**, because that is where a leftover
+        does damage: udisks2 picks its mountpoint by testing whether the
+        directory exists, so an abandoned `/media/<user>/Media` sends every
+        future stick of that name to `Media1` — permanently, and long after
+        SMBPal is gone. A stray empty directory at `/srv/backups` harms nobody
+        and was probably there first.
+
+        `rmdir` is the whole safety check. It refuses a directory with
+        anything in it and refuses one that is still a mountpoint, so there is
+        no window between asking and acting.
+        """
+        try:
+            os.rmdir(mountpoint)
+        except OSError as exc:
+            log.debug("left %s in place: %s", mountpoint, exc)
+            return
+        log.info("removed the empty mountpoint %s", mountpoint)

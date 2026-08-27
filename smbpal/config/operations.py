@@ -12,6 +12,7 @@ clients that chose to go through the front door.
 from __future__ import annotations
 
 import copy
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -49,6 +50,29 @@ class MountpointStyle:
     # Whether the platform namespaces volumes per user. Debian-family udisks2
     # does (`/media/<user>/`); macOS's /Volumes is machine-wide.
     per_user: bool
+
+
+# The roots SMBPal derives mountpoints into, across platforms. Used to decide
+# which leftover directories are ours to tidy up: see `Mounter.managed_roots`.
+MANAGED_ROOTS = frozenset({"/media", "/run/media", "/Volumes"})
+
+
+def in_managed_root(mountpoint: str, roots: frozenset[str] = MANAGED_ROOTS) -> bool:
+    """Is this a path SMBPal chose, and so is responsible for tidying up?
+
+    **The distinction is about whose namespace it is, not who made the
+    directory.** An empty directory left at `/srv/backups` is nobody's problem
+    and was very likely there before SMBPal was; one left at
+    `/media/<user>/Media` displaces udisks2's naming for good, because udisks2
+    picks its mountpoint by testing whether the directory *exists*. Observed on
+    a Pi on 27 August 2026: with the connection removed and nothing mounted, a
+    stick labelled `Media` still went to `Media1`.
+
+    String work only — `os.path` does not touch the filesystem, so this module
+    stays as testable without one as the rest of it.
+    """
+    path = os.path.normpath(mountpoint)
+    return any(path.startswith(os.path.normpath(root) + os.sep) for root in roots)
 
 
 STYLES = {
