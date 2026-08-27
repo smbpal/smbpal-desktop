@@ -59,6 +59,10 @@ class _Job:
     transform: Callable[[Any], Any] | None
     # Runs on the main thread, with whatever `transform` returned.
     then: Callable[[Any], None] | None
+    # Runs on the main thread instead of `on_error` when this call fails.
+    # A dialog needs its own: an error belonging to the form somebody is
+    # filling in has to appear in that form, not in a banner behind it.
+    catch: Callable[[SmbpalError], None] | None = None
 
 
 class Session:
@@ -133,9 +137,10 @@ class Session:
         *,
         then: Callable[[Any], None] | None = None,
         transform: Callable[[Any], Any] | None = None,
+        catch: Callable[[SmbpalError], None] | None = None,
     ) -> None:
         """Queue one call. Returns immediately; the reply arrives on the main thread."""
-        self._jobs.put(_Job(method, params or {}, transform, then))
+        self._jobs.put(_Job(method, params or {}, transform, then, catch))
 
     def refresh(self) -> None:
         """Fetch `status` and hand the view a finished Screen."""
@@ -163,10 +168,15 @@ class Session:
         try:
             result = self._call(job)
         except DaemonUnreachable as exc:
+            # Still the global handler: the daemon being gone is not the form's
+            # problem to explain, and every open dialog has the same one.
             self._report(exc, lost=True)
             return
         except SmbpalError as exc:
-            self._report(exc)
+            if job.catch is not None:
+                self._marshal(job.catch, exc)
+            else:
+                self._report(exc)
             return
 
         if job.transform is not None:

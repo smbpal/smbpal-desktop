@@ -122,6 +122,34 @@ class TestAgainstARealDaemon(DaemonTestCase):
         # The failed job produced no reply, and did not take the next one with it.
         self.assertEqual(replies, [{"pong": True}])
 
+    def test_a_call_can_take_its_own_failure(self) -> None:
+        """A dialog's error belongs in that dialog, not in the window behind it."""
+        window: list[SmbpalError] = []
+        form: list[SmbpalError] = []
+        session = self.session()
+        session.on_error = window.append
+        session.submit("no.such.method", catch=form.append)
+        self.main.pump()
+
+        self.assertEqual(len(form), 1)
+        self.assertEqual(window, [])
+
+    def test_a_dead_daemon_is_still_the_window_s_problem(self) -> None:
+        """Every open form has the same one, and none of them can fix it."""
+        form: list[SmbpalError] = []
+        lost: list[SmbpalError] = []
+        session = self.session()
+        session.on_daemon_lost = lost.append
+        session.submit("ping", then=lambda _r: None)
+        self.main.pump()
+        self._stop_serving()
+        self.main.pump()  # the listener noticing
+
+        session.submit("ping", catch=form.append)
+        self.main.pump()
+        self.assertEqual(form, [])
+        self.assertEqual(len(lost), 2)
+
     def test_a_pushed_event_arrives_without_being_asked_for(self) -> None:
         events: list[dict[str, Any]] = []
         session = self.session()

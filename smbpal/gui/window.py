@@ -23,11 +23,13 @@ from typing import Any, Callable
 import gi
 
 gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
 
 from gi.repository import Gdk, Gtk  # noqa: E402
 
 from smbpal.errors import SmbpalError  # noqa: E402
 from smbpal.gui import model  # noqa: E402
+from smbpal.gui.dialogs import add_menu  # noqa: E402
 from smbpal.gui.session import Session  # noqa: E402
 
 CSS = b"""
@@ -127,6 +129,7 @@ class Window(Gtk.ApplicationWindow):
         )
         refresh.connect("clicked", lambda _b: self.session.refresh())
         header.pack_end(refresh)
+        header.pack_start(add_menu(self, self.session, self.session.refresh))
         return header
 
     # --- session callbacks, all on the main thread -------------------------
