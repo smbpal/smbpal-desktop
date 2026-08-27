@@ -36,12 +36,26 @@ AUTO_CONNECT = (
 
 
 class _Form(Gtk.Window):
-    """The shared shape: a heading, fields, an inline error, Cancel and Add."""
+    """The shared shape: a heading, fields, an inline error, Cancel and Add.
+
+    **Not modal, and that is a bug fix rather than a preference.** On Pi OS,
+    27 August 2026: with any modal window open, a newly-mapped toplevel gets no
+    keyboard input at all. The file chooser opened from this form came up with
+    a dead "new folder" name field and a disabled Create button, and it made no
+    difference whether the chooser was `Gtk.FileChooserNative` or
+    `Gtk.FileDialog`, nor whether it was parented to this form or to the main
+    window. The one thing that made it work was no modal window existing.
+
+    So the form is a plain toplevel. `Window.present()` on an existing one
+    replaces the modality this used to rely on to stop two forms opening at
+    once, and the daemon is the arbiter of everything else — nothing here can
+    be made inconsistent by the window behind it being usable.
+    """
 
     def __init__(
         self, parent: Gtk.Window, session: Session, title: str, verb: str
     ) -> None:
-        super().__init__(transient_for=parent, modal=True, title=title)
+        super().__init__(transient_for=parent, title=title)
         self.set_default_size(460, -1)
         self.session = session
         self._done: Callable[[], None] = lambda: None
@@ -369,10 +383,24 @@ def add_menu(
     menu.append("Share a folder…", "win.add-share")
     menu.append("Connect to a share…", "win.add-connection")
 
-    def opener(dialog_class: type[_Form]) -> Callable[..., None]:
+    # One live form per kind. Without modality to prevent it, clicking Add
+    # twice would otherwise stack two identical windows.
+    open_forms: dict[str, _Form] = {}
+
+    def opener(name: str, dialog_class: type[_Form]) -> Callable[..., None]:
         def open_it(*_args: object) -> None:
+            existing = open_forms.get(name)
+            if existing is not None:
+                existing.present()
+                return
+            def forget(_dialog: Gtk.Window) -> bool:
+                open_forms.pop(name, None)
+                return False  # False lets the close proceed
+
             dialog = dialog_class(window, session)
             dialog.on_added(refresh)
+            dialog.connect("close-request", forget)
+            open_forms[name] = dialog
             dialog.present()
 
         return open_it
@@ -382,7 +410,7 @@ def add_menu(
         ("add-connection", AddConnectionDialog),
     ):
         action = Gio.SimpleAction.new(name, None)
-        action.connect("activate", opener(dialog_class))
+        action.connect("activate", opener(name, dialog_class))
         window.add_action(action)
 
     button = Gtk.MenuButton(label="Add")
