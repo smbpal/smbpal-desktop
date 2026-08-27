@@ -150,6 +150,52 @@ class TestAgainstARealDaemon(DaemonTestCase):
         self.assertEqual(form, [])
         self.assertEqual(len(lost), 2)
 
+    def test_a_quiet_daemon_is_not_reported_as_a_dead_one(self) -> None:
+        """Found on the Pi: a red banner every few seconds on an idle desktop.
+
+        M5 pushes only when something changes, so the listener sits on that
+        socket for hours by design. With a read timeout it announced the daemon
+        lost every timeout period, reconnected, announced the recovery, and did
+        it again. Nothing in this file had ever spent ten idle seconds, which
+        is what the Pi does almost all of the time.
+        """
+        made: list[Client] = []
+
+        def factory() -> Client:
+            client = Client(self.socket_path, timeout=0.2)
+            made.append(client)
+            return client
+
+        session = Session(factory, to_main_thread=self.main, retry_seconds=0.05)
+        self.addCleanup(session.stop)
+        session.on_daemon_lost = self.fail
+        session.on_error = self.fail
+        session.start()
+        _wait_for(lambda: bool(made))
+
+        # Five times the timeout with the daemon up and saying nothing.
+        _sleep_through_retries(rounds=10, interval=0.1)
+        self.assertTrue(self.main.idle(), "the listener reported something")
+        self.assertIsNone(made[0].timeout, "the listener must not time out")
+
+    def test_a_command_still_gives_up_on_a_daemon_that_stops_answering(self) -> None:
+        """The other socket keeps its timeout, and for the opposite reason."""
+        made: list[Client] = []
+
+        def factory() -> Client:
+            client = Client(self.socket_path, timeout=0.2)
+            made.append(client)
+            return client
+
+        session = Session(factory, to_main_thread=self.main, retry_seconds=3600)
+        self.addCleanup(session.stop)
+        session.start()
+        session.submit("ping", then=lambda _r: None)
+        self.main.pump()
+
+        command = [c for c in made if c.timeout is not None]
+        self.assertTrue(command, "the command socket lost its timeout too")
+
     def test_a_pushed_event_arrives_without_being_asked_for(self) -> None:
         events: list[dict[str, Any]] = []
         session = self.session()

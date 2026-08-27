@@ -224,9 +224,25 @@ class Session:
 
     # --- socket bookkeeping ------------------------------------------------
 
-    def _connect(self) -> Client:
+    def _connect(self, *, patient: bool = False) -> Client:
         """A live client, tracked — or nothing at all, if we are stopping."""
         client = self._factory()
+        if patient:
+            # **No read timeout, and this is the whole difference between the
+            # two sockets.** The command socket keeps one: a request that has
+            # had no reply in ten seconds has gone wrong. The listener is the
+            # opposite — M5 pushes only when something changes, and a machine
+            # that is working correctly changes nothing for hours. A timeout
+            # there turns "nothing has happened" into "the daemon is not
+            # answering", which is not merely wrong but flaps: report the loss,
+            # reconnect successfully, report the recovery, repeat. On the Pi
+            # that was a red banner every few seconds on an idle desktop.
+            #
+            # Safe because this is a Unix socket: both ends are on this
+            # machine, so a daemon that dies closes its end and the read
+            # returns rather than hanging. There is no half-open case to
+            # detect and so nothing a heartbeat would buy.
+            client.timeout = None
         client.connect()
         with self._clients_lock:
             if self._stopping.is_set():
@@ -250,7 +266,7 @@ class Session:
         while not self._stopping.is_set():
             client: Client | None = None
             try:
-                client = self._connect()
+                client = self._connect(patient=True)
                 self._marshal_back()
                 for message in client.events():
                     if self._stopping.is_set():
