@@ -185,6 +185,11 @@ class Tray:
             self._property_read,
             None,
         )
+        if not self._registration:
+            # Zero is the failure return. Without this the tray goes on to
+            # announce itself to the watcher and then answers nothing, which
+            # looks exactly like a panel that does not support SNI.
+            log.error("could not export %s; the icon will not work", ITEM_PATH)
 
     def announce(self) -> None:
         """Tell the watcher we exist. Without this the panel never looks."""
@@ -233,8 +238,16 @@ class Tray:
         _path: str,
         _interface: str,
         name: str,
-        _error: Any,
     ) -> GLib.Variant | None:
+        """Five arguments, not six.
+
+        `GDBusInterfaceGetPropertyFunc` takes a `GError **` before the user
+        data, but it is an out-parameter and PyGObject does not pass it into
+        Python. Declaring it meant every property read on the item raised
+        `TypeError`, so the panel could not read `Status` or `IconName` and
+        drew nothing at all — a tray that registers successfully and is
+        invisible. Pinned by a test that calls this the way GDBus does.
+        """
         if name == "Category":
             return GLib.Variant("s", "SystemServices")
         if name == "Id":
