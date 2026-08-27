@@ -209,6 +209,115 @@ class Screen:
         ]
 
 
+@dataclass(frozen=True)
+class Indicator:
+    """What the tray shows: one icon, one line, and the detail behind it.
+
+    **3g's open question, answered.** SMBPal has two axes — is anything shared,
+    is anything mounted — and 3h added a third state that is neither: a
+    connection configured and correctly not mounted. One icon cannot encode
+    three things, and the version that tries needs four icons and still cannot
+    say *which* half is wrong.
+
+    So the icon answers one question only: **does anything need you?** The
+    tooltip answers *what*, with the two axes spelled out separately. The
+    plan's worry — that a healthy share with a broken mount looks the same as a
+    broken share — stops being a worry once that is the icon's job: the answer
+    to "does anything need you" is yes in both cases, and the tooltip is where
+    they differ.
+
+    It is never hidden. SNI's `Passive` would hide the icon when nothing is
+    configured, which is exactly when somebody needs a way in.
+    """
+
+    status: str
+    title: str
+    detail: str
+
+    @property
+    def needs_attention(self) -> bool:
+        return self.status == PROBLEM
+
+
+_SERVING = frozenset({"serving", "read-only"})
+
+
+def indicator(screen: Screen) -> Indicator:
+    """Reduce a whole screen to what a tray icon can carry."""
+    problems = screen.problems
+    shared = [r for r in screen.shares if r.state in _SERVING]
+    mounted = [r for r in screen.connections if r.state in _CONNECTED]
+
+    if problems:
+        status = PROBLEM
+        title = (
+            problems[0].message
+            if len(problems) == 1
+            else f"{len(problems)} things need attention"
+        )
+    elif shared or mounted:
+        status = OK
+        title = " \u00b7 ".join(
+            part
+            for part in (
+                _count(len(shared), "folder", "shared"),
+                _count(len(mounted), "share", "connected"),
+            )
+            if part
+        )
+    elif screen.shares or screen.connections:
+        # Configured and nothing live. Calm, and it says so rather than looking
+        # like a failure — 3h's rule, one layer up.
+        status = IDLE
+        title = "ready; nothing connected yet"
+    else:
+        status = MUTED
+        title = "nothing set up yet"
+
+    return Indicator(status=status, title=title, detail=_detail(screen, problems))
+
+
+def offline_indicator(message: str) -> Indicator:
+    """What the tray shows when the daemon is not answering.
+
+    A problem, and stated as one. The shares and mounts on this machine may
+    well still be up — systemd is holding them, not us — but nothing is
+    watching them, so the one thing the tray exists to do is not happening. An
+    icon that stayed calm about that would be calm about being blind.
+    """
+    return Indicator(
+        status=PROBLEM,
+        title="SMBPal's service is not running",
+        detail=(
+            f"{message}\nShares and mounts already up are unaffected, but "
+            f"nothing is watching them and no changes can be made."
+        ),
+    )
+
+
+def _count(number: int, noun: str, verb: str) -> str:
+    if not number:
+        return ""
+    return f"{number} {noun if number == 1 else noun + 's'} {verb}"
+
+
+def _detail(screen: Screen, problems: list[Row]) -> str:
+    """Both axes, always, and then what is wrong.
+
+    Stated separately even when one of them is empty: "nothing shared" is a
+    fact somebody may be surprised by, and a line that disappears cannot
+    surprise anybody.
+    """
+    shared = len([r for r in screen.shares if r.state in _SERVING])
+    mounted = len([r for r in screen.connections if r.state in _CONNECTED])
+    lines = [
+        _count(shared, "folder", "shared") or "Nothing shared from this computer",
+        _count(mounted, "share", "connected") or "No shares connected",
+    ]
+    lines.extend(f"{row.title}: {row.message}" for row in problems)
+    return "\n".join(lines)
+
+
 def connection_row(connection: dict[str, Any]) -> Row:
     """One connection, as the window shows it."""
     state = connection.get("state") or "unknown"

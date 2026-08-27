@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=SMBPal tray icon
+Comment=Shows the state of SMBPal's shares and connections
+Exec=smbpal-tray
+Icon=smbpal
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+# Installed to /etc/xdg/autostart so it starts with the session. It is the
+# only long-lived per-user part of SMBPal: 3g's tray cannot live in the GUI,
+# which is not always open, nor in the daemon, which is root.

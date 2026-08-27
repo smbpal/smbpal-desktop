@@ -361,5 +361,100 @@ class TestEveryStateIsAccountedFor(unittest.TestCase):
                 self.assertIn(model.CONNECT, row.actions)
 
 
+class TestTheTrayIndicator(unittest.TestCase):
+    """3g's open question: one icon, two axes, and 3h's third state."""
+
+    def screen(self, shares=(), connections=()) -> model.Screen:
+        return model.screen({"shares": list(shares), "connections": list(connections)})
+
+    def test_nothing_configured_still_shows_an_icon(self) -> None:
+        """SNI's `Passive` would hide it exactly when somebody needs a way in."""
+        found = model.indicator(self.screen())
+        self.assertEqual(found.status, model.MUTED)
+        self.assertEqual(found.title, "nothing set up yet")
+        self.assertFalse(found.needs_attention)
+
+    def test_configured_and_nothing_live_is_calm(self) -> None:
+        """3h one layer up: armed and unmounted is healthy, not a fault."""
+        found = model.indicator(
+            self.screen(connections=[{"id": "n", "state": "idle"}])
+        )
+        self.assertEqual(found.status, model.IDLE)
+        self.assertFalse(found.needs_attention)
+
+    def test_both_axes_are_counted_when_all_is_well(self) -> None:
+        found = model.indicator(
+            self.screen(
+                shares=[{"id": "d", "name": "Docs", "state": "serving"}],
+                connections=[
+                    {"id": "n", "state": "connected"},
+                    {"id": "m", "state": "connected"},
+                ],
+            )
+        )
+        self.assertEqual(found.status, model.OK)
+        self.assertIn("1 folder shared", found.title)
+        self.assertIn("2 shares connected", found.title)
+
+    def test_one_problem_puts_its_own_words_on_the_icon(self) -> None:
+        found = model.indicator(
+            self.screen(
+                connections=[
+                    {"id": "n", "state": "auth_failed", "message": "the password was refused"}
+                ]
+            )
+        )
+        self.assertEqual(found.status, model.PROBLEM)
+        self.assertEqual(found.title, "the password was refused")
+
+    def test_several_problems_are_counted_rather_than_picked_between(self) -> None:
+        found = model.indicator(
+            self.screen(
+                shares=[{"id": "d", "name": "Docs", "state": "not served"}],
+                connections=[{"id": "n", "state": "unreachable", "message": "no answer"}],
+            )
+        )
+        self.assertEqual(found.title, "2 things need attention")
+
+    def test_a_broken_mount_beside_a_healthy_share_says_which(self) -> None:
+        """The plan's worry, and why the detail carries both axes separately."""
+        found = model.indicator(
+            self.screen(
+                shares=[{"id": "d", "name": "Docs", "state": "serving"}],
+                connections=[
+                    {"id": "n", "host": "h", "share": "s", "state": "unreachable",
+                     "message": "the server did not answer"}
+                ],
+            )
+        )
+        self.assertEqual(found.status, model.PROBLEM)
+        self.assertIn("1 folder shared", found.detail)
+        self.assertIn("//h/s: the server did not answer", found.detail)
+
+    def test_the_detail_states_an_empty_axis_rather_than_omitting_it(self) -> None:
+        """A line that disappears cannot tell anybody anything."""
+        found = model.indicator(
+            self.screen(connections=[{"id": "n", "state": "connected"}])
+        )
+        self.assertIn("Nothing shared from this computer", found.detail)
+
+    def test_a_read_only_share_counts_as_shared(self) -> None:
+        found = model.indicator(
+            self.screen(shares=[{"id": "d", "name": "D", "state": "read-only"}])
+        )
+        # Read-only asks for attention on its row, so the icon does too — but
+        # the share is being served and the count must say so.
+        self.assertIn("1 folder shared", found.detail)
+
+    def test_a_daemon_that_is_not_answering_is_a_problem_not_a_blank(self) -> None:
+        """An icon that stayed calm about this would be calm about being blind."""
+        found = model.offline_indicator("no SMBPal daemon is listening on /run/x")
+        self.assertEqual(found.status, model.PROBLEM)
+        self.assertTrue(found.needs_attention)
+        self.assertIn("no SMBPal daemon is listening", found.detail)
+        # And it does not claim the shares have gone: systemd is holding them.
+        self.assertIn("already up are unaffected", found.detail)
+
+
 if __name__ == "__main__":
     unittest.main()

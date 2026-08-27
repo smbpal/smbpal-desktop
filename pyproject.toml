@@ -21,6 +21,9 @@ smbpald = "smbpal.daemon.main:main"
 # Imports gi, so it is the one entry point that needs python3-gi and
 # gir1.2-gtk-4.0 installed. Nothing the daemon or the CLI runs touches it.
 smbpal-gui = "smbpal.gui.app:main"
+# Gio and GLib only — never Gtk. The tray is a long-lived session process (3g)
+# and loading a toolkit into it would be paying for a window it never opens.
+smbpal-tray = "smbpal.gui.tray:main"
 
 [tool.setuptools.packages.find]
 include = ["smbpal*"]

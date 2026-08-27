@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=SMBPal
+GenericName=Shared folders
+Comment=Share folders on this computer and connect to shares on others
+Exec=smbpal-gui
+Icon=smbpal
+Terminal=false
+Categories=System;Network;FileTransfer;
+Keywords=SMB;CIFS;Samba;Windows;network;share;NAS;
+# Matches APP_ID in smbpal/gui/app.py. A mismatch costs the window its icon
+# under Wayland, where the compositor matches the two by name and nothing says
+# it failed.
+StartupWMClass=org.smbpal.Smbpal
