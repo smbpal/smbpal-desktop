@@ -139,6 +139,34 @@ class TestMachine(unittest.TestCase):
         self.assertTrue(state.read_only)
         self.assertIn("read-only", state.message)
 
+    def test_someone_elses_filesystem_is_not_reported_as_connected(self) -> None:
+        # `mounted` is True here and it is True about a USB stick. Attributing
+        # it to this share is the same error as counting an armed automount as
+        # connected: a claim the mount table does not support.
+        state = machine.derive(
+            self.CONNECTION,
+            mounted=True,
+            unit=None,
+            occupied_by="/dev/sda1 (vfat)",
+        )
+        self.assertEqual(state.state, machine.FAILED)
+        self.assertTrue(state.is_problem)
+        self.assertIn("/dev/sda1", state.message)
+        self.assertIn("/mnt/nas", state.message)
+
+    def test_an_occupied_mountpoint_beats_a_read_only_reading(self) -> None:
+        # read_only is derived from the same mount table entry, so it would be
+        # describing the intruder too.
+        state = machine.derive(
+            self.CONNECTION,
+            mounted=True,
+            unit=None,
+            read_only=True,
+            occupied_by="/dev/sda1 (vfat)",
+        )
+        self.assertEqual(state.state, machine.FAILED)
+        self.assertFalse(state.read_only)
+
     def test_a_writable_mount_is_never_called_writable(self) -> None:
         # Whether a write succeeds is the server's decision and we have not
         # asked it. "mounted" is all we can prove; granting write on the NAS
@@ -330,6 +358,36 @@ class TestMonitor(MonitorTestCase):
         self.addCleanup(broken.stop)
         threading.Event().wait(0.1)
         self.assertIsNotNone(broken._thread)
+
+
+class TestAnOccupiedMountpoint(MonitorTestCase):
+    """The whole path, from the mount table to what a person is told."""
+
+    def test_status_names_what_is_there_instead_of_saying_connected(self) -> None:
+        # udisks2 mounting a stick labelled Media on the same path. Without the
+        # source check this polls as `connected`, because something is indeed
+        # mounted at /mnt/nas.
+        self.mountinfo.write_text(
+            self.armed
+            + "91 25 8:17 / /mnt/nas rw,relatime shared:60 - vfat /dev/sda1 "
+            "rw,uid=1000\n",
+            encoding="utf-8",
+        )
+        self.monitor.poll()
+        payload = self.events[-1][1]
+        self.assertEqual(payload["state"], machine.FAILED)
+        self.assertTrue(payload["is_problem"])
+        self.assertIn("/dev/sda1", payload["message"])
+
+    def test_our_own_share_still_polls_as_connected(self) -> None:
+        self.mountinfo.write_text(
+            self.armed
+            + "83 36 0:44 / /mnt/nas rw,relatime shared:45 - cifs "
+            "//rivendell.local/Media rw,vers=3.1.1\n",
+            encoding="utf-8",
+        )
+        self.monitor.poll()
+        self.assertEqual(self.events[-1][1]["state"], machine.CONNECTED)
 
 
 class TestFallbackHint(MonitorTestCase):

@@ -119,6 +119,9 @@ class StateMonitor:
 
     def _state_of(self, connection: dict[str, Any]) -> ConnectionState:
         mount_name, _ = units.unit_names(connection["mountpoint"])
+        # Asked first: when it answers, `mounted` is True about a filesystem
+        # that is not ours, and every question after it is the wrong one.
+        intruder = self.mounter.foreign_occupant(connection)
         mounted = self.mounter.probe.is_mounted(connection["mountpoint"])
         armed = self.mounter.probe.is_armed(connection["mountpoint"])
         unit: dict[str, str] | None
@@ -144,6 +147,9 @@ class StateMonitor:
             armed=armed,
             read_only=self.mounter.probe.is_read_only(connection["mountpoint"])
             if mounted
+            else None,
+            occupied_by=f"{intruder.source} ({intruder.fstype})"
+            if intruder is not None
             else None,
         )
 

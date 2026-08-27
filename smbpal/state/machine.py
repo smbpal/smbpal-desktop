@@ -9,7 +9,8 @@ The states, and the one that is easy to get wrong:
     unreachable   the server is off, or the network is
     unresolved    the name did not resolve (see the fallback note in §3e)
     auth_failed   the credentials were refused; retrying will not help
-    failed        something else, and we say what
+    failed        something else, and we say what — including a mountpoint
+                  another filesystem is already using
     disabled      auto_connect is "never"
     unknown       we cannot tell
 
@@ -89,6 +90,7 @@ def derive(
     cause: Cause | None = None,
     armed: bool | None = None,
     read_only: bool | None = None,
+    occupied_by: str | None = None,
 ) -> ConnectionState:
     """Work out the state from the mount table, the unit, and the journal.
 
@@ -100,6 +102,20 @@ def derive(
 
     if connection.get("auto_connect") == "never":
         return ConnectionState(identifier, DISABLED, "not connected automatically")
+
+    if occupied_by is not None:
+        # Checked before `mounted`, because something *is* mounted here — just
+        # not this share. Reporting that as `connected` would be the same
+        # mistake as counting an armed automount as connected: a state we
+        # cannot back up, and here it would be attributing somebody else's
+        # filesystem to us.
+        return ConnectionState(
+            identifier,
+            FAILED,
+            f"{occupied_by} is mounted at {connection['mountpoint']} and it is "
+            f"not this share. SMBPal will not mount on top of it, because that "
+            f"would hide it until the unmount",
+        )
 
     if mounted:
         if read_only:

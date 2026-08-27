@@ -53,6 +53,10 @@ _OCTAL = re.compile(r"\\(\d{3})")
 # a real mount.
 AUTOFS = "autofs"
 
+# What mount.cifs registers as. Anything else holding one of our mountpoints
+# belongs to somebody else.
+CIFS = "cifs"
+
 MOUNTED = "mounted"
 UNREACHABLE = "unreachable"
 NOT_MOUNTED = "not mounted"
@@ -164,15 +168,18 @@ class MountProbe:
         """Is an automount waiting here? Healthy, and not the same as mounted."""
         return self._has(mountpoint, autofs=True)
 
-    def is_read_only(self, mountpoint: str) -> bool | None:
-        """Is the mount here read-only? None when we cannot tell.
+    def occupant(self, mountpoint: str) -> MountEntry | None:
+        """The real filesystem mounted here, if any. autofs triggers excluded.
 
-        **This answers less than it looks like it does, deliberately.** `False`
-        means the mount is not itself read-only — it does *not* mean a write
-        will succeed, because the server decides that and the only way to ask
-        is to try. So `True` is reported as a reason and `False` is reported as
-        nothing at all: claiming "writable" would be the same mistake as
-        claiming an armed automount is connected.
+        `is_mounted` answers *whether* something is mounted; this answers
+        *what*, which is the only way to tell our own share from a USB stick
+        udisks2 happened to mount on the same path. Mounting on top of one
+        would hide it and leave udisks2 still believing it is reachable there.
+
+        None covers both "nothing is mounted" and "no procfs to read", which
+        are not worth distinguishing here: the caller's next move is to write
+        systemd units, and a machine without `/proc/self/mountinfo` has no
+        systemd either.
         """
         entries = mount_entries(self.mountinfo)
         if entries is None:
@@ -183,8 +190,21 @@ class MountProbe:
                 os.path.normpath(entry.mountpoint) == wanted
                 and entry.fstype != AUTOFS
             ):
-                return entry.read_only
+                return entry
         return None
+
+    def is_read_only(self, mountpoint: str) -> bool | None:
+        """Is the mount here read-only? None when we cannot tell.
+
+        **This answers less than it looks like it does, deliberately.** `False`
+        means the mount is not itself read-only — it does *not* mean a write
+        will succeed, because the server decides that and the only way to ask
+        is to try. So `True` is reported as a reason and `False` is reported as
+        nothing at all: claiming "writable" would be the same mistake as
+        claiming an armed automount is connected.
+        """
+        entry = self.occupant(mountpoint)
+        return entry.read_only if entry is not None else None
 
     def _has(self, mountpoint: str, *, autofs: bool) -> bool | None:
         entries = mount_entries(self.mountinfo)

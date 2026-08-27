@@ -15,7 +15,7 @@ from smbpal.config import operations as ops
 from smbpal.errors import InvalidParams
 from smbpal.mounts import probe as probe_module
 from smbpal.mounts import units
-from smbpal.mounts.apply import MARKER, Mounter
+from smbpal.mounts.apply import MARKER, OCCUPIED, Mounter, foreign_mount
 from smbpal.mounts.credentials import CredentialsStore
 from tests.fakes import FakeSamba
 
@@ -183,6 +183,33 @@ class TestProbeNeverBlocks(unittest.TestCase):
             "//rivendell.local/Media rw,vers=3.1.1,uid=1000,forceuid\n"
         )
         self.mountinfo.write_text(self.armed + self.real, encoding="utf-8")
+
+    def test_occupant_is_the_filesystem_not_the_trigger(self) -> None:
+        # Both lines sit on /mnt/nas. The autofs one is the trigger and says
+        # nothing about what is actually there.
+        probe = probe_module.MountProbe(mountinfo=self.mountinfo)
+        entry = probe.occupant("/mnt/nas")
+        assert entry is not None
+        self.assertEqual(entry.fstype, "cifs")
+        self.assertEqual(entry.source, "//rivendell.local/Media")
+
+    def test_an_armed_automount_alone_has_no_occupant(self) -> None:
+        # Nothing is mounted yet, so there is nothing to be hidden by mounting.
+        self.mountinfo.write_text(self.armed, encoding="utf-8")
+        probe = probe_module.MountProbe(mountinfo=self.mountinfo)
+        self.assertIsNone(probe.occupant("/mnt/nas"))
+
+    def test_a_foreign_filesystem_is_reported_as_the_occupant(self) -> None:
+        # What udisks2 leaves behind when a stick labelled Media is plugged in.
+        self.mountinfo.write_text(
+            "91 25 8:17 / /mnt/nas rw,relatime shared:60 - vfat "
+            "/dev/sda1 rw,uid=1000,gid=1000\n",
+            encoding="utf-8",
+        )
+        probe = probe_module.MountProbe(mountinfo=self.mountinfo)
+        entry = probe.occupant("/mnt/nas")
+        assert entry is not None
+        self.assertEqual((entry.fstype, entry.source), ("vfat", "/dev/sda1"))
 
     def test_a_writable_mount_is_not_read_only(self) -> None:
         probe = probe_module.MountProbe(mountinfo=self.mountinfo)
@@ -422,6 +449,58 @@ class TestMounter(unittest.TestCase):
         planned = self.mounter.plan(config)
         self.assertEqual(planned[0].state, probe_module.NOT_MOUNTED)
 
+    def occupy(self, mountpoint: str, line: str | None = None) -> None:
+        """Put something else on the mountpoint, the way udisks2 would."""
+        self.mountinfo.write_text(
+            line
+            or f"91 25 8:17 / {mountpoint} rw,relatime shared:60 - vfat "
+            f"/dev/sda1 rw,uid=1000,gid=1000\n",
+            encoding="utf-8",
+        )
+
+    def test_no_units_are_written_over_someone_elses_mount(self) -> None:
+        config = self.config()
+        self.occupy(config["connections"][0]["mountpoint"])
+        self.mounter.apply(config)
+        self.assertEqual(list(self.unit_dir.iterdir()), [])
+
+    def test_nothing_is_armed_over_someone_elses_mount(self) -> None:
+        # The automount is the dangerous half: arming it mounts on top at the
+        # next access, whenever that is, with nobody watching.
+        config = self.config()
+        self.occupy(config["connections"][0]["mountpoint"])
+        self.mounter.apply(config)
+        self.assertEqual(self.samba.enabled_units, set())
+
+    def test_an_occupied_mountpoint_does_not_reap_the_units(self) -> None:
+        # A stick plugged in this morning must not delete the connection. The
+        # mountpoint is unavailable; the connection is still configured.
+        config = self.config()
+        self.mounter.apply(config)
+        before = {p.name for p in self.unit_dir.iterdir()}
+        self.occupy(config["connections"][0]["mountpoint"])
+        self.mounter.apply(config)
+        self.assertEqual({p.name for p in self.unit_dir.iterdir()}, before)
+
+    def test_an_occupied_mountpoint_is_reported_not_called_mounted(self) -> None:
+        # `is_mounted` is True here — about the stick. Saying `mounted` would
+        # attribute somebody else's filesystem to this share.
+        config = self.config()
+        self.occupy(config["connections"][0]["mountpoint"])
+        self.assertEqual(self.mounter.plan(config)[0].state, OCCUPIED)
+
+    def test_our_own_mount_is_not_mistaken_for_an_intruder(self) -> None:
+        config = self.config()
+        mountpoint = config["connections"][0]["mountpoint"]
+        self.occupy(
+            mountpoint,
+            f"83 36 0:44 / {mountpoint} rw,relatime shared:45 - cifs "
+            "//rivendell.local/Media rw,vers=3.1.1\n",
+        )
+        self.mounter.apply(config)
+        self.assertEqual(len(list(self.unit_dir.iterdir())), 2)
+        self.assertEqual(self.mounter.plan(config)[0].state, probe_module.MOUNTED)
+
     def test_credentials_reach_the_unit_as_a_path(self) -> None:
         config = self.config(credential_ref="nas")
         self.mounter.credentials.write("nas", username="pi", password="hunter2")
@@ -431,6 +510,51 @@ class TestMounter(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("credentials=", text)
         self.assertNotIn("hunter2", text)
+
+
+class TestForeignMountDetection(unittest.TestCase):
+    """Whose filesystem is on the mountpoint — the question `is_mounted` cannot ask."""
+
+    connection = {
+        "id": "nas",
+        "host": "rivendell.local",
+        "share": "Media",
+        "mountpoint": "/media/pi/Media",
+    }
+
+    def entry(self, fstype: str, source: str) -> probe_module.MountEntry:
+        return probe_module.MountEntry(
+            mountpoint="/media/pi/Media", fstype=fstype, source=source, options="rw"
+        )
+
+    def test_our_own_share_is_not_foreign(self) -> None:
+        entry = self.entry("cifs", "//rivendell.local/Media")
+        self.assertIsNone(foreign_mount(entry, self.connection))
+
+    def test_the_case_of_the_host_does_not_matter(self) -> None:
+        # SMB hostnames are case-insensitive and the kernel echoes back what it
+        # was given, so a unit written from a differently-cased name still
+        # describes the same mount.
+        entry = self.entry("cifs", "//Rivendell.local/media")
+        self.assertIsNone(foreign_mount(entry, self.connection))
+
+    def test_the_fallback_address_is_still_this_share(self) -> None:
+        # `connection use-fallback` swaps host and fallback_host, so straight
+        # after a swap the mount that is up was made under the other name.
+        connection = {**self.connection, "fallback_host": "192.168.0.52"}
+        entry = self.entry("cifs", "//192.168.0.52/Media")
+        self.assertIsNone(foreign_mount(entry, connection))
+
+    def test_a_usb_stick_is_foreign(self) -> None:
+        entry = self.entry("vfat", "/dev/sda1")
+        self.assertIs(foreign_mount(entry, self.connection), entry)
+
+    def test_another_share_on_the_same_path_is_foreign(self) -> None:
+        entry = self.entry("cifs", "//rivendell.local/Backups")
+        self.assertIs(foreign_mount(entry, self.connection), entry)
+
+    def test_nothing_mounted_is_not_foreign(self) -> None:
+        self.assertIsNone(foreign_mount(None, self.connection))
 
 
 if __name__ == "__main__":
