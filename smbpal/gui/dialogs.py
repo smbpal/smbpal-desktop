@@ -226,7 +226,10 @@ class AddConnectionDialog(_Form):
         super().__init__(parent, session, "Connect to a share", "Connect")
         self.set_default_size(520, -1)
 
-        self._host = Gtk.Entry(placeholder_text="rivendell.local")
+        # Neutral, and it teaches the thing people do not expect: an address
+        # works as well as a name. Never a real machine from anybody's network
+        # — a placeholder reads as a suggestion.
+        self._host = Gtk.Entry(placeholder_text="nas.local  or  192.168.1.10")
         find = Gtk.Button(label="Find servers")
         find.connect("clicked", lambda _b: self._browse())
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
