@@ -46,14 +46,9 @@ WATCHER_PATH = "/StatusNotifierWatcher"
 ITEM_INTERFACE = "org.kde.StatusNotifierItem"
 ITEM_PATH = "/StatusNotifierItem"
 
-# M7 installs these under hicolor. Until then the panel falls back to its own
-# generic icon, which is a missing picture rather than a missing feature.
-ICONS = {
-    model.PROBLEM: "smbpal-attention",
-    model.OK: "smbpal",
-    model.IDLE: "smbpal-idle",
-    model.MUTED: "smbpal-idle",
-}
+# Which icon for which status is `model.ICONS`, with the rest of the
+# decisions. Re-exported so `from ...tray import ICONS` keeps working.
+ICONS = model.ICONS
 
 # `Passive` tells the panel to hide the item. It is never used: see
 # `model.Indicator` for why an icon that disappears when nothing is configured

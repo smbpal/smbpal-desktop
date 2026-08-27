@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Configured and nothing live. Calm on purpose: an armed automount is
+       healthy (3h), and a tray that painted it as a fault would train people
+       to ignore the one state that is. -->
+  <g fill="none" stroke="#7d8ba0" stroke-width="1.5" stroke-linecap="round"
+     stroke-dasharray="2.2 1.8">
+    <path d="M3.4 6.6a5 5 0 0 1 9.2 0"/>
+  </g>
+  <circle cx="8" cy="6.4" r="1.15" fill="#7d8ba0"/>
+  <rect x="2.35" y="9.95" width="11.3" height="3.9" rx="1"
+        fill="none" stroke="#7d8ba0" stroke-width="1.5"/>
+</svg>

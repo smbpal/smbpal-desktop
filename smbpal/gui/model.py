@@ -241,6 +241,17 @@ class Indicator:
 
 _SERVING = frozenset({"serving", "read-only"})
 
+# Which themed icon each status asks the panel for. A decision, so it lives
+# here with the rest of them rather than in the D-Bus code — which also means a
+# test can check the names against the files we ship without needing `gi`.
+# The files are in packaging/icons/hicolor/scalable/status.
+ICONS = {
+    PROBLEM: "smbpal-attention",
+    OK: "smbpal",
+    IDLE: "smbpal-idle",
+    MUTED: "smbpal-idle",
+}
+
 
 def indicator(screen: Screen) -> Indicator:
     """Reduce a whole screen to what a tray icon can carry."""

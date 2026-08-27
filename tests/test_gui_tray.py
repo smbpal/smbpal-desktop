@@ -19,7 +19,9 @@ introspection XML promises.
 
 from __future__ import annotations
 
+import pathlib
 import unittest
+import xml.etree.ElementTree as ET
 from typing import Any
 
 try:
@@ -191,6 +193,54 @@ class TestWhatTheTrayDoesWithoutABus(unittest.TestCase):
         tray = Tray(session)
         tray._daemon_back()
         self.assertEqual(session.refreshed, 1)
+
+
+class TestTheIconsExist(unittest.TestCase):
+    """The one thing that made the tray look broken twice over.
+
+    An icon name a theme cannot resolve makes some panels draw nothing at all,
+    which is indistinguishable from the item never having registered. This ran
+    for a whole hardware session that way. Nothing else connects the names in
+    `ICONS` to the files in `packaging/icons`, and a rename on either side is
+    silent — so this is the join.
+
+    No `gi` needed, so it runs everywhere the rest of the suite does.
+    """
+
+    ICON_DIR = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "packaging/icons/hicolor/scalable/status"
+    )
+
+    def test_every_name_the_tray_asks_for_is_a_file_we_ship(self) -> None:
+        # `model`, not `tray`: no gi, so this runs everywhere.
+        from smbpal.gui.model import ICONS as names
+
+        for status, name in names.items():
+            with self.subTest(status=status):
+                self.assertTrue(
+                    (self.ICON_DIR / f"{name}.svg").is_file(),
+                    f"the tray asks for {name!r} and nothing installs it",
+                )
+
+    def test_the_icons_are_valid_svg(self) -> None:
+        for path in sorted(self.ICON_DIR.glob("*.svg")):
+            with self.subTest(icon=path.name):
+                ET.parse(path)  # raises on malformed XML
+
+    def test_attention_is_distinguishable_without_colour(self) -> None:
+        """A panel may render into a monochrome theme.
+
+        The attention icon carries a badge — extra shapes — so it does not rely
+        on being red. Counted rather than eyeballed, because "it looks
+        different" is not something a test can hold.
+        """
+        def shapes(name: str) -> int:
+            root = ET.parse(self.ICON_DIR / f"{name}.svg").getroot()
+            return sum(1 for _ in root.iter() if _.tag.split("}")[-1]
+                       in ("path", "rect", "circle"))
+
+        self.assertGreater(shapes("smbpal-attention"), shapes("smbpal"))
 
 
 if __name__ == "__main__":
