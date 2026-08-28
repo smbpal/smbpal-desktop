@@ -122,9 +122,72 @@ class TestTheItemsProperties(unittest.TestCase):
         self.assertIn("1 share connected", body)
         self.assertTrue(icon)
 
+    def test_the_attention_icon_is_the_attention_icon_from_the_start(self) -> None:
+        """The grey-tray bug, pinned at the property that caused it.
+
+        A host reads this once, at registration, and shows it for every
+        `NeedsAttention` afterwards. At registration nothing is connected yet,
+        so answering with "the icon we are showing now" handed the panel
+        `smbpal-idle` and it drew that, calmly, through a failed mount and
+        through a server that had stopped answering.
+        """
+        self.assertEqual(
+            self.read("AttentionIconName").get_string(), ICONS[model.PROBLEM]
+        )
+
+    def test_the_attention_icon_does_not_move_with_the_state(self) -> None:
+        for screen in (
+            model.Screen(),
+            model.screen({"connections": [{"id": "a", "state": "connected"}]}),
+            model.screen({"connections": [{"id": "a", "state": "unreachable"}]}),
+        ):
+            with self.subTest(screen=screen.problems):
+                self.tray._screen_changed(screen)
+                self.assertEqual(
+                    self.read("AttentionIconName").get_string(), ICONS[model.PROBLEM]
+                )
+
+    def test_a_forced_icon_still_wins(self) -> None:
+        """`--icon` exists to tell "resolved to nothing" from "never
+        registered", so it has to override both names or it proves nothing."""
+        tray = Tray(FakeSession(), icon="folder-remote")
+        self.assertEqual(tray.attention_icon_name, "folder-remote")
+        self.assertEqual(tray.icon_name, "folder-remote")
+
     def test_left_click_is_not_a_menu(self) -> None:
         """`ItemIsMenu` true would make a panel open a menu we do not export."""
         self.assertFalse(self.read("ItemIsMenu").get_boolean())
+
+
+@unittest.skipIf(Gio is None, "python3-gi is not installed")
+class TestWhatTheItemTellsTheHostToRereRead(unittest.TestCase):
+    """A property nobody is told to re-read is a property nobody re-reads."""
+
+    def setUp(self) -> None:
+        self.tray = Tray(FakeSession())
+        self.emitted: list[str] = []
+        self.tray._connection = object()  # enough for _republish to emit
+        self.tray._emit = lambda signal, parameters=None: self.emitted.append(signal)
+
+    def test_a_new_problem_announces_both_icons(self) -> None:
+        self.tray._screen_changed(
+            model.screen({"connections": [{"id": "a", "state": "unreachable"}]})
+        )
+        self.assertIn("NewIcon", self.emitted)
+        self.assertIn("NewAttentionIcon", self.emitted)
+
+    def test_every_signal_it_emits_is_one_it_declares(self) -> None:
+        declared = {
+            s.name
+            for s in Gio.DBusNodeInfo.new_for_xml(INTROSPECTION).interfaces[0].signals
+        }
+        self.tray._screen_changed(
+            model.screen({"connections": [{"id": "a", "state": "unreachable"}]})
+        )
+        self.assertTrue(self.emitted)
+        for signal in self.emitted:
+            with self.subTest(signal=signal):
+                self.assertIn(signal, declared)
 
 
 @unittest.skipIf(Gio is None, "python3-gi is not installed")

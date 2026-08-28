@@ -85,6 +85,7 @@ INTROSPECTION = """
       <arg name="orientation" type="s" direction="in"/>
     </method>
     <signal name="NewIcon"/>
+    <signal name="NewAttentionIcon"/>
     <signal name="NewStatus"><arg name="status" type="s"/></signal>
     <signal name="NewToolTip"/>
   </interface>
@@ -163,6 +164,7 @@ class Tray:
             return
         if before.status != self.indicator.status:
             self._emit("NewIcon")
+            self._emit("NewAttentionIcon")
             self._emit("NewStatus", GLib.Variant("(s)", (self.sni_status,)))
         if (before.title, before.detail) != (
             self.indicator.title,
@@ -179,6 +181,25 @@ class Tray:
         if self.icon_override:
             return self.icon_override
         return ICONS.get(self.indicator.status, "smbpal")
+
+    @property
+    def attention_icon_name(self) -> str:
+        """**A constant, and that is the whole point.**
+
+        A host displays this one *instead of* `IconName` whenever `Status` is
+        `NeedsAttention`, so the only state it is ever seen in is the problem
+        state. Answering it with `icon_name` — whatever we happen to be showing
+        — looked equivalent and was not: a panel reads it once at registration,
+        when nothing is connected yet and `icon_name` is `smbpal-idle`, caches
+        that, and then draws the cached grey icon for every problem thereafter.
+        On the Pi that was a tray that went *grey* for a failed mount and again
+        for a server that stopped answering, with the correct message in the
+        tooltip both times — the one state that must look alarming was the one
+        that looked calm.
+        """
+        if self.icon_override:
+            return self.icon_override
+        return ICONS[model.PROBLEM]
 
     # --- D-Bus -------------------------------------------------------------
 
@@ -263,8 +284,10 @@ class Tray:
             return GLib.Variant("s", "SMBPal")
         if name == "Status":
             return GLib.Variant("s", self.sni_status)
-        if name in ("IconName", "AttentionIconName"):
+        if name == "IconName":
             return GLib.Variant("s", self.icon_name)
+        if name == "AttentionIconName":
+            return GLib.Variant("s", self.attention_icon_name)
         if name == "ItemIsMenu":
             return GLib.Variant("b", False)
         if name == "ToolTip":
