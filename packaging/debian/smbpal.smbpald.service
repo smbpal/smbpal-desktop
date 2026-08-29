@@ -12,7 +12,12 @@ ExecStart=/usr/bin/smbpald
 Restart=on-failure
 RestartSec=2s
 
-# systemd creates and owns /run/smbpal, so the daemon never has to.
+# systemd creates /run/smbpal and removes it on stop, so the daemon never has
+# to. It cannot set the group on it: RuntimeDirectory= takes its ownership from
+# User= and Group= below, and Group=smbpal would change the daemon's primary
+# gid and stamp that group on every file it writes into /etc/samba. So the
+# daemon chowns the directory to the socket group itself after systemd has made
+# it — connect() needs execute on the directory as well as on the socket.
 RuntimeDirectory=smbpal
 RuntimeDirectoryMode=0750
 

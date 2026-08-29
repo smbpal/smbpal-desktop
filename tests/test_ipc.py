@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import grp
 import json
 import os
 import socket
@@ -298,6 +299,75 @@ class TestSocket(ServerTestCase):
     def test_the_socket_is_not_world_accessible(self) -> None:
         mode = stat.S_IMODE(self.socket_path.stat().st_mode)
         self.assertEqual(mode & stat.S_IRWXO, 0, f"world bits set: {mode:04o}")
+
+
+def _a_group_we_belong_to() -> str | None:
+    """A group name we can chown to without being root.
+
+    chown(-1, gid) is permitted for the owner of a file when the gid is one
+    they are already in, so the directory guard is testable unprivileged.
+    """
+    for gid in os.getgroups():
+        try:
+            return grp.getgrgid(gid).gr_name
+        except KeyError:
+            continue
+    return None
+
+
+class TestTheDirectoryTheSocketIsIn(unittest.TestCase):
+    """A guarded socket in an unenterable directory admits nobody.
+
+    Found on a Pi on 29 August 2026: the socket was `0660 root:smbpal`,
+    exactly as designed, inside a `/run/smbpal` that systemd had made `0750
+    root:root`. `connect()` needs execute on every directory in the path, so
+    the group could not reach the socket its membership was the key to, and
+    the error said *membership of the smbpal group is required* to somebody
+    about to join it and find nothing changed.
+    """
+
+    def setUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory(dir="/tmp", prefix="smbpal-")
+        self.addCleanup(self._dir.cleanup)
+        self.root = Path(self._dir.name)
+
+    def transport(self, path: Path, group: str | None) -> UnixSocketTransport:
+        transport = UnixSocketTransport(path, group=group)
+        self.addCleanup(transport.shutdown)
+        return transport
+
+    @unittest.skipUnless(_a_group_we_belong_to(), "no named group to chown to")
+    def test_the_group_can_enter_the_directory_not_just_open_the_socket(self) -> None:
+        group = _a_group_we_belong_to()
+        assert group is not None
+        directory = self.root / "run"
+        directory.mkdir(mode=0o700)
+        self.transport(directory / "s.sock", group).bind()
+
+        info = directory.stat()
+        self.assertEqual(grp.getgrgid(info.st_gid).gr_name, group)
+        mode = stat.S_IMODE(info.st_mode)
+        self.assertTrue(mode & stat.S_IXGRP, f"group cannot enter: {mode:04o}")
+        self.assertEqual(mode & stat.S_IRWXO, 0, f"world bits set: {mode:04o}")
+
+    @unittest.skipUnless(_a_group_we_belong_to(), "no named group to chown to")
+    def test_a_shared_directory_is_refused_rather_than_taken_over(self) -> None:
+        """The flag that would otherwise chown /run to the socket group."""
+        path = Path("/tmp/smbpal-shared-dir-probe.sock")
+        self.addCleanup(path.unlink, True)
+        transport = self.transport(path, _a_group_we_belong_to())
+        with self.assertRaises(OSError) as caught:
+            transport.bind()
+        self.assertIn("directory of its own", str(caught.exception))
+
+    @unittest.skipUnless(_a_group_we_belong_to(), "no named group to chown to")
+    def test_a_refused_bind_leaves_no_socket_behind(self) -> None:
+        """Otherwise the next start finds a stale socket it has to reason about."""
+        path = Path("/tmp/smbpal-shared-dir-probe.sock")
+        self.addCleanup(path.unlink, True)
+        with self.assertRaises(OSError):
+            self.transport(path, _a_group_we_belong_to()).bind()
+        self.assertFalse(path.exists())
 
 
 class TestEvents(ServerTestCase):

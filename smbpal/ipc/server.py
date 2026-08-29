@@ -16,6 +16,7 @@ import grp
 import logging
 import os
 import socket
+import stat
 import threading
 from pathlib import Path
 from typing import Iterator
@@ -30,6 +31,16 @@ DEFAULT_SOCKET_PATH = Path("/run/smbpal/smbpald.sock")
 DEFAULT_SOCKET_GROUP = "smbpal"
 _SOCKET_MODE = 0o660
 _RUNTIME_DIR_MODE = 0o750
+
+# Directories the daemon will never take ownership of, however it is invoked.
+# Checked both as given and resolved, so /var/run catches as the /run symlink
+# it is. World-writable directories are refused by mode rather than by name:
+# /tmp resolves to /private/tmp on macOS and would walk straight past a list,
+# and a directory anyone can rename out from under the socket is the wrong
+# place for a guarded socket whatever it is called.
+_SHARED_DIRS = frozenset(
+    Path(p) for p in ("/", "/run", "/var/run", "/tmp", "/var/tmp", "/dev/shm")
+)
 _READ_CHUNK = 65536
 
 
@@ -145,7 +156,17 @@ class UnixSocketTransport:
         finally:
             os.umask(previous_umask)
 
-        self._apply_ownership()
+        # A socket file exists the moment bind() returns, so anything that
+        # refuses afterwards has to take it back down: the Pi's restart loop
+        # on 29 August 2026 left one behind on every one of its 374 attempts,
+        # each cleared as stale by the next.
+        try:
+            self._apply_ownership()
+        except BaseException:
+            listener.close()
+            self.path.unlink(missing_ok=True)
+            raise
+
         listener.listen(16)
         self._listener = listener
         log.info("listening on %s", self.path)
@@ -178,6 +199,7 @@ class UnixSocketTransport:
                     f"group {self.group!r} does not exist. The package creates it; "
                     "for a development run pass --socket-group '' to skip."
                 ) from None
+            self._apply_directory_ownership(gid)
             try:
                 os.chown(self.path, -1, gid)
             except PermissionError:
@@ -186,6 +208,41 @@ class UnixSocketTransport:
                     "the daemon is a root service (see the plan's daemon lifecycle)"
                 ) from None
         os.chmod(self.path, self.mode)
+
+    def _apply_directory_ownership(self, gid: int) -> None:
+        """Give the group the directory as well as the socket.
+
+        `connect()` needs *execute* on every directory in the path, so a 0660
+        root:smbpal socket inside a 0750 root:root directory is reachable by
+        root and by nobody else — the group guard reads as correct and admits
+        no one. Found on a Pi on 29 August 2026, where the CLI answered a
+        member-to-be with *membership of the smbpal group is required*, which
+        would have stayed the answer after they joined it.
+
+        systemd cannot do this: `RuntimeDirectory=` takes its ownership from
+        the unit's `User=` and `Group=`, and giving the unit `Group=smbpal`
+        would change the daemon's primary gid and put that group on every file
+        it writes into /etc/samba. So the daemon owns the problem, which also
+        covers the directory it makes for itself when systemd is not involved.
+        """
+        directory = self.path.parent
+        shared = {directory, directory.resolve()} & _SHARED_DIRS
+        world_writable = directory.stat().st_mode & stat.S_IWOTH
+        if shared or world_writable:
+            raise OSError(
+                f"refusing to give group {self.group!r} ownership of {directory} — "
+                "a group-guarded socket needs a directory of its own, not a "
+                "shared or world-writable one. Pass --socket-group '' for a "
+                "socket in a shared directory."
+            )
+        try:
+            os.chown(directory, -1, gid)
+            os.chmod(directory, _RUNTIME_DIR_MODE)
+        except PermissionError:
+            raise OSError(
+                f"cannot set group {self.group!r} on {directory} — "
+                "the daemon is a root service (see the plan's daemon lifecycle)"
+            ) from None
 
     def serve_forever(self, handler: Handler) -> None:
         if self._listener is None:
