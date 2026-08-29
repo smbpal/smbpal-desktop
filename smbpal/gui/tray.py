@@ -122,6 +122,7 @@ class Tray:
         self.bus_name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
 
         self._offline: str | None = None
+        self._watcher_present = False
 
         session.on_screen = self._screen_changed
         session.on_event = self._event
@@ -218,10 +219,35 @@ class Tray:
             # announce itself to the watcher and then answers nothing, which
             # looks exactly like a panel that does not support SNI.
             log.error("could not export %s; the icon will not work", ITEM_PATH)
+        self.announce()
+
+    def watcher_appeared(self, *_a: Any) -> None:
+        """The watcher is on the bus, which is not the same as it always was.
+
+        At login the panel and this process start together and the ordering
+        is a coin flip, so announcing once at startup registers with a
+        watcher that may not exist yet and then never tries again. That is
+        invisible when the tray is started by hand from a terminal, because
+        by then the panel has been up for hours -- which is every way this
+        was tested before a Pi ran it from `~/.config/autostart` and no icon
+        appeared. A panel that restarts mid-session is the same fault with a
+        different trigger, and this covers both.
+        """
+        self._watcher_present = True
+        self.announce()
+
+    def watcher_vanished(self, *_a: Any) -> None:
+        self._watcher_present = False
+        log.info("%s is not on the bus; waiting for it", WATCHER_NAME)
 
     def announce(self) -> None:
-        """Tell the watcher we exist. Without this the panel never looks."""
-        if self._connection is None:
+        """Tell the watcher we exist. Without this the panel never looks.
+
+        Both conditions are guarded rather than assumed, because either can
+        arrive first, and announcing exactly once per (bus name, watcher)
+        pairing is what keeps a re-announce from becoming a second icon.
+        """
+        if self._connection is None or not self._watcher_present:
             return
         self._connection.call(
             WATCHER_NAME,
@@ -240,12 +266,14 @@ class Tray:
         try:
             source.call_finish(result)
         except GLib.Error as exc:
-            # No watcher: GNOME without an extension, or a bare session. Not
-            # fatal and not silent — the tray is the only part of SMBPal that
-            # can simply be absent on a working desktop, and somebody looking
-            # for it deserves to find out why from the log.
+            # The watcher is on the bus and refused us, which is a different
+            # thing from there being no watcher -- that case never reaches
+            # here at all now, and is logged by watcher_vanished. Not fatal
+            # and not silent: the tray is the only part of SMBPal that can
+            # simply be absent on a working desktop, and somebody looking for
+            # it deserves to find out why from the log.
             log.warning(
-                "no %s on this session, so there will be no tray icon: %s",
+                "%s refused the registration, so there will be no tray icon: %s",
                 WATCHER_NAME,
                 exc.message,
             )
@@ -374,7 +402,6 @@ def main(argv: list[str] | None = None) -> int:
 
     def owned(connection: Gio.DBusConnection, _name: str) -> None:
         tray.register(connection)
-        tray.announce()
 
     Gio.bus_own_name(
         Gio.BusType.SESSION,
@@ -383,6 +410,15 @@ def main(argv: list[str] | None = None) -> int:
         owned,
         None,
         lambda *_a: log.error("could not take the bus name; is a tray already running?"),
+    )
+    # Held for the life of the process: the watcher can come and go, and the
+    # icon has to come back with it.
+    Gio.bus_watch_name(
+        Gio.BusType.SESSION,
+        WATCHER_NAME,
+        Gio.BusNameWatcherFlags.NONE,
+        tray.watcher_appeared,
+        tray.watcher_vanished,
     )
 
     session.start()

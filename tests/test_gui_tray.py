@@ -51,6 +51,19 @@ class FakeSession:
         self.refreshed += 1
 
 
+class FakeConnection:
+    """Enough of a `Gio.DBusConnection` to see whether we announced."""
+
+    def __init__(self) -> None:
+        self.announcements: list[str] = []
+
+    def register_object(self, *_a: Any) -> int:
+        return 1
+
+    def call(self, _name: str, _path: str, _iface: str, method: str, *_a: Any) -> None:
+        self.announcements.append(method)
+
+
 class FakeInvocation:
     def __init__(self) -> None:
         self.returned: list[Any] = []
@@ -326,3 +339,55 @@ class TestTheIconsExist(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(Gio is None, "python3-gi is not installed")
+class TestAnnouncingToAWatcherThatMayNotBeThereYet(unittest.TestCase):
+    """The login race, pinned.
+
+    The tray announced once, from the callback that takes its bus name, and
+    never again. Started by hand that always works, because the panel has
+    been up for hours. Started from `~/.config/autostart` the panel and this
+    process start together, so the watcher is often not on the bus yet: the
+    call failed, a warning went to a log nobody was reading, and the tray sat
+    there correct and invisible for the whole session. It took a Pi, a
+    logout and a canary `.desktop` to see it, because every test until this
+    one started the tray by hand.
+    """
+
+    def setUp(self) -> None:
+        self.tray = Tray(FakeSession())
+        self.connection = FakeConnection()
+
+    def test_it_does_not_announce_to_a_watcher_that_is_not_there(self) -> None:
+        self.tray.register(self.connection)
+        self.assertEqual(self.connection.announcements, [])
+
+    def test_it_announces_when_the_watcher_turns_up(self) -> None:
+        self.tray.register(self.connection)
+        self.tray.watcher_appeared()
+        self.assertEqual(
+            self.connection.announcements, ["RegisterStatusNotifierItem"]
+        )
+
+    def test_the_watcher_may_also_be_there_first(self) -> None:
+        """The other order, which is just as likely and fails differently."""
+        self.tray.watcher_appeared()
+        self.assertEqual(self.connection.announcements, [])
+        self.tray.register(self.connection)
+        self.assertEqual(
+            self.connection.announcements, ["RegisterStatusNotifierItem"]
+        )
+
+    def test_a_panel_that_restarts_gets_the_icon_back(self) -> None:
+        self.tray.register(self.connection)
+        self.tray.watcher_appeared()
+        self.tray.watcher_vanished()
+        self.tray.watcher_appeared()
+        self.assertEqual(len(self.connection.announcements), 2)
+
+    def test_the_ordinary_startup_announces_exactly_once(self) -> None:
+        """Two announcements can mean two icons, which step 4 checks for."""
+        self.tray.register(self.connection)
+        self.tray.watcher_appeared()
+        self.assertEqual(len(self.connection.announcements), 1)
