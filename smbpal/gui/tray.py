@@ -293,9 +293,18 @@ class Tray:
         if name == "ToolTip":
             # (icon name, pixmaps, title, body). The pixmap array stays empty:
             # a themed name is what M7 ships and what a panel can restyle.
+            #
+            # The title slot carries `indicator.title` and not the application
+            # name. `Title` above is already the item's name and that is the
+            # property panels use for it, so spending this slot on "SMBPal"
+            # said it twice and dropped the summary entirely. It showed up on
+            # the Pi as a daemon-down tooltip reading "the daemon closed the
+            # connection" -- `ipc.client`'s words for itself -- where
+            # `offline_indicator` had written "SMBPal's service is not
+            # running" for a person to read. Some panels show only this slot.
             return GLib.Variant(
                 "(sa(iiay)ss)",
-                (self.icon_name, [], "SMBPal", self.indicator.detail),
+                (self.icon_name, [], self.indicator.title, self.indicator.detail),
             )
         return None
 

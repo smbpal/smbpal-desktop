@@ -116,11 +116,29 @@ class TestTheItemsProperties(unittest.TestCase):
             model.screen({"connections": [{"id": "a", "state": "connected"}]})
         )
         icon, pixmaps, title, body = self.read("ToolTip").unpack()
-        self.assertEqual(title, "SMBPal")
+        self.assertEqual(title, "1 share connected")
         self.assertEqual(pixmaps, [])
         self.assertIn("Nothing shared from this computer", body)
         self.assertIn("1 share connected", body)
         self.assertTrue(icon)
+
+    def test_the_tooltip_title_is_the_summary_and_not_the_application_name(
+        self,
+    ) -> None:
+        """The daemon-down tooltip, pinned where it went wrong.
+
+        This slot used to be the constant "SMBPal", which the `Title`
+        property already says, so the sentence written for a person to read
+        never left the process. On the Pi that surfaced as a tooltip quoting
+        the IPC layer at the user instead.
+        """
+        self.tray._offline = "the daemon closed the connection"
+        self.tray._republish()
+        _, _, title, body = self.read("ToolTip").unpack()
+        self.assertEqual(title, "SMBPal's service is not running")
+        self.assertIn("the daemon closed the connection", body)
+        self.assertIn("already up are unaffected", body)
+        self.assertNotEqual(title, self.read("Title").get_string())
 
     def test_the_attention_icon_is_the_attention_icon_from_the_start(self) -> None:
         """The grey-tray bug, pinned at the property that caused it.
