@@ -107,6 +107,13 @@ class Window(Gtk.ApplicationWindow):
         outer.append(scroller)
         self.set_child(outer)
 
+        # Row ids with a call in flight. Kept here rather than on the buttons
+        # because `_rebuild` destroys every widget it has ever made: an
+        # unrelated `state.changed` arriving mid-call would otherwise hand
+        # back a live Remove for something already being removed.
+        self._in_flight: set[str] = set()
+        self._row_buttons: dict[str, list[Gtk.Button]] = {}
+
         session.on_screen = self._show
         session.on_event = self._on_event
         session.on_error = self._on_error
@@ -174,6 +181,7 @@ class Window(Gtk.ApplicationWindow):
     def _rebuild(self) -> None:
         while (child := self._body.get_first_child()) is not None:
             self._body.remove(child)
+        self._row_buttons = {}
         self._section(
             "Shared from this computer",
             self._screen.shares,
@@ -260,6 +268,8 @@ class Window(Gtk.ApplicationWindow):
         if action == model.REMOVE:
             button.add_css_class("destructive-action")
         button.connect("clicked", lambda _b: self._invoke(row, action))
+        button.set_sensitive(row.id not in self._in_flight)
+        self._row_buttons.setdefault(row.id, []).append(button)
         return button
 
     # --- doing it ----------------------------------------------------------
@@ -282,11 +292,41 @@ class Window(Gtk.ApplicationWindow):
         params: dict[str, Any] | None = None,
     ) -> None:
         self._clear_banner()
+        self._hold(row.id)
         self.session.submit(
             model.method_for(row, action),
             {"ref": row.id, **(params or {})},
-            then=self._done,
+            then=self._release(row.id, self._done),
+            catch=self._release(row.id, self._failed),
         )
+
+    def _hold(self, ref: str) -> None:
+        """Nothing else happens to this row until the daemon has answered.
+
+        A removal is a round trip, and the row stays on screen for all of it
+        because the window only changes when `refresh` comes back. A second
+        click sends a second call with a `ref` the daemon has already acted
+        on, so the error arrives *after* the removal worked and reads as it
+        having failed.
+        """
+        self._in_flight.add(ref)
+        for button in self._row_buttons.get(ref, ()):
+            button.set_sensitive(False)
+
+    def _release(
+        self, ref: str, then: Callable[[Any], None]
+    ) -> Callable[[Any], None]:
+        def done(result: Any) -> None:
+            self._in_flight.discard(ref)
+            then(result)
+
+        return done
+
+    def _failed(self, exc: SmbpalError) -> None:
+        # The row is still there and its buttons are still dead, because only
+        # a rebuild re-reads `_in_flight` and an error does not refresh.
+        self._on_error(exc)
+        self._rebuild()
 
     def _done(self, result: Any) -> None:
         # `share.make_writable` returns a note about clients that were already
