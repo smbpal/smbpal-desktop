@@ -1,0 +1,19 @@
+#!/usr/bin/make -f
+
+# pybuild reads pyproject.toml, so the console scripts in [project.scripts]
+# are the only place entry points are named. Adding one here as well would be
+# a second list that can disagree with the first.
+export PYBUILD_NAME = smbpal
+
+%:
+	dh $@ --with python3 --buildsystem=pybuild
+
+# The unit is smbpald.service and the package is smbpal, so debhelper needs
+# telling which of the two names it is looking at.
+override_dh_installsystemd:
+	dh_installsystemd --name=smbpald
+
+# No test suite at build time: it needs python3-gi for 30 of its tests and
+# pulling GTK into the build chroot to run them would make the package
+# build-depend on the toolkit it deliberately only recommends. CI runs them.
+override_dh_auto_test:

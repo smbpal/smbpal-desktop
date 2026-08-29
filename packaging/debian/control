@@ -1,0 +1,31 @@
+Source: smbpal
+Section: net
+Priority: optional
+Maintainer: Luke Hynek <luke.hynek@aiminternet.co.uk>
+Build-Depends: debhelper-compat (= 13),
+               dh-python,
+               python3-all,
+               python3-setuptools
+Standards-Version: 4.7.0
+Homepage: https://github.com/smbpal/smbpal-desktop
+Rules-Requires-Root: no
+
+Package: smbpal
+Architecture: all
+Depends: ${python3:Depends},
+         ${misc:Depends},
+         samba,
+         samba-common-bin,
+         cifs-utils
+Recommends: python3-gi,
+            gir1.2-gtk-4.0,
+            avahi-daemon,
+            avahi-utils
+Suggests: smbclient
+Description: share folders over SMB, and connect to shares on other machines
+ SMBPal manages Samba shares and cifs mounts on one computer, through a
+ daemon, a command line and a GTK4 window that all speak to the same socket.
+ .
+ It owns an include file rather than smb.conf, so an existing hand-written
+ configuration is left exactly as it was found, and removing SMBPal leaves it
+ byte-identical.

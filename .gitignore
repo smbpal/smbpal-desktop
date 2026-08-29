@@ -49,6 +49,22 @@ venv/
 .coverage
 htmlcov/
 
+# --- Debian build artefacts ------------------------------------------------
+# `debian` is a symlink to `packaging/debian`, so debhelper writes its working
+# files *inside the repository* rather than beside it. §11.3 publishes full
+# history, and a history carrying build detritus from three machines is
+# history nobody wants to read.
+packaging/debian/.debhelper/
+packaging/debian/smbpal/
+packaging/debian/files
+packaging/debian/debhelper-build-stamp
+packaging/debian/*.substvars
+packaging/debian/*.debhelper
+packaging/debian/*.debhelper.log
+*.deb
+*.buildinfo
+*.changes
+
 # --- Platform noise --------------------------------------------------------
 .DS_Store
 Thumbs.db

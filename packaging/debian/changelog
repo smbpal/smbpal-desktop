@@ -1,0 +1,9 @@
+smbpal (0.1.0) unstable; urgency=medium
+
+  * First package. Daemon, command line, GTK4 window and tray icon, all
+    speaking to one socket.
+  * Ships the systemd unit, the sysusers group, the desktop entries and the
+    hicolor status icons that M6 needed installed before a panel would draw
+    anything at all.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Sat, 29 Aug 2026 12:00:00 +0000

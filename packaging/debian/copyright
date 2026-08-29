@@ -1,0 +1,17 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: smbpal
+Upstream-Contact: Luke Hynek <luke.hynek@aiminternet.co.uk>
+Source: https://github.com/smbpal/smbpal-desktop
+
+Files: *
+Copyright: 2026 Luke Hynek
+License: UNRESOLVED
+ The project's licence is open — plan §13 Q1, "GPL confirmation", which the
+ plan itself notes is "cheap now, awkward after contributions".
+ .
+ This file is deliberately not guessing. A package built from this tree can be
+ installed and measured, which is what M7 needs it for; it must not be
+ published until this stanza names a real licence and a LICENSE file exists at
+ the root of the repository to match. §11.3 opens the repositories with full
+ history at first binary release, which is the same moment this stops being a
+ question that can be left open.

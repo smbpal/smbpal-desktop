@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+# Nobody is added to the smbpal group by this script, and that is deliberate.
+# Membership is the socket's "may talk" guard (D4), so granting it is granting
+# access to a root daemon — a decision for the administrator of the machine
+# and not for a package's postinst. Saying so is the least a package can do:
+# an unusable install with no explanation is the worse failure.
+if [ "$1" = "configure" ]; then
+    echo "SMBPal: to use it, add each user to the 'smbpal' group:"
+    echo "    sudo usermod -aG smbpal <user>"
+    echo "  They will need to log out and back in for it to take effect."
+fi
+
+#DEBHELPER#
+
+exit 0

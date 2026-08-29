@@ -1,0 +1,5 @@
+packaging/debian/smbpal.desktop            usr/share/applications
+packaging/debian/smbpal-tray.desktop       etc/xdg/autostart
+packaging/icons/hicolor/scalable/status/smbpal.svg            usr/share/icons/hicolor/scalable/status
+packaging/icons/hicolor/scalable/status/smbpal-idle.svg       usr/share/icons/hicolor/scalable/status
+packaging/icons/hicolor/scalable/status/smbpal-attention.svg  usr/share/icons/hicolor/scalable/status
