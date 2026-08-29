@@ -1,0 +1,25 @@
+#!/bin/sh
+set -e
+
+# purge forgets the configuration, which is the one thing prerm's teardown
+# deliberately keeps. /etc/smbpal is written by the daemon at runtime and is
+# not dpkg-tracked, so without this nothing would ever remove it.
+#
+# The credentials directory holds cifs passwords in plain text — 0600, and the
+# mode is enforced where they are written, not here. `rm` is not a secure erase
+# and this does not pretend to be one: on any modern filesystem the blocks
+# survive until they are reused. It is the difference between a password
+# sitting in a listed file and one sitting only in unallocated space, which is
+# worth having and is not the same as the password being gone.
+#
+# The smbpal group is left alone. Debian does not remove system groups on
+# purge, and a stale gid on files elsewhere is worse than an unused group.
+case "$1" in
+    purge)
+        rm -rf /etc/smbpal
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

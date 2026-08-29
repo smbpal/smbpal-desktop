@@ -1,0 +1,34 @@
+#!/bin/sh
+set -e
+
+# Hand the machine back the way SMBPal found it: unmount what it mounted, take
+# away the units it wrote, and remove its block from smb.conf. Without this a
+# purged machine goes on automounting a remote share at every boot, with no
+# SMBPal left to manage it or explain where it came from — verified on a Pi on
+# 29 August 2026, where `apt purge` removed nothing the daemon had written
+# because none of it is dpkg-tracked.
+#
+# It has to be prerm and not postrm. By the time postrm runs dpkg has already
+# deleted /usr/bin/smbpal and the daemon it talks to, and the block in smb.conf
+# would have nothing left able to remove it. #DEBHELPER# is below rather than
+# above for the same reason: dh_installsystemd's stop lands there, and the
+# daemon has to still be answering when teardown asks.
+#
+# `teardown` keeps /etc/smbpal, so `apt remove` followed by a reinstall picks
+# the configuration back up. Forgetting it is purge's job, in postrm.
+case "$1" in
+    remove)
+        if [ -x /usr/bin/smbpal ]; then
+            if ! smbpal teardown --yes; then
+                echo "SMBPal: teardown failed. Its mount units, its smb.conf" >&2
+                echo "  block, or both may still be in place. Removal will" >&2
+                echo "  continue: blocking it would leave you with neither a" >&2
+                echo "  working package nor a clean machine." >&2
+            fi
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
