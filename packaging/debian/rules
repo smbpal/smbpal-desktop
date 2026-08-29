@@ -17,3 +17,17 @@ override_dh_installsystemd:
 # pulling GTK into the build chroot to run them would make the package
 # build-depend on the toolkit it deliberately only recommends. CI runs them.
 override_dh_auto_test:
+
+# dh_installsysusers exists on the system but is not in the compat 13 sequence
+# (verified against debhelper 13.24.2 on Debian trixie, 29 August 2026), so
+# debian/smbpal.sysusers was read by nothing and the first package installed
+# without the group its socket is guarded by — silently, with no warning from
+# the build. Calling it by hand is the fix.
+#
+# Before dh_installsystemd and not after, because debhelper appends postinst
+# snippets in the order the helpers run and dh_installsystemd's second snippet
+# starts the daemon. Ordered the other way the group would be created after
+# systemd had already tried to start smbpald and failed on the missing group,
+# leaving a fresh install broken until somebody started it a second time.
+execute_before_dh_installsystemd:
+	dh_installsysusers
