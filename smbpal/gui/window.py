@@ -291,6 +291,13 @@ class Window(Gtk.ApplicationWindow):
         action: str,
         params: dict[str, Any] | None = None,
     ) -> None:
+        if row.id in self._in_flight:
+            # Belt as well as braces. The dead button is what a person meets,
+            # but sensitivity is a property of a widget `_rebuild` is free to
+            # replace, and a synthetic click ignores it outright. The rule is
+            # one call per row at a time, so state it where it cannot be
+            # redrawn away.
+            return
         self._clear_banner()
         self._hold(row.id)
         self.session.submit(
