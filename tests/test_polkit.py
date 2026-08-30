@@ -309,21 +309,28 @@ class TestTheTtyAgent(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def fake(self, *, close_fd: bool = True, linger: int = 30) -> str:
+        """Python and not `sh`, which cost a CI run to learn.
+
+        The first version closed the notify fd with `eval "exec ${fd}>&-"`.
+        **dash only understands single-digit descriptors in a redirection**, and
+        `os.pipe()` hands out whatever number is free — two digits, often. So
+        the fake died before it could signal, `start()` correctly reported that
+        nothing had registered, and three tests failed on Linux while passing on
+        macOS, where `/bin/sh` is bash and the redirection is legal.
+        """
+        closes = "if fd is not None:\n    os.close(fd)\n" if close_fd else ""
         path = self.tmp / "pkttyagent"
         path.write_text(
-            "#!/bin/sh\n"
-            f'printf "%s\\n" "$*" > "{self.argv}"\n'
-            'fd=""\n'
-            'while [ $# -gt 0 ]; do\n'
-            '  if [ "$1" = "--notify-fd" ]; then fd="$2"; fi\n'
-            "  shift\n"
-            "done\n"
-            + (
-                'if [ -n "$fd" ]; then eval "exec ${fd}>&-"; fi\n'
-                if close_fd
-                else ""
-            )
-            + f"sleep {linger}\n"
+            "#!/usr/bin/env python3\n"
+            "import os, sys, time\n"
+            "argv = sys.argv[1:]\n"
+            f"open({str(self.argv)!r}, 'w').write(' '.join(argv))\n"
+            "fd = None\n"
+            "for i, a in enumerate(argv):\n"
+            "    if a == '--notify-fd':\n"
+            "        fd = int(argv[i + 1])\n"
+            + closes
+            + f"time.sleep({linger})\n"
         )
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
         return str(path)

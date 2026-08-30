@@ -15,6 +15,7 @@ import errno
 import grp
 import logging
 import os
+import selectors
 import socket
 import stat
 import threading
@@ -130,6 +131,20 @@ class UnixSocketTransport:
         self._threads_lock = threading.Lock()
         self._threads: list[threading.Thread] = []
         self._stopping = threading.Event()
+        # **Closing the listener does not stop `accept()` on Linux.** It does
+        # on macOS, which is why this was written without a wake-up and why
+        # nothing noticed for two weeks: every `test_cli` test paid the full
+        # `join(timeout=5)` on Linux and finished instantly on the machine the
+        # code was written on. The daemon itself survived only by accident —
+        # SIGTERM interrupts the syscall, so the signal handler's `shutdown()`
+        # runs and the retried `accept()` then fails on a closed fd. Anything
+        # calling `shutdown()` from another thread simply hung.
+        #
+        # So: a socketpair the serve loop watches alongside the listener.
+        # `shutdown()` writes one byte to it, which is a wake-up that does not
+        # depend on what a platform does with a closed descriptor.
+        self._wake_r: socket.socket | None = None
+        self._wake_w: socket.socket | None = None
         # shutdown() is called from both the signal handler and the serve
         # loop's finally, so it has to be safe to call twice — and quiet the
         # second time.
@@ -169,6 +184,7 @@ class UnixSocketTransport:
 
         listener.listen(16)
         self._listener = listener
+        self._wake_r, self._wake_w = socket.socketpair()
         log.info("listening on %s", self.path)
 
     def _clear_stale_socket(self) -> None:
@@ -247,9 +263,35 @@ class UnixSocketTransport:
     def serve_forever(self, handler: Handler) -> None:
         if self._listener is None:
             raise RuntimeError("bind() before serve_forever()")
+        selector = selectors.DefaultSelector()
+        selector.register(self._listener, selectors.EVENT_READ)
+        if self._wake_r is not None:
+            selector.register(self._wake_r, selectors.EVENT_READ)
+        try:
+            self._accept_loop(selector, handler)
+        finally:
+            selector.close()
+            if self._wake_r is not None:
+                self._wake_r.close()
+                self._wake_r = None
+
+    def _accept_loop(self, selector: selectors.BaseSelector, handler: Handler) -> None:
         while not self._stopping.is_set():
             try:
-                client, _ = self._listener.accept()
+                ready = selector.select()
+            except OSError:
+                # A registered descriptor went away underneath us. That is
+                # shutdown if shutdown says so, and a real fault otherwise.
+                if self._stopping.is_set():
+                    break
+                raise
+            if any(key.fileobj is self._wake_r for key, _ in ready):
+                break
+            listener = self._listener
+            if listener is None:
+                break
+            try:
+                client, _ = listener.accept()
             except OSError:
                 if self._stopping.is_set():
                     break
@@ -313,6 +355,15 @@ class UnixSocketTransport:
                 return
             self._shutdown_done = True
         self._stopping.set()
+        # The wake-up first, and the listener after: the serve loop must have
+        # something to notice before the thing it is watching disappears.
+        if self._wake_w is not None:
+            try:
+                self._wake_w.send(b"\0")
+            except OSError:
+                pass
+            self._wake_w.close()
+            self._wake_w = None
         if self._listener is not None:
             try:
                 self._listener.close()

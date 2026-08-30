@@ -344,6 +344,38 @@ class TestPeerAndAuthorisation(ServerTestCase):
             self.client().call("definitely.not.a.method")
 
 
+class TestStopping(unittest.TestCase):
+    """`shutdown()` from another thread must actually stop the serve loop.
+
+    It did not on Linux, and it did on macOS, so nothing said so for two weeks:
+    closing a listening socket wakes a thread blocked in `accept()` on BSD and
+    leaves it blocked on Linux. The daemon survived on the accident that
+    SIGTERM interrupts the syscall, so the handler's `shutdown()` ran and the
+    retried `accept()` failed on a closed descriptor — but every `test_cli`
+    test paid a five-second `join` timeout on Linux, which is how CI found it:
+    528 tests in 391 seconds against 8 on the machine they were written on.
+
+    This asserts the contract rather than the mechanism, so it holds whatever
+    the platform does with a closed descriptor.
+    """
+
+    def test_the_serve_loop_ends_when_it_is_told_to(self) -> None:
+        directory = tempfile.TemporaryDirectory(dir="/tmp", prefix="smbpal-")
+        self.addCleanup(directory.cleanup)
+        transport = UnixSocketTransport(Path(directory.name) / "s.sock", group=None)
+        transport.bind()
+        thread = threading.Thread(
+            target=transport.serve_forever, args=(lambda *_: None,), daemon=True
+        )
+        thread.start()
+        transport.shutdown()
+        thread.join(timeout=2.0)
+        self.assertFalse(
+            thread.is_alive(),
+            "serve_forever was still running two seconds after shutdown()",
+        )
+
+
 class TestSocket(ServerTestCase):
     def test_the_socket_is_removed_on_shutdown(self) -> None:
         self.assertTrue(self.socket_path.exists())

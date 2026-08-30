@@ -93,24 +93,53 @@ jobs:
           set -eux
           deb=$(ls ../smbpal_*_all.deb)
           sudo apt-get install -y "$deb"
+
           # The four entry points exist and answer, which is a weaker claim
           # than the Pi's "they run" but the one a runner can make.
           smbpal --version
           smbpald --version
           test -f /usr/share/polkit-1/actions/org.smbpal.policy
           test -f /etc/xdg/autostart/smbpal-tray.desktop
+
           # polkit must be able to read what was installed. An unparseable
           # policy file means polkit sees no actions at all and every mutation
           # is refused — silently, since nothing reports a parse error.
           pkaction | grep -q '^org\.smbpal\.manage-shares$'
           pkaction | grep -q '^org\.smbpal\.manage-connections$'
           pkaction | grep -q '^org\.smbpal\.use-connections$'
+
+          # Type=notify, checked the way the Pi checks it: under notify the
+          # substate reaches `running` only when READY=1 arrives, so this is
+          # systemd confirming receipt rather than the daemon vouching for
+          # itself. A daemon that never notifies still binds and still answers.
+          sudo systemctl is-active --quiet smbpald
+          test "$(systemctl show smbpald -p SubState --value)" = running
+
+          # **Configure something before removing.** Without this the removal
+          # runs against an empty machine and proves nothing — which is exactly
+          # how the Pi's 29 August purge test came back green while removing
+          # nothing at all. `sudo` takes the uid 0 short-circuit, which is also
+          # the path `prerm` uses.
+          sudo mkdir -p /srv/smbpal-ci
+          sudo smbpal share add CI /srv/smbpal-ci
+          grep -q smbpal /etc/samba/smb.conf
+          test -f /etc/samba/smbpal.conf
+          test -d /etc/smbpal
+
           sudo apt-get remove -y smbpal
           test -d /etc/smbpal || { echo "remove deleted the config; only purge may"; exit 1; }
+          if grep -q smbpal /etc/samba/smb.conf; then
+            echo "remove left the include block in smb.conf"; exit 1
+          fi
+          test ! -e /etc/samba/smbpal.conf || { echo "remove left smbpal.conf"; exit 1; }
+
           sudo apt-get install -y "$deb"
           sudo apt-get purge -y smbpal
           test ! -e /etc/smbpal || { echo "purge left /etc/smbpal behind"; exit 1; }
           test ! -e /etc/samba/smbpal.conf || { echo "purge left smbpal.conf behind"; exit 1; }
+          if grep -q smbpal /etc/samba/smb.conf; then
+            echo "purge left the include block in smb.conf"; exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
