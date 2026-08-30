@@ -1,9 +1,42 @@
-smbpal (0.1.0) unstable; urgency=medium
+smbpal (0.1.0) trixie; urgency=medium
 
-  * First package. Daemon, command line, GTK4 window and tray icon, all
-    speaking to one socket.
-  * Ships the systemd unit, the sysusers group, the desktop entries and the
-    hicolor status icons that M6 needed installed before a panel would draw
-    anything at all.
+  * First release. SMBPal shares folders over SMB and connects to shares on
+    other machines, from a window, a tray icon or a command line.
+  * The daemon, the command line, the GTK4 window and the tray icon are one
+    package and one version. They speak to each other over a socket, and
+    shipping them separately is how a client and a daemon come to disagree.
+  * Serving a folder writes to /etc/samba/smbpal.conf, which this package owns
+    completely. The distribution's smb.conf gains a single "include" line and
+    is otherwise never read, rewritten or reformatted. Shares written by hand
+    are shown, marked as not managed by SMBPal, and left alone; a name that
+    would shadow one is refused.
+  * Connecting to a remote share writes a systemd .mount and .automount unit
+    rather than an fstab line, so a share is attached when something looks at
+    it and its failures are visible to journalctl. A mount SMBPal did not make
+    is never unmounted, and an unreachable server is reported as unreachable
+    rather than as connected.
+  * Credentials are written to /etc/smbpal/credentials/ at mode 0600 and are
+    never passed on a command line, logged, or written to the Samba
+    configuration.
+  * Changing what this machine shares, or what it connects to, requires
+    authorisation through polkit. Three actions are registered; connecting to
+    and disconnecting from an already-configured share is not one of them,
+    because an armed automount attaches when any local user lists the
+    directory and a password prompt in front of that would protect nothing.
+  * Other SMB servers on the network can be browsed, and this machine
+    advertises itself only while it is actually sharing something.
+  * Removing the package undoes what it did: the include line goes, the units
+    are stopped and removed, and smb.conf is left byte-identical to how it was
+    found. Purging additionally forgets the configuration in /etc/smbpal.
 
- -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Sat, 29 Aug 2026 12:00:00 +0000
+  * Nobody is added to the "smbpal" group by this package. That membership is
+    what permits talking to a service running as root, so it is left to the
+    administrator: run "sudo usermod -aG smbpal <user>" and log in again.
+    Without it the applications start and cannot reach the daemon.
+  * Architecture: all. The same file installs on arm64, armhf and amd64 —
+    SMBPal is Python, and depends on the distribution's GTK rather than
+    carrying its own.
+  * Built and tested against Raspberry Pi OS Trixie on a Raspberry Pi 4.
+    Nothing else has been tested.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Sun, 30 Aug 2026 21:30:00 +0000
