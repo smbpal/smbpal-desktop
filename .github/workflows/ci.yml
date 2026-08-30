@@ -175,6 +175,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # For the build attestation. `id-token` is what lets the runner prove to
+      # sigstore which workflow it is, and it is the whole mechanism: there is
+      # no signing key to generate, store, rotate or lose.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v5
 
@@ -215,6 +220,21 @@ jobs:
         run: |
           sha256sum smbpal_*_all.deb > SHA256SUMS
           cat SHA256SUMS
+
+      # What the checksum above cannot do. A hash published beside the file
+      # proves it arrived intact; this proves it *came from here* — that these
+      # exact bytes were produced by this repository's workflow from this tag,
+      # attested through sigstore's public transparency log. A person who
+      # replaced both the .deb and SHA256SUMS still cannot produce this.
+      #
+      # It attests the artifact from `package` rather than a rebuild, because
+      # a rebuilt .deb has different timestamps and therefore a different
+      # digest — an attestation for a file nobody downloaded is worse than
+      # none, since it verifies and proves nothing about the real one.
+      - name: Attest the build
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/smbpal_*_all.deb
 
       # A draft, so a person publishes it. Tagging is a routine act; putting a
       # binary in front of the public is not, and the two should not be the
@@ -257,14 +277,21 @@ jobs:
 
           \`\`\`sh
           sha256sum -c SHA256SUMS
+          gh attestation verify smbpal_${version}_all.deb --repo ${GITHUB_REPOSITORY}
           \`\`\`
 
-          Both files come from the same automated build. Note what that does
-          and does not show: a checksum published beside the file it describes
-          proves the download arrived intact, not that it is authentic —
-          anyone who could replace one could replace the other. Signed
-          verification is the apt repository's job, where \`apt\` checks it
-          without anyone having to remember to.
+          The first shows the download arrived intact. On its own that is all
+          it shows — it sits beside the file it describes, so anyone who could
+          replace one could replace the other.
+
+          The second shows where the file came from: that these exact bytes
+          were built by this repository's workflow from this tag, attested
+          through sigstore's public transparency log. There is no key involved
+          and none to trust; the proof is the log entry.
+
+          Neither replaces a signed apt repository, which is the version
+          \`apt\` checks on your behalf rather than the version you have to
+          remember to run.
 
           ## Tested on
 
