@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 from types import FrameType
 
-from smbpal import __version__
+from smbpal import __version__, version_banner
 from smbpal.config import ConfigStore
 from smbpal.config.store import DEFAULT_CONFIG_PATH
 from smbpal.daemon.handlers import Authoriser, Dispatcher
@@ -40,7 +40,11 @@ log = logging.getLogger("smbpald")
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="smbpald", description="SMBPal daemon (system service, runs as root)"
+        prog="smbpald",
+        description="SMBPal daemon (system service, runs as root)",
+        # See the same line in cli/main.py: raw, so --version keeps its
+        # line breaks rather than being reflowed into a paragraph.
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--config", type=Path, default=DEFAULT_CONFIG_PATH, help="config file path"
@@ -104,7 +108,9 @@ def build_parser() -> argparse.ArgumentParser:
         "which is no authorisation at all and exists for development on a "
         "machine with no polkit; the daemon says so at startup.",
     )
-    parser.add_argument("--version", action="version", version=f"smbpald {__version__}")
+    parser.add_argument(
+        "--version", action="version", version=version_banner("smbpald")
+    )
     return parser
 
 

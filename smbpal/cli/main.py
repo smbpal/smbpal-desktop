@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
-from smbpal import __version__
+from smbpal import version_banner
 from smbpal.cli.agent import TtyAgent
 from smbpal.cli.format import render_json, render_table
 from smbpal.errors import DaemonUnreachable, NotFound, SmbpalError
@@ -38,7 +38,13 @@ _AUTO_CONNECT = ("always", "on_this_network", "never")
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="smbpal", description="Manage SMB shares and connections."
+        prog="smbpal",
+        description="Manage SMB shares and connections.",
+        # Raw, so that --version keeps its line breaks. argparse renders the
+        # version action through the parser's formatter, and the default one
+        # reflows it into a paragraph — which turns the licence notice into
+        # prose soup. The description is a single short line either way.
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--socket", type=Path, default=DEFAULT_SOCKET_PATH, help="daemon socket path"
@@ -46,7 +52,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--json", action="store_true", help="machine-readable output"
     )
-    parser.add_argument("--version", action="version", version=f"smbpal {__version__}")
+    parser.add_argument(
+        "--version", action="version", version=version_banner("smbpal")
+    )
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
     commands.required = True
 

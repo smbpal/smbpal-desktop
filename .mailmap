@@ -1,0 +1,6 @@
+# One author, two addresses. Commits made through the GitHub web interface carry
+# the noreply address; commits from this machine carry the real one. Nothing
+# turns on the difference — but §11.3's dual-licensing option rests on sole
+# copyright ownership being *demonstrable*, and a public history showing two
+# author identities makes a reader check rather than see. This makes them one.
+Luke Hynek <luke.hynek@aiminternet.co.uk> <302187058+lukehynek-png@users.noreply.github.com>

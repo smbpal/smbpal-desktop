@@ -5,13 +5,40 @@ Source: https://github.com/smbpal/smbpal-desktop
 
 Files: *
 Copyright: 2026 Luke Hynek
-License: UNRESOLVED
- The project's licence is open — plan §13 Q1, "GPL confirmation", which the
- plan itself notes is "cheap now, awkward after contributions".
+License: GPL-3+
+Comment:
+ One stanza, because there is one copyright holder and nothing in this tree
+ came from anywhere else. Audited before the licence was chosen, 30 August
+ 2026: no vendored code, no third-party assets, every import either the
+ standard library, `gi`, or `smbpal` itself, and the three status icons are
+ hand-written SVG paths carrying no editor metadata or attribution.
  .
- This file is deliberately not guessing. A package built from this tree can be
- installed and measured, which is what M7 needs it for; it must not be
- published until this stanza names a real licence and a LICENSE file exists at
- the root of the repository to match. §11.3 opens the repositories with full
- history at first binary release, which is the same moment this stops being a
- question that can be left open.
+ Nothing here is linked, which is why the dependencies impose no terms of
+ their own. Samba, cifs-utils and polkitd are separate processes driven by
+ config files and a command line. GTK4 and PyGObject are LGPL and arrive as
+ Debian packages loaded at runtime through introspection, so the user can
+ install a different libgtk-4 and this program picks it up — which is the
+ relinking freedom the LGPL asks for, satisfied by the packaging rather than
+ by anything we had to build.
+ .
+ The source is at the Source: URL above, and every release is tagged to match
+ the binary built from it. GPLv3 section 6(d) allows directions to a
+ third-party host in place of a source tarball, provided they travel with the
+ object code — which this file does, as /usr/share/doc/smbpal/copyright.
+
+License: GPL-3+
+ This program is free software: you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by the Free
+ Software Foundation, either version 3 of the License, or (at your option)
+ any later version.
+ .
+ This program is distributed in the hope that it will be useful, but WITHOUT
+ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ more details.
+ .
+ You should have received a copy of the GNU General Public License along
+ with this program. If not, see <https://www.gnu.org/licenses/>.
+ .
+ On Debian systems the complete text of the GNU General Public License
+ version 3 can be found in /usr/share/common-licenses/GPL-3.

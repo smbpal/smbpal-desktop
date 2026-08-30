@@ -8,6 +8,16 @@ version = "0.1.0"
 description = "SMB share manager — daemon, CLI and GUI in one package"
 requires-python = ">=3.11"
 
+# The classifier rather than PEP 639's `license = "GPL-3.0-or-later"`, which
+# needs setuptools 77 or newer. The package is built by pybuild against
+# whichever setuptools the distribution ships, and CI builds on an older one
+# than Trixie — so the SPDX field would be a build failure that only appears
+# on some machines. The classifier is understood everywhere. The licence
+# itself is stated in LICENSE and in debian/copyright.
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+]
+
 # Deliberately empty, and it should stay that way for the daemon and CLI.
 # D11: system Python, depend don't bundle. The GUI's PyGObject and GTK4 arrive
 # as Debian packages (python3-gi, gir1.2-gtk-4.0), not from PyPI, because a

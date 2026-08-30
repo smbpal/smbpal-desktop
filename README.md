@@ -180,11 +180,37 @@ and silently failing over would send the stored credentials to whatever answers
 on port 445. So the address is recorded, surfaced when the name fails to
 resolve, and used only when a person runs `smbpal connection use-fallback`.
 
-### Known interim: authorisation
+### Authorisation
 
-Mutating methods currently accept any peer that got through the socket's `0660
-root:smbpal` guard — so *may talk* and *may act* are the same answer, which is
-not what D4 says. polkit is the plan's answer and ships with the policy file at
-M7. The seam is `Authoriser.check`, every mutation is audited to
-`smbpal.audit`, and the daemon logs the policy in force at startup.
+Closed at M7, 30 August 2026. Mutating methods ask polkit about the calling
+process; read-only methods never do. Three actions — `manage-shares`,
+`manage-connections`, `use-connections` — with the reasoning for the split, and
+for `use-connections` being `yes`, in `packaging/polkit/org.smbpal.policy`.
+
+The check runs through `pkcheck` rather than polkit's D-Bus API, so that the
+root daemon does not need `python3-gi`, which the package only recommends.
+`--allow-user-interaction` is what makes the prompt appear, and the CLI starts
+a `pkttyagent` so that a terminal with no desktop session has something to
+prompt *with*. Every allow and every refusal is logged to `smbpal.audit`, and
+the daemon states the policy in force at startup.
+
+Before it, mutating methods accepted any peer that got through the socket's
+`0660 root:smbpal` guard — *may talk* and *may act* were the same answer, which
+is not what D4 says. `--authorisation group` still selects that behaviour for
+development on a machine with no polkit, and the daemon warns when it is on.
+
+## Licence
+
+**GPL-3.0-or-later.** The full text is in [`LICENSE`](LICENSE); the packaging
+statement, and the audit of provenance behind it, is in
+[`packaging/debian/copyright`](packaging/debian/copyright).
+
+Nothing here is linked to anything. Samba, cifs-utils and polkit are separate
+processes driven by config files and a command line, and GTK4 and PyGObject are
+loaded at runtime through introspection from Debian packages the user can
+replace. So the dependencies impose no terms of their own, and there is no
+vendored code in the tree.
+
+Contributions need a CLA before they can be merged — see
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for why, in one paragraph.
 

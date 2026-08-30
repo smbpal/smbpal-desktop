@@ -424,3 +424,102 @@ def _is_docstring(tree: ast.Module, node: ast.Constant) -> bool:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheLicence(unittest.TestCase):
+    """§13 Q1, answered 30 August 2026: GPL-3.0-or-later.
+
+    Pinned here because the licence is stated in six places that can disagree,
+    and because `debian/copyright` sat at `License: UNRESOLVED` for the whole of
+    M7 without anything noticing. A package that ships an unresolved licence
+    field is not a lint failure — `lintian` passes it — it is a package that
+    should not have been published.
+    """
+
+    def test_the_repository_carries_the_full_gpl_text(self) -> None:
+        text = (ROOT / "LICENSE").read_text(encoding="utf-8")
+        self.assertIn("GNU GENERAL PUBLIC LICENSE", text)
+        self.assertIn("Version 3, 29 June 2007", text)
+        # Not just the header: the operative sections have to be here too. A
+        # truncated licence file is the classic way to ship a licence that
+        # grants nothing.
+        for section in (
+            "2. Basic Permissions.",
+            "5. Conveying Modified Source Versions.",
+            "6. Conveying Non-Source Forms.",
+            "15. Disclaimer of Warranty.",
+        ):
+            self.assertIn(section, text, f"LICENSE is missing {section!r}")
+
+    def test_the_package_names_a_real_licence(self) -> None:
+        text = (ROOT / "packaging" / "debian" / "copyright").read_text(encoding="utf-8")
+        self.assertNotIn("UNRESOLVED", text)
+        self.assertIn("License: GPL-3+", text)
+        # The short name in the Files stanza has to match a standalone stanza of
+        # the same name, or the field points at nothing.
+        self.assertIn("/usr/share/common-licenses/GPL-3", text)
+        self.assertEqual(
+            2, text.count("License: GPL-3+"), "expected the Files field and its stanza"
+        )
+
+    def test_pyproject_agrees(self) -> None:
+        text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn(
+            "License :: OSI Approved :: GNU General Public License v3 or later",
+            text,
+        )
+
+    def test_the_program_can_state_its_own_licence(self) -> None:
+        # GPLv3 section 6(d) lets the repository stand in for a source tarball
+        # only if the directions to it travel with the object code. The .deb
+        # carries them; so should the program, for the user who still has the
+        # binary and no longer has the package.
+        from smbpal import SOURCE_URL, version_banner
+
+        banner = version_banner("smbpal")
+        self.assertTrue(banner.startswith("smbpal "))
+        self.assertIn("GPL-3.0-or-later", banner)
+        self.assertIn("NO WARRANTY", banner)
+        self.assertIn(SOURCE_URL, banner)
+
+    def test_every_copy_of_the_source_url_is_the_same_url(self) -> None:
+        # Three files name it independently. Two of the three are legal
+        # directions to the Corresponding Source, so a stale one is not a
+        # cosmetic problem.
+        from smbpal import SOURCE_URL
+
+        copyright_text = (ROOT / "packaging" / "debian" / "copyright").read_text(
+            encoding="utf-8"
+        )
+        control = (ROOT / "packaging" / "debian" / "control").read_text(encoding="utf-8")
+        self.assertIn(f"Source: {SOURCE_URL}", copyright_text)
+        self.assertIn(f"Homepage: {SOURCE_URL}", control)
+
+    def test_contributing_states_the_cla_requirement(self) -> None:
+        # Dual-licensing for the App Store needs sole copyright ownership, and
+        # one merged contribution without a CLA ends it permanently. The file
+        # existing is what makes that a stated condition rather than a thing
+        # somebody was supposed to remember at review time.
+        text = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+        self.assertIn("CLA", text)
+        self.assertIn("cannot be merged", text)
+
+    def test_one_author(self) -> None:
+        # Sole ownership is what keeps the dual-licence available, so the
+        # history has to show one person rather than two addresses a reader has
+        # to reconcile. .mailmap is what makes that true; this asserts it is.
+        if not _in_a_git_checkout():
+            self.skipTest("not a git checkout")
+        import subprocess
+
+        out = subprocess.run(
+            ["git", "log", "--use-mailmap", "--format=%aN <%aE>"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        authors = sorted(set(line for line in out.splitlines() if line.strip()))
+        self.assertEqual(
+            1, len(authors), f"history shows more than one author: {authors}"
+        )
