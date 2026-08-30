@@ -167,13 +167,13 @@ class TestShares(CliTestCase):
 class TestConnections(CliTestCase):
     def test_add_list_remove(self) -> None:
         code, out, _ = self.run_cli(
-            "connection", "add", "rivendell.local", "Media", "/mnt/nas"
+            "connection", "add", "nas.local", "Media", "/mnt/nas"
         )
         self.assertEqual(code, EXIT_OK)
-        self.assertIn("//rivendell.local/Media -> /mnt/nas", out)
+        self.assertIn("//nas.local/Media -> /mnt/nas", out)
 
         _, out, _ = self.run_cli("connection", "list")
-        self.assertIn("rivendell.local", out)
+        self.assertIn("nas.local", out)
 
         code, _, _ = self.run_cli("connection", "remove", "/mnt/nas")
         self.assertEqual(code, EXIT_OK)
@@ -182,7 +182,7 @@ class TestConnections(CliTestCase):
         # The whole path: an omitted positional must not become a resolved
         # path from the CLI's working directory on the way to the daemon.
         code, out, _ = self.run_cli(
-            "connection", "add", "rivendell.local", "Media", "--owner", "pi"
+            "connection", "add", "nas.local", "Media", "--owner", "pi"
         )
         self.assertEqual(code, EXIT_OK)
         self.assertIn("-> /media/pi/Media", out)
@@ -191,7 +191,7 @@ class TestConnections(CliTestCase):
         )
 
     def test_a_given_mountpoint_is_still_used(self) -> None:
-        self.run_cli("connection", "add", "rivendell.local", "Media", "/srv/backups")
+        self.run_cli("connection", "add", "nas.local", "Media", "/srv/backups")
         self.assertEqual(
             self.store.load()["connections"][0]["mountpoint"], "/srv/backups"
         )
@@ -263,7 +263,7 @@ class TestBrowse(CliTestCase):
         code, out, _ = self.run_cli("browse")
         self.assertEqual(code, EXIT_OK)
         self.assertIn("RASPBERRYPI", out)
-        self.assertIn("192.168.0.210", out)
+        self.assertIn("192.0.2.210", out)
         self.assertNotIn("127.0.0.1", out)
         self.assertEqual(out.count("RASPBERRYPI"), 1)
 
@@ -318,11 +318,11 @@ class TestUnaccounted(CliTestCase):
         self.mountinfo = root / "mountinfo"
         self.mountinfo.write_text(
             f"83 36 0:44 / {self.mountpoint} rw,relatime shared:45 - cifs "
-            "//rivendell.local/Media rw,vers=3.1.1\n",
+            "//nas.local/Media rw,vers=3.1.1\n",
             encoding="utf-8",
         )
         (self.unit_dir / "mnt-smbpal.mount").write_text(
-            f"{MARKER}rivendell-local-media. Do not edit.\n"
+            f"{MARKER}nas-local-media. Do not edit.\n"
             f"[Mount]\nWhere={self.mountpoint}\n",
             encoding="utf-8",
         )
@@ -342,12 +342,12 @@ class TestUnaccounted(CliTestCase):
         self.assertIn("no connections configured", out)
         self.assertIn("Not in the config (1)", out)
         self.assertIn(self.mountpoint, out)
-        self.assertIn("rivendell-local-media", out)
+        self.assertIn("nas-local-media", out)
 
     def test_connection_live_lists_it(self) -> None:
         code, out, _ = self.run_cli("connection", "live")
         self.assertEqual(code, EXIT_OK)
-        self.assertIn("//rivendell.local/Media", out)
+        self.assertIn("//nas.local/Media", out)
 
     def test_connection_live_is_quiet_when_there_is_nothing(self) -> None:
         self.mountinfo.write_text("", encoding="utf-8")
@@ -393,7 +393,7 @@ class TestUnaccounted(CliTestCase):
 
     def test_a_configured_connection_is_not_reported_as_unaccounted(self) -> None:
         self.run_cli(
-            "connection", "add", "rivendell.local", "Media", self.mountpoint
+            "connection", "add", "nas.local", "Media", self.mountpoint
         )
         _, out, _ = self.run_cli("status")
         self.assertNotIn("Not in the config", out)

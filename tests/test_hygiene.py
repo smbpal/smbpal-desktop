@@ -113,27 +113,107 @@ class TestNoPrivateNamesReachAUser(unittest.TestCase):
 
     So this checks string *literals* only — the things that can be printed,
     logged, or drawn.
+
+    **Widened to `tests/` on 30 August 2026, the day the repository went
+    public.** The original scanned `smbpal/` alone, and the exemption was
+    written for a real reason — this file has to name what it forbids — but it
+    was taken by excusing the whole tree rather than the one file, so the
+    fixtures went unguarded. That is where captured data actually lands, and a
+    real `avahi-browse` capture had been sitting in `test_discovery.py` since
+    M2: a live hostname against a live address, which §11.3 names explicitly on
+    the list of things never to commit. The guard was pointed at the half that
+    was never the risk. Now the exemption is this file, by path.
     """
 
     # Not secret; the git history is full of it and that was decided to be
-    # fine. The rule is about what reaches a screen.
+    # fine. The rule is about what reaches a screen — and, since publication,
+    # about what a stranger reads in a fixture.
     PRIVATE = ("rivendell",)
 
-    def test_no_string_literal_in_the_package_names_a_private_machine(self) -> None:
-        for path in sorted((ROOT / "smbpal").rglob("*.py")):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
-                    continue
-                if _is_docstring(tree, node):
-                    continue
-                for name in self.PRIVATE:
+    # Where a test may say an address. Everything else is refused, which is a
+    # wider net than banning RFC1918: a fixture must not name an address that
+    # could belong to a real machine anywhere, and a public one is worse than a
+    # private one, not better.
+    #
+    # RFC 5737 and RFC 3849 exist for exactly this and are guaranteed never to
+    # be routed. Loopback and link-local are here because two discovery tests
+    # are *about* them — 127.0.0.1 must be dropped from a browse result, and an
+    # fe80:: address must be suppressed — so the addresses are the subject of
+    # those tests rather than set dressing.
+    ADDRESSES_ALLOWED_IN_A_FIXTURE = (
+        "192.0.2.0/24",       # RFC 5737 TEST-NET-1
+        "198.51.100.0/24",    # RFC 5737 TEST-NET-2
+        "203.0.113.0/24",     # RFC 5737 TEST-NET-3
+        "2001:db8::/32",      # RFC 3849 documentation
+        "127.0.0.0/8",
+        "::1/128",
+        "169.254.0.0/16",
+        "fe80::/10",
+    )
+
+    # Deliberately not applied to `smbpal/`, which reads backwards until you
+    # see the one literal it would catch: the Connect dialog suggests
+    # "nas.local  or  192.168.1.10", and 192.168.1.10 is the right thing to put
+    # in front of a user precisely because it looks like their own network.
+    # 192.0.2.10 would be correct and useless. The rule is about fixtures.
+    SCANNED = "tests"
+
+    def _literals(self, path: Path):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            if _is_docstring(tree, node):
+                continue
+            yield node
+
+    def _files(self, directory: str):
+        for path in sorted((ROOT / directory).rglob("*.py")):
+            # The one exemption, and it is one file rather than one tree: the
+            # checker has to be able to spell what it refuses.
+            if path.resolve() == Path(__file__).resolve():
+                continue
+            yield path
+
+    def test_no_string_literal_names_a_private_machine(self) -> None:
+        for directory in ("smbpal", self.SCANNED):
+            for path in self._files(directory):
+                for node in self._literals(path):
+                    for name in self.PRIVATE:
+                        with self.subTest(file=path.name, line=node.lineno):
+                            self.assertNotIn(
+                                name,
+                                node.value.lower(),
+                                f"{path.relative_to(ROOT)}:{node.lineno} puts a real "
+                                f"machine name somewhere a user could see it",
+                            )
+
+    def test_no_fixture_names_an_address_a_real_machine_could_have(self) -> None:
+        import ipaddress
+        import re
+
+        allowed = [
+            ipaddress.ip_network(n) for n in self.ADDRESSES_ALLOWED_IN_A_FIXTURE
+        ]
+        # Four dotted octets, or something with two colons in it. Loose on
+        # purpose — anything that does not parse is not an address and is
+        # dropped, so the cost of over-matching is nil and the cost of
+        # under-matching is a real address nobody notices.
+        candidates = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b|[0-9a-fA-F:]*:[0-9a-fA-F:]+")
+        for path in self._files(self.SCANNED):
+            for node in self._literals(path):
+                for text in candidates.findall(node.value):
+                    try:
+                        address = ipaddress.ip_address(text)
+                    except ValueError:
+                        continue
                     with self.subTest(file=path.name, line=node.lineno):
-                        self.assertNotIn(
-                            name,
-                            node.value.lower(),
-                            f"{path.relative_to(ROOT)}:{node.lineno} puts a real "
-                            f"machine name somewhere a user could see it",
+                        self.assertTrue(
+                            any(address in network for network in allowed),
+                            f"{path.relative_to(ROOT)}:{node.lineno} uses {text}, "
+                            f"which a real machine could hold. Fixtures use the "
+                            f"documentation ranges: 192.0.2.x, 198.51.100.x, "
+                            f"203.0.113.x, 2001:db8::x",
                         )
 
 

@@ -91,7 +91,7 @@ class TestAgainstARealDaemon(DaemonTestCase):
                     {
                         "type": "os",
                         "id": "media",
-                        "host": "rivendell.local",
+                        "host": "nas.local",
                         "share": "Media",
                         "mountpoint": "/media/pi/Media",
                         "auto_connect": "always",
@@ -106,7 +106,7 @@ class TestAgainstARealDaemon(DaemonTestCase):
         self.main.pump()
 
         self.assertEqual(len(seen), 1)
-        self.assertEqual(seen[0].connections[0].title, "//rivendell.local/Media")
+        self.assertEqual(seen[0].connections[0].title, "//nas.local/Media")
 
     def test_an_error_is_reported_and_the_session_keeps_working(self) -> None:
         errors: list[SmbpalError] = []

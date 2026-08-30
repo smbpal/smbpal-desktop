@@ -369,7 +369,7 @@ class TestApplyDoesBothHalves(ApplyTestCase):
         self.store = ConfigStore(self.root / "config.json")
         doc, self.connection = ops.add_connection(
             empty_config(),
-            host="rivendell.local",
+            host="nas.local",
             share="Media",
             mountpoint=str(self.root / "mnt" / "nas"),
         )
@@ -468,7 +468,7 @@ class TestTeardownIsReachable(ApplyTestCase):
     def test_it_takes_the_generated_file_and_the_units(self) -> None:
         doc, _ = ops.add_connection(
             self.config_with_share(),
-            host="rivendell.local",
+            host="nas.local",
             share="Media",
             mountpoint=str(self.root / "mnt" / "nas"),
         )

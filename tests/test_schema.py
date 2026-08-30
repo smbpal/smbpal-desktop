@@ -26,7 +26,7 @@ def _connection(**overrides: object) -> dict[str, object]:
     connection = {
         "type": "os",
         "id": "nas",
-        "host": "rivendell.local",
+        "host": "nas.local",
         "share": "Media",
         "mountpoint": "/mnt/nas",
         "credential_ref": "nas-creds",

@@ -64,7 +64,7 @@ class TestUnitContent(unittest.TestCase):
     def setUp(self) -> None:
         self.connection = {
             "id": "nas",
-            "host": "rivendell.local",
+            "host": "nas.local",
             "share": "Media",
             "mountpoint": "/mnt/nas",
             "auto_connect": "on_this_network",
@@ -85,7 +85,7 @@ class TestUnitContent(unittest.TestCase):
 
     def test_the_mount_names_the_remote_and_the_mountpoint(self) -> None:
         text = units.mount_unit(self.connection, "/etc/smbpal/credentials/nas")
-        self.assertIn("What=//rivendell.local/Media", text)
+        self.assertIn("What=//nas.local/Media", text)
         self.assertIn("Where=/mnt/nas", text)
         self.assertIn("Type=cifs", text)
 
@@ -181,7 +181,7 @@ class TestProbeNeverBlocks(unittest.TestCase):
         )
         self.real = (
             "83 36 0:44 / /mnt/nas rw,relatime shared:45 - cifs "
-            "//rivendell.local/Media rw,vers=3.1.1,uid=1000,forceuid\n"
+            "//nas.local/Media rw,vers=3.1.1,uid=1000,forceuid\n"
         )
         self.mountinfo.write_text(self.armed + self.real, encoding="utf-8")
 
@@ -192,7 +192,7 @@ class TestProbeNeverBlocks(unittest.TestCase):
         entry = probe.occupant("/mnt/nas")
         assert entry is not None
         self.assertEqual(entry.fstype, "cifs")
-        self.assertEqual(entry.source, "//rivendell.local/Media")
+        self.assertEqual(entry.source, "//nas.local/Media")
 
     def test_an_armed_automount_alone_has_no_occupant(self) -> None:
         # Nothing is mounted yet, so there is nothing to be hidden by mounting.
@@ -223,7 +223,7 @@ class TestProbeNeverBlocks(unittest.TestCase):
         self.mountinfo.write_text(
             self.armed
             + "83 36 0:44 / /mnt/nas ro,relatime shared:45 - cifs "
-            "//rivendell.local/Media ro,vers=3.1.1,uid=1000,forceuid\n",
+            "//nas.local/Media ro,vers=3.1.1,uid=1000,forceuid\n",
             encoding="utf-8",
         )
         probe = probe_module.MountProbe(mountinfo=self.mountinfo)
@@ -337,7 +337,7 @@ class TestProbeNeverBlocks(unittest.TestCase):
         entries = probe_module.mount_entries(self.mountinfo)
         self.assertEqual(
             [(e.fstype, e.source) for e in entries],
-            [("autofs", "systemd-1"), ("cifs", "//rivendell.local/Media")],
+            [("autofs", "systemd-1"), ("cifs", "//nas.local/Media")],
         )
 
     def test_a_line_with_no_separator_is_skipped_rather_than_misread(self) -> None:
@@ -366,7 +366,7 @@ class TestMounter(unittest.TestCase):
         mountpoint = kw.pop("mountpoint", str(self.root / "mnt" / "nas"))
         doc, _ = ops.add_connection(
             empty_config(),
-            host=kw.pop("host", "rivendell.local"),
+            host=kw.pop("host", "nas.local"),
             share=kw.pop("share", "Media"),
             mountpoint=mountpoint,
             **kw,
@@ -496,7 +496,7 @@ class TestMounter(unittest.TestCase):
         self.occupy(
             mountpoint,
             f"83 36 0:44 / {mountpoint} rw,relatime shared:45 - cifs "
-            "//rivendell.local/Media rw,vers=3.1.1\n",
+            "//nas.local/Media rw,vers=3.1.1\n",
         )
         self.mounter.apply(config)
         self.assertEqual(len(list(self.unit_dir.iterdir())), 2)
@@ -513,7 +513,7 @@ class TestMounter(unittest.TestCase):
         self.occupy(
             mountpoint,
             f"83 36 0:44 / {mountpoint} rw,relatime shared:45 - cifs "
-            "//rivendell.local/Media rw,vers=3.1.1\n",
+            "//nas.local/Media rw,vers=3.1.1\n",
         )
         self.mounter.apply(empty_config())
         kept = [p.name for p in self.unit_dir.iterdir()]
@@ -597,7 +597,7 @@ class TestForeignMountDetection(unittest.TestCase):
 
     connection = {
         "id": "nas",
-        "host": "rivendell.local",
+        "host": "nas.local",
         "share": "Media",
         "mountpoint": "/media/pi/Media",
     }
@@ -608,21 +608,21 @@ class TestForeignMountDetection(unittest.TestCase):
         )
 
     def test_our_own_share_is_not_foreign(self) -> None:
-        entry = self.entry("cifs", "//rivendell.local/Media")
+        entry = self.entry("cifs", "//nas.local/Media")
         self.assertIsNone(foreign_mount(entry, self.connection))
 
     def test_the_case_of_the_host_does_not_matter(self) -> None:
         # SMB hostnames are case-insensitive and the kernel echoes back what it
         # was given, so a unit written from a differently-cased name still
         # describes the same mount.
-        entry = self.entry("cifs", "//Rivendell.local/media")
+        entry = self.entry("cifs", "//Nas.local/media")
         self.assertIsNone(foreign_mount(entry, self.connection))
 
     def test_the_fallback_address_is_still_this_share(self) -> None:
         # `connection use-fallback` swaps host and fallback_host, so straight
         # after a swap the mount that is up was made under the other name.
-        connection = {**self.connection, "fallback_host": "192.168.0.52"}
-        entry = self.entry("cifs", "//192.168.0.52/Media")
+        connection = {**self.connection, "fallback_host": "192.0.2.52"}
+        entry = self.entry("cifs", "//192.0.2.52/Media")
         self.assertIsNone(foreign_mount(entry, connection))
 
     def test_a_usb_stick_is_foreign(self) -> None:
@@ -630,7 +630,7 @@ class TestForeignMountDetection(unittest.TestCase):
         self.assertIs(foreign_mount(entry, self.connection), entry)
 
     def test_another_share_on_the_same_path_is_foreign(self) -> None:
-        entry = self.entry("cifs", "//rivendell.local/Backups")
+        entry = self.entry("cifs", "//nas.local/Backups")
         self.assertIs(foreign_mount(entry, self.connection), entry)
 
     def test_nothing_mounted_is_not_foreign(self) -> None:
@@ -677,14 +677,14 @@ class TestInventory(unittest.TestCase):
 
     def test_a_configured_connection_is_not_reported(self) -> None:
         self.write_unit("mnt-nas.mount", "/mnt/nas", "nas")
-        self.mount("/mnt/nas", "//rivendell.local/Media")
+        self.mount("/mnt/nas", "//nas.local/Media")
         self.assertEqual(self.survey(self.config("/mnt/nas")), [])
 
     def test_our_unit_with_no_config_entry_is_an_orphan(self) -> None:
         # The Pi case: connection gone from the config, automount still
         # enabled, share still mounting on access.
         self.write_unit("mnt-nas.mount", "/mnt/nas", "nas")
-        self.mount("/mnt/nas", "//rivendell.local/Media")
+        self.mount("/mnt/nas", "//nas.local/Media")
         finding = self.survey(self.config())[0]
         self.assertEqual(finding.kind, inventory.ORPHANED)
         self.assertEqual(finding.connection_id, "nas")
@@ -709,7 +709,7 @@ class TestInventory(unittest.TestCase):
 
     def test_an_orphan_is_not_also_counted_as_unmanaged(self) -> None:
         self.write_unit("mnt-nas.mount", "/mnt/nas", "nas")
-        self.mount("/mnt/nas", "//rivendell.local/Media")
+        self.mount("/mnt/nas", "//nas.local/Media")
         findings = self.survey(self.config())
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0].kind, inventory.ORPHANED)

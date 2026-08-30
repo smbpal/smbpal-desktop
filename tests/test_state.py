@@ -37,7 +37,7 @@ mount error(13): Permission denied
 Refer to the mount.cifs(8) manual page (e.g. man mount.cifs) and kernel log messages (dmesg)
 mnt-smbpal\\x2dtest.mount: Mount process exited, code=exited, status=32/n/a
 mnt-smbpal\\x2dtest.mount: Failed with result 'exit-code'.
-Failed to mount mnt-smbpal\\x2dtest.mount - SMBPal mount of //rivendell.local/Media.
+Failed to mount mnt-smbpal\\x2dtest.mount - SMBPal mount of //nas.local/Media.
 mnt-smbpal\\x2dtest.mount: Start request repeated too quickly.
 mnt-smbpal\\x2dtest.mount: Failed with result 'exit-code'.
 """
@@ -70,7 +70,7 @@ class TestTranslate(unittest.TestCase):
 
     def test_a_resolution_failure_has_no_errno_and_is_recognised_anyway(self) -> None:
         cause = translate.translate_journal(
-            "mount error: could not resolve address for rivendell.local: Unknown error"
+            "mount error: could not resolve address for nas.local: Unknown error"
         )
         self.assertEqual(cause.state, "unresolved")
         self.assertIsNone(cause.errno)
@@ -285,10 +285,10 @@ class MonitorTestCase(unittest.TestCase):
         self.store = ConfigStore(self.root / "config.json")
         doc, self.connection = ops.add_connection(
             empty_config(),
-            host="rivendell.local",
+            host="nas.local",
             share="Media",
             mountpoint="/mnt/nas",
-            fallback_host="192.168.0.52",
+            fallback_host="192.0.2.52",
         )
         self.store.save(doc)
         self.events: list[tuple[str, dict]] = []
@@ -388,7 +388,7 @@ class TestAnOccupiedMountpoint(MonitorTestCase):
         self.mountinfo.write_text(
             self.armed
             + "83 36 0:44 / /mnt/nas rw,relatime shared:45 - cifs "
-            "//rivendell.local/Media rw,vers=3.1.1\n",
+            "//nas.local/Media rw,vers=3.1.1\n",
             encoding="utf-8",
         )
         self.monitor.poll()
@@ -399,7 +399,7 @@ class TestFallbackHint(MonitorTestCase):
     def test_the_recorded_address_is_offered_only_when_the_name_fails(self) -> None:
         unresolved = machine.ConnectionState("x", machine.UNRESOLVED, "no")
         hint = fallback_hint(self.connection, unresolved)
-        self.assertIn("192.168.0.52", hint)
+        self.assertIn("192.0.2.52", hint)
         self.assertIn("use-fallback", hint)
 
     def test_it_is_never_offered_for_an_unrelated_failure(self) -> None:
@@ -514,7 +514,7 @@ class TestClearingALatchedUnit(MonitorTestCase):
 
         mountpoint = str(self.root / "mnt" / "nas")
         doc, self.connection = ops.add_connection(
-            empty_config(), host="rivendell.local", share="Media",
+            empty_config(), host="nas.local", share="Media",
             mountpoint=mountpoint,
         )
         self.store.save(doc)
@@ -582,13 +582,13 @@ class TestReadingWhetherTheServerIsAnswering(unittest.TestCase):
     def test_a_good_server_and_a_gone_one(self) -> None:
         states = self.parse(
             "Servers:\n"
-            "1) ConnectionId: 0x1 Hostname: rivendell.local\n"
+            "1) ConnectionId: 0x1 Hostname: nas.local\n"
             "Number of credits: 8190 Dialect 0x311 TCP status: 1 Instance: 1\n"
             "\n"
             "2) ConnectionId: 0x2 Hostname: moria.local\n"
             "TCP status: 3 Instance: 2\n"
         )
-        self.assertEqual(states, {"rivendell.local": True, "moria.local": False})
+        self.assertEqual(states, {"nas.local": True, "moria.local": False})
 
     def test_the_status_may_share_a_line_with_anything_else(self) -> None:
         """Which it does on current kernels, and did not on older ones."""
@@ -627,7 +627,7 @@ class TestAMountedShareWhoseServerHasGone(unittest.TestCase):
 
     def state(self, **kw):
         return derive(
-            {"id": "nas", "host": "rivendell.local", "mountpoint": "/mnt/nas"},
+            {"id": "nas", "host": "nas.local", "mountpoint": "/mnt/nas"},
             mounted=True,
             unit={"ActiveState": "active", "Result": "success"},
             **kw,
@@ -666,14 +666,14 @@ class TestTheMonitorAsksTheKernel(MonitorTestCase):
         self.mountinfo.write_text(
             self.armed
             + "37 25 0:32 / /mnt/nas rw,relatime shared:23 - cifs "
-            "//rivendell.local/Media rw,vers=3.1.1\n",
+            "//nas.local/Media rw,vers=3.1.1\n",
             encoding="utf-8",
         )
 
     def test_a_mounted_share_with_its_server_gone_is_reported_unreachable(self) -> None:
         self.mount_it()
         self.debug_data.write_text(
-            "Hostname: rivendell.local\nTCP status: 3 Instance: 1\n", encoding="utf-8"
+            "Hostname: nas.local\nTCP status: 3 Instance: 1\n", encoding="utf-8"
         )
         state = self.monitor.poll()[0]
         self.assertEqual(state.state, machine.UNREACHABLE)
@@ -681,7 +681,7 @@ class TestTheMonitorAsksTheKernel(MonitorTestCase):
     def test_the_same_share_with_its_server_answering_is_connected(self) -> None:
         self.mount_it()
         self.debug_data.write_text(
-            "Hostname: rivendell.local\nTCP status: 1 Instance: 1\n", encoding="utf-8"
+            "Hostname: nas.local\nTCP status: 1 Instance: 1\n", encoding="utf-8"
         )
         self.assertEqual(self.monitor.poll()[0].state, machine.CONNECTED)
 
@@ -694,7 +694,7 @@ class TestTheMonitorAsksTheKernel(MonitorTestCase):
     def test_an_unmounted_connection_does_not_ask_at_all(self) -> None:
         """Nothing is mounted, so a server's state cannot say anything useful."""
         self.debug_data.write_text(
-            "Hostname: rivendell.local\nTCP status: 3\n", encoding="utf-8"
+            "Hostname: nas.local\nTCP status: 3\n", encoding="utf-8"
         )
         self.assertEqual(self.monitor.poll()[0].state, machine.IDLE)
 
@@ -702,13 +702,13 @@ class TestTheMonitorAsksTheKernel(MonitorTestCase):
         """The tray's whole justification: nobody asked, and it still arrives."""
         self.mount_it()
         self.debug_data.write_text(
-            "Hostname: rivendell.local\nTCP status: 1\n", encoding="utf-8"
+            "Hostname: nas.local\nTCP status: 1\n", encoding="utf-8"
         )
         self.monitor.poll()
         self.events.clear()
 
         self.debug_data.write_text(
-            "Hostname: rivendell.local\nTCP status: 3\n", encoding="utf-8"
+            "Hostname: nas.local\nTCP status: 3\n", encoding="utf-8"
         )
         self.monitor.poll()
         pushed = [data for event, data in self.events if event == "state.changed"]

@@ -244,7 +244,13 @@ class AddConnectionDialog(_Form):
         self._found_frame.set_child(self._found)
         self.fields.append(self._found_frame)
 
-        self._share = Gtk.Entry(placeholder_text="Media")
+        # "Backup" rather than "Media", which the Add Share dialog above already
+        # suggests. Two placeholders reading the same word makes the second look
+        # like an echo of the first, when the two fields mean opposite things:
+        # there you are naming a share you are creating, here you are recalling
+        # one somebody else already named. Same rule as the server field above —
+        # a plausible suggestion, never a real machine from anybody's network.
+        self._share = Gtk.Entry(placeholder_text="Backup")
         self.labelled(
             "Share name on that server",
             self._share,

@@ -9,13 +9,13 @@ from smbpal.errors import Unavailable
 
 # Verbatim from M0's avahi-smb-service.txt, the capture that closed §5.
 M0_CAPTURE = """\
-+;wlan0;IPv4;RIVENDELL;Microsoft Windows Network;local
-=;wlan0;IPv4;RIVENDELL;Microsoft Windows Network;local;RIVENDELL.local;192.168.0.52;445;
++;wlan0;IPv4;NAS;Microsoft Windows Network;local
+=;wlan0;IPv4;NAS;Microsoft Windows Network;local;NAS.local;192.0.2.52;445;
 +;wlan0;IPv6;RASPBERRYPI;Microsoft Windows Network;local
 +;wlan0;IPv4;RASPBERRYPI;Microsoft Windows Network;local
 +;lo;IPv4;RASPBERRYPI;Microsoft Windows Network;local
 =;wlan0;IPv6;RASPBERRYPI;Microsoft Windows Network;local;raspberrypi.local;fe80::1edb:1129:123b:6c0;445;
-=;wlan0;IPv4;RASPBERRYPI;Microsoft Windows Network;local;raspberrypi.local;192.168.0.210;445;
+=;wlan0;IPv4;RASPBERRYPI;Microsoft Windows Network;local;raspberrypi.local;192.0.2.210;445;
 =;lo;IPv4;RASPBERRYPI;Microsoft Windows Network;local;raspberrypi.local;127.0.0.1;445;
 """
 
@@ -28,21 +28,21 @@ class TestParse(unittest.TestCase):
 
     def test_fields_land_in_the_right_places(self) -> None:
         service = parse(M0_CAPTURE)[0]
-        self.assertEqual(service.name, "RIVENDELL")
-        self.assertEqual(service.hostname, "RIVENDELL.local")
-        self.assertEqual(service.address, "192.168.0.52")
+        self.assertEqual(service.name, "NAS")
+        self.assertEqual(service.hostname, "NAS.local")
+        self.assertEqual(service.address, "192.0.2.52")
 
     def test_a_semicolon_in_a_name_does_not_shift_every_later_field(self) -> None:
         # avahi escapes rather than quotes, so a naive split(';') would tear the
         # name in half and misread the address as the domain.
-        line = r"=;wlan0;IPv4;we\;ird;_smb._tcp;local;host.local;10.0.0.5;445;"
+        line = r"=;wlan0;IPv4;we\;ird;_smb._tcp;local;host.local;192.0.2.5;445;"
         service = parse(line)[0]
         self.assertEqual(service.name, "we;ird")
-        self.assertEqual(service.address, "10.0.0.5")
+        self.assertEqual(service.address, "192.0.2.5")
 
     def test_decimal_escapes_are_decoded(self) -> None:
-        line = "=;en0;IPv4;Luke\\039s\\032Mac;_smb._tcp;local;mac.local;10.0.0.6;445;"
-        self.assertEqual(parse(line)[0].name, "Luke's Mac")
+        line = "=;en0;IPv4;Ada\\039s\\032Mac;_smb._tcp;local;mac.local;192.0.2.6;445;"
+        self.assertEqual(parse(line)[0].name, "Ada's Mac")
 
     def test_a_malformed_line_is_skipped_not_fatal(self) -> None:
         self.assertEqual(parse("=;too;few;fields\n=;a;b;c;d;e;f;g;notaport;"), [])
@@ -53,7 +53,9 @@ class TestMergeRules(unittest.TestCase):
         self.machines = merge(parse(M0_CAPTURE))
 
     def test_one_row_per_machine(self) -> None:
-        self.assertEqual([m.name for m in self.machines], ["RASPBERRYPI", "RIVENDELL"])
+        # Sorted by name, so renaming the fixture host reorders this. It used
+        # to read RASPBERRYPI, RIVENDELL for the same reason.
+        self.assertEqual([m.name for m in self.machines], ["NAS", "RASPBERRYPI"])
 
     def test_loopback_is_dropped(self) -> None:
         # Offering to mount your own share as a remote is nonsense.
@@ -66,20 +68,20 @@ class TestMergeRules(unittest.TestCase):
 
     def test_the_surviving_addresses_are_the_usable_ones(self) -> None:
         pi = next(m for m in self.machines if m.name == "RASPBERRYPI")
-        self.assertEqual(pi.addresses, ["192.168.0.210"])
+        self.assertEqual(pi.addresses, ["192.0.2.210"])
         self.assertEqual(pi.hostname, "raspberrypi.local")
 
     def test_ipv4_sorts_before_ipv6(self) -> None:
         capture = (
             "=;en0;IPv6;HOST;_smb._tcp;local;h.local;2001:db8::1;445;\n"
-            "=;en0;IPv4;HOST;_smb._tcp;local;h.local;10.0.0.9;445;\n"
+            "=;en0;IPv4;HOST;_smb._tcp;local;h.local;192.0.2.9;445;\n"
         )
-        self.assertEqual(merge(parse(capture))[0].addresses, ["10.0.0.9", "2001:db8::1"])
+        self.assertEqual(merge(parse(capture))[0].addresses, ["192.0.2.9", "2001:db8::1"])
 
 
 class TestSmbpalJoin(unittest.TestCase):
-    SMB = "=;wlan0;IPv4;RASPBERRYPI;_smb._tcp;local;raspberrypi.local;192.168.0.210;445;"
-    SMBPAL = "=;wlan0;IPv4;raspberrypi;_smbpal._tcp;local;raspberrypi.local;192.168.0.210;445;v=1"
+    SMB = "=;wlan0;IPv4;RASPBERRYPI;_smb._tcp;local;raspberrypi.local;192.0.2.210;445;"
+    SMBPAL = "=;wlan0;IPv4;raspberrypi;_smbpal._tcp;local;raspberrypi.local;192.0.2.210;445;v=1"
 
     def test_the_join_is_on_hostname_not_instance_name(self) -> None:
         # §3f: Samba's instance is the NetBIOS name uppercased (RASPBERRYPI)
@@ -116,13 +118,13 @@ class TestDiscover(unittest.TestCase):
         self.assertEqual(len(machines), 2)
 
     def test_a_wire_row_carries_names_and_addresses_apart(self) -> None:
-        machine = Machine(name="PI", hostname="pi.local", addresses=["10.0.0.1"])
+        machine = Machine(name="PI", hostname="pi.local", addresses=["192.0.2.1"])
         self.assertEqual(
             machine.to_wire(),
             {
                 "name": "PI",
                 "hostname": "pi.local",
-                "addresses": ["10.0.0.1"],
+                "addresses": ["192.0.2.1"],
                 "port": 445,
                 "running_smbpal": False,
             },

@@ -87,11 +87,11 @@ class TestConnections(unittest.TestCase):
     def test_add_derives_an_id_from_host_and_share(self) -> None:
         _, connection = ops.add_connection(
             empty_config(),
-            host="rivendell.local",
+            host="nas.local",
             share="Media",
             mountpoint="/mnt/nas",
         )
-        self.assertEqual(connection["id"], "rivendell-local-media")
+        self.assertEqual(connection["id"], "nas-local-media")
 
     def test_two_connections_on_one_mountpoint_are_refused(self) -> None:
         doc, _ = ops.add_connection(
@@ -121,12 +121,12 @@ class TestIdsAreSharedAcrossKinds(unittest.TestCase):
         # Ids are a single namespace across shares and connections, so deriving
         # one has to consider both or the save would fail validation.
         doc, _ = ops.add_share(
-            empty_config(), name="X", path="/srv/x", id="rivendell-local-media"
+            empty_config(), name="X", path="/srv/x", id="nas-local-media"
         )
         _, connection = ops.add_connection(
-            doc, host="rivendell.local", share="Media", mountpoint="/mnt/nas"
+            doc, host="nas.local", share="Media", mountpoint="/mnt/nas"
         )
-        self.assertEqual(connection["id"], "rivendell-local-media-2")
+        self.assertEqual(connection["id"], "nas-local-media-2")
 
 
 class TestDerivedMountpoints(unittest.TestCase):
@@ -166,20 +166,20 @@ class TestDerivedMountpoints(unittest.TestCase):
             "Media",
             "pi",
             {"/media/pi/Media"},
-            host="rivendell.local",
+            host="nas.local",
             style=self.LINUX,
         )
-        self.assertEqual(path, "/media/pi/Media on rivendell.local")
+        self.assertEqual(path, "/media/pi/Media on nas.local")
 
     def test_a_second_collision_falls_back_to_a_number(self) -> None:
         path = ops.default_mountpoint(
             "Media",
             "pi",
-            {"/media/pi/Media", "/media/pi/Media on rivendell.local"},
-            host="rivendell.local",
+            {"/media/pi/Media", "/media/pi/Media on nas.local"},
+            host="nas.local",
             style=self.LINUX,
         )
-        self.assertEqual(path, "/media/pi/Media on rivendell.local 2")
+        self.assertEqual(path, "/media/pi/Media on nas.local 2")
 
     def test_a_leading_dot_is_stripped_because_it_would_hide_the_mount(self) -> None:
         # GIO hides any mount whose path contains "/." — deriving
@@ -219,7 +219,7 @@ class TestDerivedMountpoints(unittest.TestCase):
         # Stored explicitly: a config whose mountpoint depends on which version
         # of the derivation last ran is not a record of anything.
         doc, connection = ops.add_connection(
-            empty_config(), host="rivendell.local", share="Media", owner="pi"
+            empty_config(), host="nas.local", share="Media", owner="pi"
         )
         self.assertEqual(connection["mountpoint"], "/media/pi/Media")
         self.assertEqual(doc["connections"][0]["mountpoint"], "/media/pi/Media")
@@ -232,21 +232,21 @@ class TestDerivedMountpoints(unittest.TestCase):
             "Media",
             "pi",
             {"/media/pi/Media"},
-            host="rivendell.local",
+            host="nas.local",
             style=self.LINUX,
         )
-        self.assertEqual(path, "/media/pi/Media on rivendell.local")
+        self.assertEqual(path, "/media/pi/Media on nas.local")
 
     def test_add_connection_avoids_a_mountpoint_in_use(self) -> None:
         _, connection = ops.add_connection(
             empty_config(),
-            host="rivendell.local",
+            host="nas.local",
             share="Media",
             owner="pi",
             in_use={"/media/pi/Media"},
         )
         self.assertEqual(
-            connection["mountpoint"], "/media/pi/Media on rivendell.local"
+            connection["mountpoint"], "/media/pi/Media on nas.local"
         )
 
     def test_an_explicit_mountpoint_is_not_second_guessed(self) -> None:
@@ -255,7 +255,7 @@ class TestDerivedMountpoints(unittest.TestCase):
         # would be a harsher answer to a more temporary fact.
         _, connection = ops.add_connection(
             empty_config(),
-            host="rivendell.local",
+            host="nas.local",
             share="Media",
             mountpoint="/media/pi/Media",
             owner="pi",
@@ -266,7 +266,7 @@ class TestDerivedMountpoints(unittest.TestCase):
     def test_an_explicit_mountpoint_still_wins(self) -> None:
         _, connection = ops.add_connection(
             empty_config(),
-            host="rivendell.local",
+            host="nas.local",
             share="Media",
             mountpoint="/srv/backups",
             owner="pi",
@@ -275,7 +275,7 @@ class TestDerivedMountpoints(unittest.TestCase):
 
     def test_two_connections_to_the_same_share_name_do_not_collide(self) -> None:
         doc, first = ops.add_connection(
-            empty_config(), host="rivendell.local", share="Media", owner="pi"
+            empty_config(), host="nas.local", share="Media", owner="pi"
         )
         _, second = ops.add_connection(
             doc, host="moria.local", share="Media", owner="pi"

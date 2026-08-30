@@ -20,7 +20,7 @@ class TestConnectionRows(unittest.TestCase):
     def row(self, **kw) -> model.Row:
         base = {
             "id": "nas",
-            "host": "rivendell.local",
+            "host": "nas.local",
             "share": "Media",
             "mountpoint": "/media/pi/Media",
             "state": "idle",
@@ -59,9 +59,9 @@ class TestConnectionRows(unittest.TestCase):
     def test_the_fallback_is_offered_only_when_unresolved(self) -> None:
         # §3e: recorded, offered, never taken on its own — the address may
         # since belong to a different machine.
-        unresolved = self.row(state="unresolved", fallback_host="192.168.0.52")
+        unresolved = self.row(state="unresolved", fallback_host="192.0.2.52")
         self.assertIn(model.USE_FALLBACK, unresolved.actions)
-        connected = self.row(state="connected", fallback_host="192.168.0.52")
+        connected = self.row(state="connected", fallback_host="192.0.2.52")
         self.assertNotIn(model.USE_FALLBACK, connected.actions)
 
     def test_no_fallback_recorded_means_no_offer(self) -> None:
@@ -220,7 +220,7 @@ class TestActionWiring(unittest.TestCase):
     def test_every_offered_action_has_a_method_and_a_label(self) -> None:
         """A button with no method behind it is a button that does nothing."""
         rows = [
-            model.connection_row({"id": "a", "state": state, "fallback_host": "10.0.0.5"})
+            model.connection_row({"id": "a", "state": state, "fallback_host": "192.0.2.5"})
             for state in _CONNECTION_STATES
         ] + [
             model.share_row({"id": "s", "name": "S", "read_only": True,
