@@ -19,6 +19,7 @@ introspection XML promises.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import unittest
 import xml.etree.ElementTree as ET
@@ -32,7 +33,19 @@ except ImportError:  # pragma: no cover - a machine without python3-gi
 
 if Gio is not None:
     from smbpal.gui import model
-    from smbpal.gui.tray import ICONS, INTROSPECTION, ITEM_INTERFACE, ITEM_PATH, Tray
+    from smbpal.gui.tray import (
+        ICONS,
+        INTROSPECTION,
+        ITEM_INTERFACE,
+        ITEM_PATH,
+        MENU_INTERFACE,
+        MENU_INTROSPECTION,
+        MENU_PATH,
+        QUIT_ID,
+        ROOT_ID,
+        SINGLETON_NAME,
+        Tray,
+    )
 
 
 class FakeSession:
@@ -391,3 +404,267 @@ class TestAnnouncingToAWatcherThatMayNotBeThereYet(unittest.TestCase):
         self.tray.register(self.connection)
         self.tray.watcher_appeared()
         self.assertEqual(len(self.connection.announcements), 1)
+
+
+# The in-arguments each dbusmenu method takes, so that "every method is
+# answered" can call all of them. A method that never returns leaves the panel
+# waiting on a D-Bus timeout with its menu half-open.
+MENU_CALLS = {
+    "GetLayout": GLib.Variant("(iias)", (0, -1, [])) if GLib else None,
+    "GetGroupProperties": GLib.Variant("(aias)", ([0, 1], [])) if GLib else None,
+    "GetProperty": GLib.Variant("(is)", (1, "label")) if GLib else None,
+    "Event": (
+        GLib.Variant("(isvu)", (1, "hovered", GLib.Variant("s", ""), 0))
+        if GLib
+        else None
+    ),
+    "EventGroup": GLib.Variant("(a(isvu))", ([],)) if GLib else None,
+    "AboutToShow": GLib.Variant("(i)", (0,)) if GLib else None,
+    "AboutToShowGroup": GLib.Variant("(ai)", ([0],)) if GLib else None,
+}
+
+
+@unittest.skipIf(Gio is None, "python3-gi is not installed")
+class TestTheMenusProperties(unittest.TestCase):
+    """The same shape as the item's property tests, for the same reason.
+
+    `_menu_property_read` is a second `GDBusInterfaceGetPropertyFunc` and takes
+    the same five arguments the item's does — the six-argument version is the
+    bug this whole file was written for, and adding an interface is exactly
+    where it would come back.
+    """
+
+    def setUp(self) -> None:
+        self.tray = Tray(FakeSession(), launch=["/bin/true"])
+        self.declared = Gio.DBusNodeInfo.new_for_xml(MENU_INTROSPECTION).interfaces[0]
+
+    def read(self, name: str) -> Any:
+        return self.tray._menu_property_read(
+            None, ":1.2", MENU_PATH, MENU_INTERFACE, name
+        )
+
+    def test_every_declared_property_answers(self) -> None:
+        for prop in self.declared.properties:
+            with self.subTest(property=prop.name):
+                self.assertIsNotNone(
+                    self.read(prop.name), f"{prop.name} is declared and unanswered"
+                )
+
+    def test_every_answer_matches_the_type_the_xml_promises(self) -> None:
+        for prop in self.declared.properties:
+            with self.subTest(property=prop.name):
+                self.assertEqual(self.read(prop.name).get_type_string(), prop.signature)
+
+    def test_a_property_nobody_declared_is_not_a_crash(self) -> None:
+        self.assertIsNone(self.read("NotAThing"))
+
+    def test_the_item_points_at_the_menu(self) -> None:
+        """Without `Menu` the panel has nothing to ask, and there is no menu."""
+        menu = self.tray._property_read(
+            None, ":1.2", ITEM_PATH, ITEM_INTERFACE, "Menu"
+        )
+        self.assertEqual(menu.get_string(), MENU_PATH)
+
+    def test_a_left_click_still_reaches_activate(self) -> None:
+        """`ItemIsMenu` true would make every click open the menu instead.
+
+        The menu is for the right click. Opening the window is what the icon is
+        mostly for, and it must survive the menu being added.
+        """
+        item_is_menu = self.tray._property_read(
+            None, ":1.2", ITEM_PATH, ITEM_INTERFACE, "ItemIsMenu"
+        )
+        self.assertFalse(item_is_menu.get_boolean())
+
+
+@unittest.skipIf(Gio is None, "python3-gi is not installed")
+class TestTheMenusLayout(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tray = Tray(FakeSession(), launch=["/bin/true"])
+        self.declared = Gio.DBusNodeInfo.new_for_xml(MENU_INTROSPECTION).interfaces[0]
+
+    def call(self, method: str, parameters: Any = None) -> FakeInvocation:
+        invocation = FakeInvocation()
+        self.tray._menu_method_called(
+            None,
+            ":1.2",
+            MENU_PATH,
+            MENU_INTERFACE,
+            method,
+            parameters if parameters is not None else MENU_CALLS[method],
+            invocation,
+        )
+        return invocation
+
+    def signature(self, method: str) -> str:
+        """The out-arguments the XML promises, as one tuple signature."""
+        info = next(m for m in self.declared.methods if m.name == method)
+        return "(" + "".join(a.signature for a in info.out_args) + ")"
+
+    def test_every_method_is_answered(self) -> None:
+        for method in MENU_CALLS:
+            with self.subTest(method=method):
+                self.assertEqual(len(self.call(method).returned), 1)
+
+    def test_every_answer_matches_the_type_the_xml_promises(self) -> None:
+        """A wrong signature is refused by the bus, not by Python.
+
+        The layout type is `(ia{sv}av)` and recursive, which PyGObject will not
+        let you assemble from finished variants — nesting a built one inside a
+        format string makes it descend into the variant instead of taking it
+        whole, and raises `TypeError: Expected GLib.Variant, but got str` from
+        four frames down in `overrides/GLib.py`. This is the test that says the
+        one construction that does work is still the one being used.
+        """
+        for method in MENU_CALLS:
+            with self.subTest(method=method):
+                returned = self.call(method).returned[0]
+                if returned is None:
+                    continue
+                self.assertEqual(returned.get_type_string(), self.signature(method))
+
+    def layout(self, parameters: Any = None) -> Any:
+        return self.call("GetLayout", parameters).returned[0].unpack()
+
+    def test_the_menu_holds_exactly_one_item_and_it_is_quit(self) -> None:
+        _revision, (item_id, _properties, children) = self.layout()
+        self.assertEqual(item_id, ROOT_ID)
+        self.assertEqual(len(children), 1)
+        child_id, properties, grandchildren = children[0]
+        self.assertEqual(child_id, QUIT_ID)
+        self.assertEqual(grandchildren, [])
+        self.assertIn("Quit", properties["label"])
+        self.assertTrue(properties["enabled"])
+        self.assertTrue(properties["visible"])
+
+    def test_the_root_says_it_has_a_submenu(self) -> None:
+        """Without `children-display` a panel draws the root and no children."""
+        _revision, (_id, properties, _children) = self.layout()
+        self.assertEqual(properties.get("children-display"), "submenu")
+
+    def test_asking_for_the_item_alone_gets_the_item(self) -> None:
+        _revision, (item_id, properties, children) = self.layout(
+            GLib.Variant("(iias)", (QUIT_ID, -1, []))
+        )
+        self.assertEqual(item_id, QUIT_ID)
+        self.assertEqual(children, [])
+        self.assertIn("label", properties)
+
+    def test_a_panel_that_asks_for_one_property_gets_one(self) -> None:
+        _revision, (_id, _properties, children) = self.layout(
+            GLib.Variant("(iias)", (0, -1, ["label"]))
+        )
+        self.assertEqual(list(children[0][1]), ["label"])
+
+    def test_group_properties_answers_for_every_id_asked(self) -> None:
+        answered = self.call("GetGroupProperties").returned[0].unpack()[0]
+        self.assertEqual([item_id for item_id, _p in answered], [ROOT_ID, QUIT_ID])
+
+    def test_a_property_nobody_has_is_an_empty_string_not_an_error(self) -> None:
+        """Panels ask for `icon-name` and `toggle-type` on every item.
+
+        Returning an error there is a menu that does not open. The C
+        implementation answers empty, so this does.
+        """
+        value = self.call(
+            "GetProperty", GLib.Variant("(is)", (QUIT_ID, "icon-name"))
+        ).returned[0]
+        self.assertEqual(value.unpack()[0], "")
+
+    def test_the_menu_never_needs_rebuilding_before_it_opens(self) -> None:
+        self.assertFalse(self.call("AboutToShow").returned[0].unpack()[0])
+
+
+@unittest.skipIf(Gio is None, "python3-gi is not installed")
+class TestStopping(unittest.TestCase):
+    """The tray had no way to be stopped from any interface SMBPal offered.
+
+    Raised on a Pi on 29 August 2026 — *"i can't stop the tray icon without a
+    terminal command"* — and `pkill` is not an answer for an end user, on a
+    system with no Startup Applications UI to disable the autostart entry from
+    either.
+    """
+
+    def setUp(self) -> None:
+        self.tray = Tray(FakeSession(), launch=["/bin/true"])
+        self.quits = 0
+
+        def quit() -> None:
+            self.quits += 1
+
+        self.tray.on_quit = quit
+
+    def event(self, item_id: int, name: str) -> None:
+        self.tray._menu_method_called(
+            None,
+            ":1.2",
+            MENU_PATH,
+            MENU_INTERFACE,
+            "Event",
+            GLib.Variant("(isvu)", (item_id, name, GLib.Variant("s", ""), 0)),
+            FakeInvocation(),
+        )
+
+    def test_clicking_quit_quits(self) -> None:
+        self.event(QUIT_ID, "clicked")
+        self.assertEqual(self.quits, 1)
+
+    def test_hovering_over_quit_does_not(self) -> None:
+        """Panels send `hovered` as the pointer crosses the item."""
+        for name in ("hovered", "opened", "closed"):
+            with self.subTest(event=name):
+                self.event(QUIT_ID, name)
+        self.assertEqual(self.quits, 0)
+
+    def test_clicking_the_root_does_not(self) -> None:
+        self.event(ROOT_ID, "clicked")
+        self.assertEqual(self.quits, 0)
+
+    def test_a_click_delivered_in_a_group_still_quits(self) -> None:
+        self.tray._menu_method_called(
+            None,
+            ":1.2",
+            MENU_PATH,
+            MENU_INTERFACE,
+            "EventGroup",
+            GLib.Variant(
+                "(a(isvu))",
+                ([(QUIT_ID, "clicked", GLib.Variant("s", ""), 0)],),
+            ),
+            FakeInvocation(),
+        )
+        self.assertEqual(self.quits, 1)
+
+    def test_losing_the_singleton_name_quits(self) -> None:
+        """Last one wins, and the polarity is the decision.
+
+        `KillUserProcesses=no` means a tray survives its own logout carrying
+        the group set it had before `usermod`. First-one-wins hands the name to
+        that survivor and exits the instance that can actually reach the
+        daemon, leaving only the broken icon on the panel.
+        """
+        self.tray.name_lost(None, SINGLETON_NAME)
+        self.assertEqual(self.quits, 1)
+
+    def test_quitting_before_the_loop_exists_is_not_a_crash(self) -> None:
+        Tray(FakeSession()).quit()
+
+
+@unittest.skipIf(Gio is None, "python3-gi is not installed")
+class TestTheNameThatMakesItASingleton(unittest.TestCase):
+    def test_the_singleton_name_is_not_the_item_name(self) -> None:
+        """The bug that produced two icons, pinned.
+
+        `org.kde.StatusNotifierItem-<pid>-1` is pid-scoped by the spec, so two
+        trays never contend for it — they take one each and the panel draws
+        two. A guard built on it can never fire, which is why the one that was
+        there never did.
+        """
+        one, two = Tray(FakeSession()), Tray(FakeSession())
+        self.assertNotEqual(SINGLETON_NAME, one.bus_name)
+        self.assertNotIn(str(os.getpid()), SINGLETON_NAME)
+        self.assertEqual(one.bus_name, two.bus_name)  # same process, same pid
+
+    def test_it_is_a_valid_well_known_bus_name(self) -> None:
+        self.assertTrue(Gio.dbus_is_name(SINGLETON_NAME))
+        self.assertFalse(SINGLETON_NAME.startswith(":"))

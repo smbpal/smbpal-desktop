@@ -45,6 +45,19 @@ WATCHER_NAME = "org.kde.StatusNotifierWatcher"
 WATCHER_PATH = "/StatusNotifierWatcher"
 ITEM_INTERFACE = "org.kde.StatusNotifierItem"
 ITEM_PATH = "/StatusNotifierItem"
+MENU_INTERFACE = "com.canonical.dbusmenu"
+MENU_PATH = "/MenuBar"
+
+# **The name that makes this a singleton, and it cannot be the item's.**
+# `org.kde.StatusNotifierItem-<pid>-1` is PID-scoped by the spec, so two trays
+# never contend for it — they each take their own and the panel draws two
+# icons. That is what happened on the Pi on 29 August 2026 and why the
+# "is a tray already running?" error had never once fired.
+SINGLETON_NAME = "org.smbpal.Tray"
+
+# dbusmenu item ids. 0 is the root by convention; the menu holds one item.
+ROOT_ID = 0
+QUIT_ID = 1
 
 # Which icon for which status is `model.ICONS`, with the rest of the
 # decisions. Re-exported so `from ...tray import ICONS` keeps working.
@@ -67,6 +80,7 @@ INTROSPECTION = """
     <property name="IconName" type="s" access="read"/>
     <property name="AttentionIconName" type="s" access="read"/>
     <property name="ItemIsMenu" type="b" access="read"/>
+    <property name="Menu" type="o" access="read"/>
     <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
     <method name="Activate">
       <arg name="x" type="i" direction="in"/>
@@ -92,9 +106,77 @@ INTROSPECTION = """
 </node>
 """
 
+# The menu, as a second interface on a second object path. All of it is owed
+# for one item: on Wayland a client cannot place a popup at the panel's
+# coordinates — it has no surface there — so the panel draws the menu and this
+# is the only way to describe one to it. Plan §3g decided Quit as the only
+# item; the interface cost is the same either way and the item count is not.
+MENU_INTROSPECTION = """
+<node>
+  <interface name="com.canonical.dbusmenu">
+    <property name="Version" type="u" access="read"/>
+    <property name="TextDirection" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="IconThemePath" type="as" access="read"/>
+    <method name="GetLayout">
+      <arg name="parentId" type="i" direction="in"/>
+      <arg name="recursionDepth" type="i" direction="in"/>
+      <arg name="propertyNames" type="as" direction="in"/>
+      <arg name="revision" type="u" direction="out"/>
+      <arg name="layout" type="(ia{sv}av)" direction="out"/>
+    </method>
+    <method name="GetGroupProperties">
+      <arg name="ids" type="ai" direction="in"/>
+      <arg name="propertyNames" type="as" direction="in"/>
+      <arg name="properties" type="a(ia{sv})" direction="out"/>
+    </method>
+    <method name="GetProperty">
+      <arg name="id" type="i" direction="in"/>
+      <arg name="name" type="s" direction="in"/>
+      <arg name="value" type="v" direction="out"/>
+    </method>
+    <method name="Event">
+      <arg name="id" type="i" direction="in"/>
+      <arg name="eventId" type="s" direction="in"/>
+      <arg name="data" type="v" direction="in"/>
+      <arg name="timestamp" type="u" direction="in"/>
+    </method>
+    <method name="EventGroup">
+      <arg name="events" type="a(isvu)" direction="in"/>
+      <arg name="idErrors" type="ai" direction="out"/>
+    </method>
+    <method name="AboutToShow">
+      <arg name="id" type="i" direction="in"/>
+      <arg name="needUpdate" type="b" direction="out"/>
+    </method>
+    <method name="AboutToShowGroup">
+      <arg name="ids" type="ai" direction="in"/>
+      <arg name="updatesNeeded" type="ai" direction="out"/>
+      <arg name="idErrors" type="ai" direction="out"/>
+    </method>
+    <signal name="ItemsPropertiesUpdated">
+      <arg name="updatedProps" type="a(ia{sv})"/>
+      <arg name="removedProps" type="a(ias)"/>
+    </signal>
+    <signal name="LayoutUpdated">
+      <arg name="revision" type="u"/>
+      <arg name="parent" type="i"/>
+    </signal>
+    <signal name="ItemActivationRequested">
+      <arg name="id" type="i"/>
+      <arg name="timestamp" type="u"/>
+    </signal>
+  </interface>
+</node>
+"""
+
 
 class Tray:
     """One StatusNotifierItem, fed by the same `Session` the window uses."""
+
+    # The menu never changes, so the revision never has to. It exists in the
+    # protocol for menus that rebuild themselves; this one is one item.
+    menu_revision = 1
 
     def __init__(
         self,
@@ -119,7 +201,11 @@ class Tray:
         self._screen = model.Screen()
         self._connection: Gio.DBusConnection | None = None
         self._registration = 0
+        self._menu_registration = 0
         self.bus_name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
+        # Set by `main`, so that both ways out of the process — the menu's Quit
+        # and losing the singleton name to a newer tray — go through one place.
+        self.on_quit: Any = None
 
         self._offline: str | None = None
         self._watcher_present = False
@@ -219,6 +305,19 @@ class Tray:
             # announce itself to the watcher and then answers nothing, which
             # looks exactly like a panel that does not support SNI.
             log.error("could not export %s; the icon will not work", ITEM_PATH)
+        menu_node = Gio.DBusNodeInfo.new_for_xml(MENU_INTROSPECTION)
+        self._menu_registration = connection.register_object(
+            MENU_PATH,
+            menu_node.interfaces[0],
+            self._menu_method_called,
+            self._menu_property_read,
+            None,
+        )
+        if not self._menu_registration:
+            # Not fatal, unlike the item: the icon still works and clicking it
+            # still opens the window. What is lost is the only way to stop the
+            # tray from inside SMBPal, which is worth saying out loud.
+            log.error("could not export %s; there will be no menu", MENU_PATH)
         self.announce()
 
     def watcher_appeared(self, *_a: Any) -> None:
@@ -317,7 +416,12 @@ class Tray:
         if name == "AttentionIconName":
             return GLib.Variant("s", self.attention_icon_name)
         if name == "ItemIsMenu":
+            # Still false, and the menu does not change it. False means a left
+            # click reaches `Activate` and opens the window, which is what the
+            # icon is mostly for; the menu is what a right click gets.
             return GLib.Variant("b", False)
+        if name == "Menu":
+            return GLib.Variant("o", MENU_PATH)
         if name == "ToolTip":
             # (icon name, pixmaps, title, body). The pixmap array stays empty:
             # a themed name is what M7 ships and what a panel can restyle.
@@ -347,11 +451,169 @@ class Tray:
         invocation: Gio.DBusMethodInvocation,
     ) -> None:
         if method in ("Activate", "SecondaryActivate", "ContextMenu"):
-            # Every click opens the window, including the right one. 3g decided
-            # against a context menu, and a right click that does nothing reads
-            # as the icon being broken.
+            # A host that reads `Menu` draws the menu itself on a right click
+            # and never calls `ContextMenu`. One that ignores `Menu` still
+            # does, and there is no menu this process can draw for it — on
+            # Wayland it has no surface at the panel's coordinates. Opening the
+            # window is the honest answer for that host; a right click that
+            # does nothing reads as the icon being broken.
             self.open_window()
         invocation.return_value(None)
+
+    # --- the menu ----------------------------------------------------------
+
+    def _menu_properties(self, item_id: int) -> dict[str, Any]:
+        """One item's properties, in dbusmenu's vocabulary."""
+        if item_id == ROOT_ID:
+            return {"children-display": GLib.Variant("s", "submenu")}
+        if item_id == QUIT_ID:
+            return {
+                "label": GLib.Variant("s", "Quit SMBPal"),
+                "enabled": GLib.Variant("b", True),
+                "visible": GLib.Variant("b", True),
+            }
+        return {}
+
+    def _filtered(self, item_id: int, wanted: list[str]) -> dict[str, Any]:
+        """`propertyNames` empty means all of them, which is what panels send."""
+        properties = self._menu_properties(item_id)
+        if not wanted:
+            return properties
+        return {k: v for k, v in properties.items() if k in wanted}
+
+    def menu_layout(self, parent: int, wanted: list[str]) -> Any:
+        """The `(u(ia{sv}av))` GetLayout answers with.
+
+        **Built in one call and not assembled from finished variants.** A
+        `GLib.Variant` already built cannot be nested inside another by format
+        string — PyGObject descends into it with the remaining format instead
+        of taking it whole, and raises `TypeError: Expected GLib.Variant, but
+        got str` from somewhere several levels down that names nothing in this
+        file. The one exception is an `av` element, which is boxed correctly
+        from a built variant and has to be, because the layout type is
+        recursive and there is no other way to express a child.
+        """
+        if parent == QUIT_ID:
+            return GLib.Variant(
+                "(u(ia{sv}av))",
+                (self.menu_revision, (QUIT_ID, self._filtered(QUIT_ID, wanted), [])),
+            )
+        child = GLib.Variant(
+            "(ia{sv}av)", (QUIT_ID, self._filtered(QUIT_ID, wanted), [])
+        )
+        return GLib.Variant(
+            "(u(ia{sv}av))",
+            (self.menu_revision, (ROOT_ID, self._filtered(ROOT_ID, wanted), [child])),
+        )
+
+    def _menu_property_read(
+        self,
+        _connection: Gio.DBusConnection,
+        _sender: str,
+        _path: str,
+        _interface: str,
+        name: str,
+    ) -> GLib.Variant | None:
+        """Five arguments, for the same reason `_property_read` takes five."""
+        if name == "Version":
+            return GLib.Variant("u", 3)
+        if name == "TextDirection":
+            return GLib.Variant("s", "ltr")
+        if name == "Status":
+            # dbusmenu's Status, which is "normal" or "notice" and is about the
+            # menu wanting attention. Nothing to do with the item's Status.
+            return GLib.Variant("s", "normal")
+        if name == "IconThemePath":
+            return GLib.Variant("as", [])
+        return None
+
+    def _menu_method_called(
+        self,
+        _connection: Gio.DBusConnection,
+        _sender: str,
+        _path: str,
+        _interface: str,
+        method: str,
+        parameters: GLib.Variant,
+        invocation: Gio.DBusMethodInvocation,
+    ) -> None:
+        args = parameters.unpack()
+        if method == "GetLayout":
+            parent, _depth, wanted = args
+            invocation.return_value(self.menu_layout(parent, list(wanted)))
+            return
+        if method == "GetGroupProperties":
+            ids, wanted = args
+            asked = list(ids) or [ROOT_ID, QUIT_ID]
+            invocation.return_value(
+                GLib.Variant(
+                    "(a(ia{sv}))",
+                    ([(i, self._filtered(i, list(wanted))) for i in asked],),
+                )
+            )
+            return
+        if method == "GetProperty":
+            item_id, name = args
+            value = self._menu_properties(item_id).get(name)
+            # A property nobody has is answered with an empty string rather
+            # than an error: it is what the C implementation does, and a panel
+            # that asks for `icon-name` should get a menu, not an exception.
+            invocation.return_value(
+                GLib.Variant("(v)", (value or GLib.Variant("s", ""),))
+            )
+            return
+        if method == "Event":
+            item_id, event, _data, _timestamp = args
+            self._menu_event(item_id, event)
+            invocation.return_value(None)
+            return
+        if method == "EventGroup":
+            for item_id, event, _data, _timestamp in args[0]:
+                self._menu_event(item_id, event)
+            invocation.return_value(GLib.Variant("(ai)", ([],)))
+            return
+        if method == "AboutToShow":
+            # The menu is one static item, so it never needs rebuilding before
+            # it opens. False is the answer that says so.
+            invocation.return_value(GLib.Variant("(b)", (False,)))
+            return
+        if method == "AboutToShowGroup":
+            invocation.return_value(GLib.Variant("(aiai)", ([], [])))
+            return
+        invocation.return_value(None)
+
+    def _menu_event(self, item_id: int, event: str) -> None:
+        """`clicked` on the one item is the only event that does anything.
+
+        Hosts also send `hovered` and `opened`/`closed`, and quitting on a
+        hover would be memorable. The event name is checked, not just the id.
+        """
+        if item_id == QUIT_ID and event == "clicked":
+            log.info("quitting: the menu asked")
+            self.quit()
+
+    # --- stopping ----------------------------------------------------------
+
+    def quit(self) -> None:
+        if self.on_quit is None:
+            log.warning("asked to quit with nothing to quit; ignoring")
+            return
+        self.on_quit()
+
+    def name_lost(self, *_a: Any) -> None:
+        """A newer tray took `SINGLETON_NAME`, so this one is the old one.
+
+        **Last one wins, and the polarity is the whole decision.** The Pi grew
+        two icons on 29 August 2026 because Debian ships logind with
+        `KillUserProcesses=no`: the tray from the previous session survived the
+        logout carrying the group set it had before `usermod`, and autostart
+        started a second one that could actually reach the daemon. First-one-
+        wins would hand the name to the survivor and exit the working
+        instance, leaving only the broken icon. The newest instance is always
+        the one holding the current session's credentials.
+        """
+        log.info("a newer tray took %s; quitting", SINGLETON_NAME)
+        self.quit()
 
     # --- the click ---------------------------------------------------------
 
@@ -400,6 +662,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     tray = Tray(session, launch=shlex.split(args.gui), icon=args.icon)
 
+    tray.on_quit = loop.quit
+
     def owned(connection: Gio.DBusConnection, _name: str) -> None:
         tray.register(connection)
 
@@ -409,7 +673,27 @@ def main(argv: list[str] | None = None) -> int:
         Gio.BusNameOwnerFlags.NONE,
         owned,
         None,
-        lambda *_a: log.error("could not take the bus name; is a tray already running?"),
+        # Not "is one already running?": the item name carries this process's
+        # pid and nothing else can hold it. Reaching here means the session bus
+        # refused it, which is a bus problem and not another tray.
+        lambda *_a: log.error("the session bus refused %s", tray.bus_name),
+    )
+    # **The singleton, and it is a separate name on purpose.** See
+    # SINGLETON_NAME: the item's name is pid-scoped and can never collide, so
+    # the guard cannot be built on it. ALLOW_REPLACEMENT lets a newer tray take
+    # this away from us; REPLACE_EXISTING takes it from whoever has it now.
+    # Both flags, because this process is on both sides of that trade over its
+    # life. The acquired callback is deliberately empty — owning the name is
+    # not what starts the icon, and tying registration to it would mean a bus
+    # that refused the name left the tray with no icon rather than a duplicate.
+    Gio.bus_own_name(
+        Gio.BusType.SESSION,
+        SINGLETON_NAME,
+        Gio.BusNameOwnerFlags.ALLOW_REPLACEMENT
+        | Gio.BusNameOwnerFlags.REPLACE_EXISTING,
+        None,
+        None,
+        tray.name_lost,
     )
     # Held for the life of the process: the watcher can come and go, and the
     # icon has to come back with it.
