@@ -7,7 +7,9 @@ three ways on purpose:
 - the **table** is where a new method gets forgotten,
 - the **policy file** is where the answer to a prompt is actually decided, and
   it is XML that nothing else in the project reads,
-- **asking** is the part with a subprocess, a timeout and a pid in it.
+- **asking** is the part with a subprocess, a timeout and a pid in it, and
+- the **tty agent**, which is what stops all of the above from being a
+  regression on every machine driven over ssh.
 
 Nothing here needs polkit installed. A test that only ran where polkit exists
 would not run on the machine this is written on, which is where the mistakes
@@ -25,6 +27,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest import mock
 
+from smbpal.cli import agent as polkit_agent
 from smbpal.daemon import polkit
 from smbpal.daemon.handlers import Authoriser, _METHODS
 from smbpal.errors import NotPermitted
@@ -279,3 +282,119 @@ class TestAskingPkcheck(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheTtyAgent(unittest.TestCase):
+    """`pkttyagent`, spawned only on a refusal.
+
+    The fake writes its arguments down and then closes the notify fd, which is
+    the signal the real one gives when it has registered. Waiting for that is
+    the point of the whole dance: a request sent before the agent is registered
+    races it, and the loser is a prompt that never appears.
+    """
+
+    def setUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.tmp = Path(self._dir.name)
+        self.argv = self.tmp / "argv"
+        for patcher in (
+            mock.patch("sys.stdin.isatty", return_value=True),
+            # No `/proc` on the machine this is written on, and the agent reads
+            # it for its own start time. Fixed here so the subject string can be
+            # asserted exactly rather than matched loosely.
+            mock.patch.object(polkit_agent, "start_time", return_value=77),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def fake(self, *, close_fd: bool = True, linger: int = 30) -> str:
+        path = self.tmp / "pkttyagent"
+        path.write_text(
+            "#!/bin/sh\n"
+            f'printf "%s\\n" "$*" > "{self.argv}"\n'
+            'fd=""\n'
+            'while [ $# -gt 0 ]; do\n'
+            '  if [ "$1" = "--notify-fd" ]; then fd="$2"; fi\n'
+            "  shift\n"
+            "done\n"
+            + (
+                'if [ -n "$fd" ]; then eval "exec ${fd}>&-"; fi\n'
+                if close_fd
+                else ""
+            )
+            + f"sleep {linger}\n"
+        )
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+        return str(path)
+
+    def test_it_starts_and_stays_running(self) -> None:
+        agent = polkit_agent.TtyAgent(self.fake())
+        self.addCleanup(agent.stop)
+        self.assertTrue(agent.start())
+        self.assertIsNone(agent.process.poll() if agent.process else 1)
+
+    def test_it_waits_for_the_agent_to_register(self) -> None:
+        """Not merely for it to be spawned. The fd closing is the only word
+        `pkttyagent` gives that polkit knows about it."""
+        agent = polkit_agent.TtyAgent(self.fake())
+        self.addCleanup(agent.stop)
+        agent.start()
+        self.assertIn("--notify-fd", self.argv.read_text())
+
+    def test_it_asks_only_to_be_the_fallback(self) -> None:
+        """A desktop terminal already has the session's own agent, and the
+        prompt belongs in the window the user is looking at, not in the
+        terminal they typed into."""
+        agent = polkit_agent.TtyAgent(self.fake())
+        self.addCleanup(agent.stop)
+        agent.start()
+        self.assertIn("--fallback", self.argv.read_text())
+
+    def test_the_subject_is_this_process(self) -> None:
+        """The same pid and start time the daemon will hand polkit, because the
+        agent has to belong to the session of the process being authorised."""
+        agent = polkit_agent.TtyAgent(self.fake())
+        self.addCleanup(agent.stop)
+        agent.start()
+        self.assertIn(f"{os.getpid()},77", self.argv.read_text())
+
+    def test_stopping_it_stops_it(self) -> None:
+        agent = polkit_agent.TtyAgent(self.fake())
+        agent.start()
+        process = agent.process
+        agent.stop()
+        assert process is not None
+        self.assertIsNotNone(process.poll())
+        self.assertIsNone(agent.process)
+
+    def test_starting_twice_does_not_start_twice(self) -> None:
+        """The second call returns False, which is also what tells the client
+        not to retry a request a second time."""
+        agent = polkit_agent.TtyAgent(self.fake())
+        self.addCleanup(agent.stop)
+        self.assertTrue(agent.start())
+        self.assertFalse(agent.start())
+
+    def test_an_agent_that_dies_immediately_is_not_a_success(self) -> None:
+        agent = polkit_agent.TtyAgent(self.fake(close_fd=False, linger=0))
+        self.addCleanup(agent.stop)
+        self.assertFalse(agent.start())
+        self.assertIsNone(agent.process)
+
+    def test_a_missing_pkttyagent_is_not_a_success(self) -> None:
+        agent = polkit_agent.TtyAgent(str(self.tmp / "not-installed"))
+        self.assertFalse(agent.start())
+
+    def test_it_does_not_try_without_a_terminal_to_prompt_on(self) -> None:
+        """A prompt nobody can answer is worse than a refusal: it hangs a
+        script that would otherwise have failed and said why."""
+        with mock.patch("sys.stdin.isatty", return_value=False):
+            agent = polkit_agent.TtyAgent(self.fake())
+            self.assertFalse(agent.usable())
+            self.assertFalse(agent.start())
+        self.assertFalse(self.argv.exists())
+
+    def test_root_never_needs_one(self) -> None:
+        with mock.patch("os.getuid", return_value=0):
+            self.assertFalse(polkit_agent.TtyAgent(self.fake()).usable())

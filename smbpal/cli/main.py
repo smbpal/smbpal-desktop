@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from smbpal import __version__
+from smbpal.cli.agent import TtyAgent
 from smbpal.cli.format import render_json, render_table
 from smbpal.errors import DaemonUnreachable, NotFound, SmbpalError
 from smbpal.ipc.client import Client
@@ -188,11 +189,42 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _asking_for_authorisation(agent: TtyAgent) -> Callable[[], bool]:
+    """What the client does the first time the daemon says no.
+
+    polkit refuses without a murmur when the session has no agent in it, which
+    is every ssh session — the same refusal a user gets for typing the wrong
+    password, and ssh is how the Pi is driven. Starting an agent turns that
+    refusal into a question. Not starting one would have left `smbpal share
+    add` failing with no route to yes except `sudo`, which takes the uid 0
+    short-circuit and skips the check entirely.
+    """
+
+    def denied() -> bool:
+        if agent.start():
+            return True
+        if not agent.usable():
+            print(
+                "smbpal: this needs authorisation, and there is nothing here "
+                "able to ask for it.",
+                file=sys.stderr,
+            )
+            print(
+                "  No polkit agent, and no terminal to prompt on. Run it from a "
+                "terminal, or from the SMBPal window.",
+                file=sys.stderr,
+            )
+        return False
+
+    return denied
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     handler = _COMMANDS[(args.command, getattr(args, "subcommand", None))]
+    agent = TtyAgent()
     try:
-        with Client(args.socket) as client:
+        with Client(args.socket, on_denied=_asking_for_authorisation(agent)) as client:
             return handler(client, args)
     except DaemonUnreachable as exc:
         _fail(exc)
@@ -202,6 +234,10 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ERROR
     except KeyboardInterrupt:
         return 130
+    finally:
+        # It outlives the request that needed it, because one `smbpal`
+        # invocation can make several calls, but never the process.
+        agent.stop()
 
 
 # --- commands --------------------------------------------------------------

@@ -15,7 +15,9 @@ from pathlib import Path
 from smbpal import PROTOCOL_VERSION
 from smbpal.config import ConfigStore, empty_config
 from smbpal.daemon.handlers import Authoriser, Dispatcher
+from smbpal.daemon import polkit as polkit_module
 from smbpal.daemon.polkit import MANAGE_SHARES
+from smbpal.ipc import client as client_module
 from smbpal.errors import (
     BadRequest,
     DaemonUnreachable,
@@ -58,8 +60,8 @@ class ServerTestCase(unittest.TestCase):
         self.transport.shutdown()
         self.thread.join(timeout=5)
 
-    def client(self) -> Client:
-        client = Client(self.socket_path, timeout=5.0)
+    def client(self, **kwargs: object) -> Client:
+        client = Client(self.socket_path, timeout=5.0, reply_timeout=5.0, **kwargs)  # type: ignore[arg-type]
         client.connect()
         self.addCleanup(client.close)
         return client
@@ -198,6 +200,77 @@ class RecordingChecker:
     def check(self, peer: PeerCredentials, action: str) -> bool:
         self.calls.append((peer, action))
         return self.answer
+
+
+class ScriptedChecker:
+    """Answers from a list, so a refusal can be followed by a grant."""
+
+    def __init__(self, *answers: bool) -> None:
+        self.answers = list(answers)
+        self.calls = 0
+
+    def check(self, peer: PeerCredentials, action: str) -> bool:
+        self.calls += 1
+        return self.answers.pop(0) if self.answers else False
+
+
+class TestARefusalGetsOneSecondChance(ServerTestCase):
+    """`on_denied`: the CLI's hook for starting a polkit agent and asking again.
+
+    The case it exists for is an ssh session with no agent in it, where polkit
+    refuses because there was nobody to ask rather than because the answer is
+    no. Starting an agent and repeating the request is the difference between
+    that and `sudo`, which would skip authorisation altogether.
+    """
+
+    def test_a_refusal_is_retried_once_and_can_then_succeed(self) -> None:
+        self.dispatcher.authoriser = Authoriser(
+            policy="polkit", checker=ScriptedChecker(False, True)
+        )
+        tries: list[int] = []
+
+        def denied() -> bool:
+            tries.append(1)
+            return True
+
+        client = self.client(on_denied=denied)
+        share = client.call("share.add", {"name": "X", "path": "/srv/x"})
+        self.assertEqual(share["id"], "x")
+        self.assertEqual(len(tries), 1)
+
+    def test_a_second_refusal_is_final(self) -> None:
+        """The user said no, or is not allowed. A program that asked again
+        would be arguing with them."""
+        checker = ScriptedChecker(False, False)
+        self.dispatcher.authoriser = Authoriser(policy="polkit", checker=checker)
+        with self.assertRaises(NotPermitted):
+            self.client(on_denied=lambda: True).call(
+                "share.add", {"name": "X", "path": "/srv/x"}
+            )
+        self.assertEqual(checker.calls, 2)
+
+    def test_nothing_is_retried_when_the_hook_cannot_help(self) -> None:
+        checker = ScriptedChecker(False, True)
+        self.dispatcher.authoriser = Authoriser(policy="polkit", checker=checker)
+        with self.assertRaises(NotPermitted):
+            self.client(on_denied=lambda: False).call(
+                "share.add", {"name": "X", "path": "/srv/x"}
+            )
+        self.assertEqual(checker.calls, 1)
+
+    def test_a_client_with_no_hook_behaves_as_it_always_did(self) -> None:
+        checker = ScriptedChecker(False, True)
+        self.dispatcher.authoriser = Authoriser(policy="polkit", checker=checker)
+        with self.assertRaises(NotPermitted):
+            self.client().call("share.add", {"name": "X", "path": "/srv/x"})
+        self.assertEqual(checker.calls, 1)
+
+    def test_the_client_waits_longer_than_the_daemon_will(self) -> None:
+        """A prompt is a person reading a dialog, and the client is blocked for
+        the whole of it. If the client gave up first, the mutation would still
+        go through once they typed their password — after the command that
+        asked for it had already reported failure."""
+        self.assertGreater(client_module.REPLY_TIMEOUT, polkit_module.DEFAULT_TIMEOUT)
 
 
 class TestPeerAndAuthorisation(ServerTestCase):

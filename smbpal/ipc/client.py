@@ -43,6 +43,22 @@ _ERROR_CLASSES: dict[str, type[SmbpalError]] = {
 
 DEFAULT_TIMEOUT = 10.0
 
+# How long to wait for a *reply*, which is not the same question as how long to
+# wait for a connection, and stopped being the same question when polkit landed.
+#
+# A mutating call now blocks in the daemon while polkit puts a password dialog
+# in front of somebody. Ten seconds of that is a person still reading the box.
+# The 10s timeout was never protecting against a slow answer anyway: a daemon
+# that has died closes the socket and `recv` returns empty immediately, which is
+# the case the CLI actually needed to report well. What is left for a timeout to
+# catch is a daemon that is alive and not answering — which is now a *normal*
+# state with a known upper bound, so this sits just above it.
+#
+# Pinned by a test against the daemon's own polkit timeout: a client that gives
+# up first turns an authorisation the user granted into a failed command, and
+# the mutation would go through afterwards with nobody watching.
+REPLY_TIMEOUT = 130.0
+
 
 class Client:
     """A synchronous request/response client with an optional event callback."""
@@ -52,9 +68,17 @@ class Client:
         path: Path | str = DEFAULT_SOCKET_PATH,
         *,
         timeout: float = DEFAULT_TIMEOUT,
+        reply_timeout: float = REPLY_TIMEOUT,
+        on_denied: Callable[[], bool] | None = None,
     ) -> None:
         self.path = Path(path)
         self.timeout = timeout
+        self.reply_timeout = reply_timeout
+        # Called once when a call comes back "not permitted", to give the
+        # caller a chance to make authorisation possible — the CLI starts a
+        # `pkttyagent` here. Returning True means something changed and the
+        # request is worth repeating; the client never retries twice.
+        self.on_denied = on_denied
         self._sock: socket.socket | None = None
         self._buffer = bytearray()
         self._counter = 0
@@ -85,6 +109,9 @@ class Client:
             raise DaemonUnreachable(
                 f"cannot connect to {self.path}", detail=str(exc)
             ) from exc
+        # Connecting had ten seconds; replying gets longer, because one of them
+        # may now be waiting on a person. See REPLY_TIMEOUT.
+        sock.settimeout(self.reply_timeout)
         self._sock = sock
 
     def close(self) -> None:
@@ -119,7 +146,23 @@ class Client:
     # --- calls -------------------------------------------------------------
 
     def call(self, method: str, params: dict[str, Any] | None = None) -> Any:
-        """Send one request and return its result, or raise the daemon's error."""
+        """Send one request and return its result, or raise the daemon's error.
+
+        A refusal gets one second chance and no more. `on_denied` exists for
+        the case where the answer was "no" only because there was nobody to ask
+        — an ssh session with no polkit agent in it — and starting one turns
+        the same request into a question the user can answer. A second refusal
+        is a real one: the user said no, or is not allowed, and asking again
+        would be a program arguing with them.
+        """
+        try:
+            return self._call_once(method, params)
+        except NotPermitted:
+            if self.on_denied is None or not self.on_denied():
+                raise
+        return self._call_once(method, params)
+
+    def _call_once(self, method: str, params: dict[str, Any] | None = None) -> Any:
         with self._lock:
             sock = self._require_socket()
             self._counter += 1
@@ -195,7 +238,7 @@ class Client:
                 chunk = sock.recv(65536)
             except socket.timeout as exc:
                 raise DaemonUnreachable(
-                    f"no reply from the daemon within {self.timeout:g}s"
+                    f"no reply from the daemon within {self.reply_timeout:g}s"
                 ) from exc
             if not chunk:
                 raise DaemonUnreachable("the daemon closed the connection")
