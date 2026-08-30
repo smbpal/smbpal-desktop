@@ -214,6 +214,37 @@ class TestTheMaintainerScripts(unittest.TestCase):
                 self.assertTrue(os.access(path, os.X_OK), f"{path.name} is not +x")
 
 
+class TestTheShippedShellScripts(unittest.TestCase):
+    """The scripts in `packaging/` that are not maintainer scripts.
+
+    Same two failures as the maintainer scripts and the same two checks, for
+    the same reason: a script that will not parse fails where it is run rather
+    than where it is written, and CI is a slower place to find that out than
+    here. `check-installed-size.sh` is also documented as something to run by
+    hand, which needs the executable bit as much as CI does.
+    """
+
+    def scripts(self) -> list[Path]:
+        found = sorted((ROOT / "packaging").glob("*.sh"))
+        self.assertTrue(found, "found no shell scripts in packaging/")
+        return found
+
+    def test_every_script_parses_as_sh(self) -> None:
+        import subprocess
+
+        for path in self.scripts():
+            with self.subTest(script=path.name):
+                result = subprocess.run(
+                    ["sh", "-n", str(path)], capture_output=True, text=True
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_every_script_is_executable(self) -> None:
+        for path in self.scripts():
+            with self.subTest(script=path.name):
+                self.assertTrue(os.access(path, os.X_OK), f"{path.name} is not +x")
+
+
 try:
     from gi.repository import Gio, GLib
 except ImportError:  # pragma: no cover - a machine without python3-gi

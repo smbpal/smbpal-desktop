@@ -1,0 +1,119 @@
+# CI for smbpal-desktop.
+#
+# **What this repository actually gets wrong.** Nine times now the defect has
+# not been in the code but in something the code never reached: a maintainer
+# script that debhelper spliced a snippet into the middle of, a GDBus flag that
+# does not exist under the name it was written with, a policy file whose XML
+# stopped parsing because a comment contained two dashes. Every one of those
+# passed the unit tests, because none of them is reachable from the unit tests.
+#
+# So this runs in two halves, and the second is the point. `tests` is the fast
+# one. `package` builds the .deb and then *installs, removes and purges it*,
+# which is the only way any of the above becomes visible before a Pi does it.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # python3-gi and gir1.2-gtk-4.0 are Recommends of the package, not
+      # Depends, and the suite skips its GUI tests without them. xvfb is here
+      # because `tests/test_gui_window.py` calls `Gtk.init_check()` and builds
+      # real widgets: no display, no window tests.
+      - name: Install the GUI's dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3-gi gir1.2-gtk-4.0 xvfb
+
+      # **Before the tests, not after.** A skipped test is silent and green,
+      # and 30 of these skip themselves when `gi` is missing — so an image
+      # without GTK on it would report a passing run of a suite that never
+      # exercised the tray, the window or the hygiene checks over `Gio`. This
+      # step exists to make that a failure instead of a colour.
+      - name: Refuse to run without GTK and a display
+        run: |
+          xvfb-run -a python3 - <<'PY'
+          import gi
+          gi.require_version("Gtk", "4.0")
+          from gi.repository import Gtk
+          if not Gtk.init_check():
+              raise SystemExit("GTK is installed but there is no usable display")
+          print("GTK 4 with a display: the GUI tests will run rather than skip")
+          PY
+
+      - name: Run the suite
+        run: xvfb-run -a python3 -m unittest discover -s tests -v
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the build chain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential fakeroot devscripts lintian \
+            debhelper dh-python pybuild-plugin-pyproject \
+            python3-all python3-setuptools
+
+      # `debian` is a symlink to `packaging/debian`, which is the one
+      # structural choice in this package that nothing but a real build tests.
+      - name: Build
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: D10 size budget
+        run: packaging/check-installed-size.sh ../smbpal_*_all.deb
+
+      # Errors only. lintian has opinions about a package that is not going to
+      # a Debian archive, and treating all of them as failures would make this
+      # step noise that gets ignored — which is worse than not running it.
+      - name: lintian
+        run: lintian --fail-on error ../smbpal_*_all.deb
+
+      # The half that exists because of `#DEBHELPER#`. Every install and
+      # removal for two days died in a prerm that no test could see, and this
+      # is the shape of run that would have caught it in minutes.
+      - name: Install, remove, purge
+        run: |
+          set -eux
+          deb=$(ls ../smbpal_*_all.deb)
+          sudo apt-get install -y "$deb"
+          # The four entry points exist and answer, which is a weaker claim
+          # than the Pi's "they run" but the one a runner can make.
+          smbpal --version
+          smbpald --version
+          test -f /usr/share/polkit-1/actions/org.smbpal.policy
+          test -f /etc/xdg/autostart/smbpal-tray.desktop
+          # polkit must be able to read what was installed. An unparseable
+          # policy file means polkit sees no actions at all and every mutation
+          # is refused — silently, since nothing reports a parse error.
+          pkaction | grep -q '^org\.smbpal\.manage-shares$'
+          pkaction | grep -q '^org\.smbpal\.manage-connections$'
+          pkaction | grep -q '^org\.smbpal\.use-connections$'
+          sudo apt-get remove -y smbpal
+          test -d /etc/smbpal || { echo "remove deleted the config; only purge may"; exit 1; }
+          sudo apt-get install -y "$deb"
+          sudo apt-get purge -y smbpal
+          test ! -e /etc/smbpal || { echo "purge left /etc/smbpal behind"; exit 1; }
+          test ! -e /etc/samba/smbpal.conf || { echo "purge left smbpal.conf behind"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: ../smbpal_*_all.deb
+          if-no-files-found: error
