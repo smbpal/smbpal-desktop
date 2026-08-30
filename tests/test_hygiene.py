@@ -214,6 +214,98 @@ class TestTheMaintainerScripts(unittest.TestCase):
                 self.assertTrue(os.access(path, os.X_OK), f"{path.name} is not +x")
 
 
+def _in_a_git_checkout() -> bool:
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+@unittest.skipUnless(_in_a_git_checkout(), "not a git checkout")
+class TestNothingTheBuildNeedsIsIgnored(unittest.TestCase):
+    """A source file that `.gitignore` swallows, which is invisible twice over.
+
+    `smbpal/mounts/credentials.py` was matched by `credentials.*` — a rule
+    written to keep captured secrets out of a repository that §11.3 publishes
+    with full history — and was ignored from 20 August 2026 for ten days. It
+    never showed, because neither machine needed the repository to have it: the
+    Mac wrote the file, and the Pi receives the tree by rsync, which does not
+    read `.gitignore`. Every test passed on both. A clone could not import the
+    daemon, the CLI or the GUI.
+
+    That is the shape of the bug this whole file exists for — code that is
+    correct and that something never reaches — and the reason it is worth a
+    test rather than a fixed `.gitignore` is that the next rule to do it will
+    be a different rule against a different file.
+    """
+
+    def ignored(self, paths: list[Path]) -> list[str]:
+        """The ones git will not hand to a clone. Tracked files are exempt:
+        a force-added file matches a pattern and is still in the repository."""
+        import subprocess
+
+        tracked = set(
+            subprocess.run(
+                ["git", "-C", str(ROOT), "ls-files"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.splitlines()
+        )
+        offenders = []
+        for path in paths:
+            relative = path.relative_to(ROOT).as_posix()
+            if relative in tracked:
+                continue
+            check = subprocess.run(
+                ["git", "-C", str(ROOT), "check-ignore", "-v", relative],
+                capture_output=True,
+                text=True,
+            )
+            for line in check.stdout.splitlines():
+                # `-v` prints negations too, and a negation means *kept*.
+                pattern = line.split("\t")[0].rsplit(":", 1)[-1]
+                if not pattern.startswith("!"):
+                    offenders.append(line.strip())
+        return offenders
+
+    def test_no_python_module_is_ignored(self) -> None:
+        sources = [
+            path
+            for directory in ("smbpal", "tests")
+            for path in (ROOT / directory).rglob("*.py")
+            if "__pycache__" not in path.parts
+        ]
+        self.assertTrue(sources, "found no Python to check")
+        self.assertEqual(
+            self.ignored(sources),
+            [],
+            "these are on disk and will not reach a clone",
+        )
+
+    def test_everything_the_package_installs_is_in_the_repository(self) -> None:
+        """`smbpal.install` names its sources by path. One of them being absent
+        from a clone is a package that builds and ships less than it says."""
+        listed = []
+        install = ROOT / "packaging/debian/smbpal.install"
+        for line in install.read_text(encoding="utf-8").splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            listed.append(ROOT / line.split()[0])
+        self.assertTrue(listed, "smbpal.install names nothing")
+        for path in listed:
+            with self.subTest(path=path.name):
+                self.assertTrue(path.exists(), f"{path} is named but does not exist")
+        self.assertEqual(self.ignored(listed), [])
+
+
 class TestTheShippedShellScripts(unittest.TestCase):
     """The scripts in `packaging/` that are not maintainer scripts.
 

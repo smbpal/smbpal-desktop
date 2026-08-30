@@ -33,6 +33,15 @@ credentials.*
 *.keychain
 *.keychain-db
 
+# ...but never a source file. `credentials.*` matched `smbpal/mounts/credentials.py`
+# — a module, not a secret — and swallowed it for ten days from 20 August 2026.
+# Nothing noticed, because both machines had it another way: the Mac wrote it,
+# and the Pi receives the tree by rsync, which has never heard of this file. A
+# clone of this repository could not import the daemon, the CLI or the GUI, and
+# §11.3 was going to publish that. Found by the first CI run there has ever been.
+!credentials.py
+!secrets.py
+
 # --- Build and interpreter artifacts ---------------------------------------
 # Nothing here is unpublishable, but §11.3 publishes full history and a repo
 # carrying __pycache__ from three machines is history nobody wants to read.
