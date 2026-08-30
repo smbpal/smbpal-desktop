@@ -77,3 +77,4 @@ packaging/debian/*.debhelper.log
 # --- Platform noise --------------------------------------------------------
 .DS_Store
 Thumbs.db
+dist/
