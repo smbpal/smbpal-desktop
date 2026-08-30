@@ -26,7 +26,7 @@ jobs:
     name: tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # python3-gi and gir1.2-gtk-4.0 are Recommends of the package, not
       # Depends, and the suite skips its GUI tests without them. xvfb is here
@@ -61,7 +61,7 @@ jobs:
     name: package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install the build chain
         run: |
@@ -150,7 +150,7 @@ jobs:
           mkdir -p dist
           cp ../smbpal_*_all.deb dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: always()
         with:
           name: deb
