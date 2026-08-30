@@ -19,6 +19,7 @@ was the total dropping, which nothing was watching.
 from __future__ import annotations
 
 import ast
+import os
 import unittest
 import warnings
 from pathlib import Path
@@ -134,6 +135,83 @@ class TestNoPrivateNamesReachAUser(unittest.TestCase):
                             f"{path.relative_to(ROOT)}:{node.lineno} puts a real "
                             f"machine name somewhere a user could see it",
                         )
+
+
+MAINTAINER_SCRIPTS = ("preinst", "postinst", "prerm", "postrm")
+
+
+class TestTheMaintainerScripts(unittest.TestCase):
+    """`#DEBHELPER#` written inside a comment, which is not a comment.
+
+    debhelper substitutes that token textually wherever it appears and has no
+    idea what a comment is. A sentence in `smbpal.prerm` mentioning the token
+    by name got a multi-line snippet spliced into the middle of it: the leading
+    `#` covered only the first line, the injected code ran unprotected, and the
+    tail of the sentence became a command called `is`. Every install and every
+    removal then failed with `prerm: 28: is: not found`, which names nothing
+    that appears in the source.
+
+    It also put `deb-systemd-invoke stop` above the `case` instead of below it,
+    silently inverting the ordering the sentence was there to explain — so the
+    same line broke the script *and* the design it documented.
+
+    Nothing in this suite had ever looked at a maintainer script. These are
+    plain `sh` and the smallest checks worth having: they parse, and the token
+    appears once, alone on its line.
+    """
+
+    def scripts(self) -> list[Path]:
+        found = [
+            path
+            for name in MAINTAINER_SCRIPTS
+            for path in (ROOT / "packaging" / "debian").glob(f"*.{name}")
+        ]
+        self.assertTrue(found, "found no maintainer scripts to check")
+        return sorted(found)
+
+    def test_the_debhelper_token_is_never_embedded_in_a_line(self) -> None:
+        offenders: list[str] = []
+        for path in self.scripts():
+            for number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                if "#DEBHELPER#" in line and line.strip() != "#DEBHELPER#":
+                    offenders.append(f"{path.name}:{number}: {line.strip()}")
+        self.assertEqual(
+            offenders,
+            [],
+            "the token is substituted textually, comment or not:\n  "
+            + "\n  ".join(offenders),
+        )
+
+    def test_every_script_has_exactly_one_token(self) -> None:
+        """None means debhelper appends its snippets at the end by default.
+
+        That is a different bug and a quieter one: the stop would land after
+        `teardown` rather than never running, and nothing would say so.
+        """
+        for path in self.scripts():
+            with self.subTest(script=path.name):
+                text = path.read_text(encoding="utf-8")
+                self.assertEqual(text.count("#DEBHELPER#"), 1)
+
+    def test_every_script_parses_as_sh(self) -> None:
+        """`sh -n`, because a maintainer script that will not parse takes the
+        install down with it and dpkg reports the line, not the cause."""
+        import subprocess
+
+        for path in self.scripts():
+            with self.subTest(script=path.name):
+                result = subprocess.run(
+                    ["sh", "-n", str(path)], capture_output=True, text=True
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_every_script_is_executable(self) -> None:
+        """dpkg runs them directly. A non-executable one fails the install."""
+        for path in self.scripts():
+            with self.subTest(script=path.name):
+                self.assertTrue(os.access(path, os.X_OK), f"{path.name} is not +x")
 
 
 try:

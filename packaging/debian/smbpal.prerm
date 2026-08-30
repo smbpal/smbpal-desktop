@@ -10,9 +10,19 @@ set -e
 #
 # It has to be prerm and not postrm. By the time postrm runs dpkg has already
 # deleted /usr/bin/smbpal and the daemon it talks to, and the block in smb.conf
-# would have nothing left able to remove it. #DEBHELPER# is below rather than
-# above for the same reason: dh_installsystemd's stop lands there, and the
-# daemon has to still be answering when teardown asks.
+# would have nothing left able to remove it. The debhelper token is below this
+# case rather than above it for the same reason: dh_installsystemd's stop lands
+# where that token is, and the daemon has to still be answering when teardown
+# asks.
+#
+# **The token is named in prose and never written out, and that is not
+# fussiness.** debhelper substitutes it textually wherever it appears, with no
+# idea it is inside a comment. Writing it here once put a multi-line snippet in
+# the middle of this sentence: the leading `#` covered only the first line, the
+# injected code ran unprotected, and the tail of the sentence became a command
+# called `is`. Every install and removal died with
+# "prerm: 28: is: not found" — and the snippet it injected landed above the
+# case below, defeating the very ordering this paragraph exists to explain.
 #
 # `teardown` keeps /etc/smbpal, so `apt remove` followed by a reinstall picks
 # the configuration back up. Forgetting it is purge's job, in postrm.
