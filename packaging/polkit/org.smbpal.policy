@@ -33,6 +33,25 @@
         one action to the person making it: add, set a password, apply. Three
         prompts for one intention is how people learn to type their password
         without reading the box.
+
+        What _keep actually retains, established on hardware 30 August 2026:
+        polkit keys a temporary authorization to the *subject*, and the subject
+        the daemon supplies is a unix-process. So it is kept for as long as the
+        process that earned it lives, and a different process never inherits it.
+
+        That divides the two clients, and in the right direction. The GUI is one
+        long-lived process, so its add / set password / apply carry one subject
+        and prompt once — verified. The CLI is a new process per command, so
+        every command authenticates, and no amount of _keep will change that:
+        each `smbpal` invocation is a new subject by construction. Which is the
+        correct outcome anyway. One command is one act, and the multi-prompt
+        problem this exists to solve was always the window, never the shell.
+
+        A `unix-session` subject would keep across CLI invocations and is not
+        reachable: `pkcheck` can express --process or --system-bus-name and
+        nothing else, so it would mean the D-Bus API and python3-gi inside the
+        root daemon. Not worth a dependency to remove a prompt from the one
+        path where prompting is right.
       -->
       <allow_active>auth_admin_keep</allow_active>
     </defaults>
