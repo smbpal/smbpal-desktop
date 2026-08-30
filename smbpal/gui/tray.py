@@ -55,6 +55,21 @@ MENU_PATH = "/MenuBar"
 # "is a tray already running?" error had never once fired.
 SINGLETON_NAME = "org.smbpal.Tray"
 
+# **Evaluated at import, so that getting a name wrong is an ImportError.**
+# `REPLACE` is GLib's spelling. The D-Bus wire protocol calls the same bit
+# `DBUS_NAME_FLAG_REPLACE_EXISTING`, and writing that here cost a Pi login:
+# `Gio.BusNameOwnerFlags.REPLACE_EXISTING` does not exist, `main` raised
+# `AttributeError` before `loop.run`, and the packaged tray died at startup
+# while two survivors from earlier logins went on drawing icons — which looks
+# exactly like the guard failing rather than never running.
+#
+# ALLOW_REPLACEMENT lets a newer tray take the name from us; REPLACE takes it
+# from whoever holds it now. Both, because this process is on both sides of
+# that trade over its life.
+SINGLETON_FLAGS = (
+    Gio.BusNameOwnerFlags.ALLOW_REPLACEMENT | Gio.BusNameOwnerFlags.REPLACE
+)
+
 # dbusmenu item ids. 0 is the root by convention; the menu holds one item.
 ROOT_ID = 0
 QUIT_ID = 1
@@ -680,17 +695,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     # **The singleton, and it is a separate name on purpose.** See
     # SINGLETON_NAME: the item's name is pid-scoped and can never collide, so
-    # the guard cannot be built on it. ALLOW_REPLACEMENT lets a newer tray take
-    # this away from us; REPLACE_EXISTING takes it from whoever has it now.
-    # Both flags, because this process is on both sides of that trade over its
-    # life. The acquired callback is deliberately empty — owning the name is
-    # not what starts the icon, and tying registration to it would mean a bus
-    # that refused the name left the tray with no icon rather than a duplicate.
+    # the guard cannot be built on it. The flags are SINGLETON_FLAGS, resolved
+    # at import rather than here, for the reason written above them. The
+    # acquired callback is deliberately empty — owning the name is not what
+    # starts the icon, and tying registration to it would mean a bus that
+    # refused the name left the tray with no icon rather than a duplicate.
     Gio.bus_own_name(
         Gio.BusType.SESSION,
         SINGLETON_NAME,
-        Gio.BusNameOwnerFlags.ALLOW_REPLACEMENT
-        | Gio.BusNameOwnerFlags.REPLACE_EXISTING,
+        SINGLETON_FLAGS,
         None,
         None,
         tray.name_lost,

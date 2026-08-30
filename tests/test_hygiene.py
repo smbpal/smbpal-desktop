@@ -136,6 +136,74 @@ class TestNoPrivateNamesReachAUser(unittest.TestCase):
                         )
 
 
+try:
+    from gi.repository import Gio, GLib
+except ImportError:  # pragma: no cover - a machine without python3-gi
+    Gio = None
+    GLib = None
+
+
+@unittest.skipIf(Gio is None, "python3-gi is not installed")
+class TestEveryGiNameExists(unittest.TestCase):
+    """`Gio.BusNameOwnerFlags.REPLACE_EXISTING`, which does not exist.
+
+    GLib spells that bit `REPLACE`; `REPLACE_EXISTING` is the D-Bus *wire*
+    protocol's name for it, and both spellings read as obviously correct. The
+    result was an `AttributeError` raised from `tray.main` before `loop.run`,
+    so on 30 August 2026 the packaged tray died at startup on a Pi while two
+    trays that had outlived earlier logins went on drawing icons — which looks
+    exactly like the new single-instance guard failing rather than never having
+    run at all.
+
+    **Nothing in the suite could have caught it, and that is the point.** The
+    tray's 22 tests call its handlers directly; `main` is wiring, it needs a
+    session bus to run, and it is the one part of the module no test enters. A
+    wrong attribute name there is invisible until a desktop starts it. This is
+    the ninth defect in this project of the form *correct, tested code that
+    something never reaches*, so the check is on the class and not on the line:
+    every `Gio.x.y` and `GLib.x.y` written anywhere in the package has to
+    resolve, whether or not a test ever executes that statement.
+    """
+
+    def _chain(self, node: ast.Attribute) -> list[str] | None:
+        """`Gio.BusNameOwnerFlags.REPLACE` -> ['Gio', 'BusNameOwnerFlags', ...]."""
+        parts: list[str] = []
+        current: ast.expr = node
+        while isinstance(current, ast.Attribute):
+            parts.append(current.attr)
+            current = current.value
+        if not isinstance(current, ast.Name) or current.id not in ("Gio", "GLib"):
+            return None
+        parts.append(current.id)
+        return list(reversed(parts))
+
+    def test_every_attribute_the_package_asks_gi_for_resolves(self) -> None:
+        modules = {"Gio": Gio, "GLib": GLib}
+        missing: list[str] = []
+        checked = 0
+        for path in sorted((ROOT / "smbpal").rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Attribute):
+                    continue
+                chain = self._chain(node)
+                if chain is None:
+                    continue
+                checked += 1
+                target: object = modules[chain[0]]
+                for step in chain[1:]:
+                    target = getattr(target, step, None)
+                    if target is None:
+                        missing.append(
+                            f"{path.relative_to(ROOT)}:{node.lineno}: "
+                            f"{'.'.join(chain)}"
+                        )
+                        break
+        self.assertGreater(checked, 20, "found suspiciously few gi attributes")
+        self.assertEqual(missing, [], "these names do not exist in gi:\n  " +
+                         "\n  ".join(missing))
+
+
 def _is_docstring(tree: ast.Module, node: ast.Constant) -> bool:
     """True for a module, class or function docstring anywhere in the tree."""
     for parent in ast.walk(tree):

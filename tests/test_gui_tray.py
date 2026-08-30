@@ -43,6 +43,7 @@ if Gio is not None:
         MENU_PATH,
         QUIT_ID,
         ROOT_ID,
+        SINGLETON_FLAGS,
         SINGLETON_NAME,
         Tray,
     )
@@ -668,3 +669,33 @@ class TestTheNameThatMakesItASingleton(unittest.TestCase):
     def test_it_is_a_valid_well_known_bus_name(self) -> None:
         self.assertTrue(Gio.dbus_is_name(SINGLETON_NAME))
         self.assertFalse(SINGLETON_NAME.startswith(":"))
+
+    def test_the_name_is_taken_in_both_directions(self) -> None:
+        """Two bits, and dropping either one breaks a different case.
+
+        Without `REPLACE` a new tray cannot take the name and quits itself,
+        which is first-one-wins with extra steps. Without `ALLOW_REPLACEMENT`
+        no later tray can take it from us, so the survivor of a logout keeps it
+        forever — the exact case this guard exists for.
+        """
+        self.assertTrue(SINGLETON_FLAGS & Gio.BusNameOwnerFlags.ALLOW_REPLACEMENT)
+        self.assertTrue(SINGLETON_FLAGS & Gio.BusNameOwnerFlags.REPLACE)
+
+    def test_the_bus_accepts_the_flags_as_written(self) -> None:
+        """The one thing 22 tests of the handlers could not say.
+
+        `main` is the only caller and no test enters it, so a name that does
+        not exist on `Gio.BusNameOwnerFlags` reached a Pi and killed the tray
+        at startup. This calls the same function `main` does with the same
+        arguments; `tests/test_hygiene.py` covers the whole class of it.
+        """
+        owner_id = Gio.bus_own_name(
+            Gio.BusType.SESSION,
+            SINGLETON_NAME,
+            SINGLETON_FLAGS,
+            None,
+            None,
+            lambda *_a: None,
+        )
+        self.assertTrue(owner_id)
+        Gio.bus_unown_name(owner_id)
