@@ -482,8 +482,16 @@ class Tray:
         if item_id == ROOT_ID:
             return {"children-display": GLib.Variant("s", "submenu")}
         if item_id == QUIT_ID:
+            # Not "Quit SMBPal". This quits the tray process and nothing else:
+            # smbpald is a system service, the shares keep being served by smbd
+            # out of smbpal.conf, and the connections stay mounted because
+            # systemd's automount units hold them, not us. A label promising to
+            # quit SMBPal would be promising something no tray icon can do —
+            # and something no per-user icon should do to the other people
+            # logged in. The label says what actually happens instead, since
+            # the icon does not come back until the next login.
             return {
-                "label": GLib.Variant("s", "Quit SMBPal"),
+                "label": GLib.Variant("s", "Hide icon until next login"),
                 "enabled": GLib.Variant("b", True),
                 "visible": GLib.Variant("b", True),
             }

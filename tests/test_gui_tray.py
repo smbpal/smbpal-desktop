@@ -534,9 +534,21 @@ class TestTheMenusLayout(unittest.TestCase):
         child_id, properties, grandchildren = children[0]
         self.assertEqual(child_id, QUIT_ID)
         self.assertEqual(grandchildren, [])
-        self.assertIn("Quit", properties["label"])
+        self.assertTrue(properties["label"])
         self.assertTrue(properties["enabled"])
         self.assertTrue(properties["visible"])
+
+    def test_the_label_does_not_promise_to_quit_smbpal(self) -> None:
+        """It quits this process. smbpald, smbd and the mounts carry on.
+
+        A label saying `Quit SMBPal` would be read as stopping the sharing, and
+        someone who wanted the sharing stopped would walk away believing it was
+        — with the shares still being served. The item can only take the icon
+        away, so that is all it is allowed to claim.
+        """
+        _revision, (_id, _properties, children) = self.layout()
+        _child_id, properties, _grandchildren = children[0]
+        self.assertNotIn("smbpal", properties["label"].lower())
 
     def test_the_root_says_it_has_a_submenu(self) -> None:
         """Without `children-display` a panel draws the root and no children."""
