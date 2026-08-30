@@ -37,6 +37,9 @@ import subprocess
 from smbpal.ipc.peer import PeerCredentials
 
 log = logging.getLogger(__name__)
+# The same logger handlers.py audits mutations to, so an authorisation and the
+# change it permitted end up in one place and one order.
+audit = logging.getLogger("smbpal.audit")
 
 # The action ids in packaging/polkit/org.smbpal.policy. Duplicated in two files
 # by necessity — one is XML read by polkit, one is Python read by us — and
@@ -141,14 +144,20 @@ class Polkit:
             return False
 
         if completed.returncode == 0:
-            log.debug("polkit allowed %s for %s", action, peer.describe())
+            # info, not debug. A refusal explains itself to the person it
+            # happened to; a grant is silent, and a gate whose successes leave
+            # no trace cannot be told apart from a gate that is not running.
+            # That is exactly the question asked on 30 August 2026 when a
+            # mutation went through without a prompt and there was nothing in
+            # the journal to say whether polkit had been consulted at all.
+            audit.info("polkit allowed %s for %s", action, peer.describe())
             return True
         # Every other code is a refusal. They are distinguished in the log and
         # nowhere else: "not authorised", "dismissed the dialog" and "polkit is
         # broken" are the same answer to the question that was asked, and a
         # caller that could tell them apart would be tempted to treat one of
         # them as a yes.
-        log.info(
+        audit.info(
             "polkit refused %s for %s (%s exited %s%s)",
             action,
             peer.describe(),
