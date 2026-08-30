@@ -48,10 +48,15 @@
         problem this exists to solve was always the window, never the shell.
 
         A `unix-session` subject would keep across CLI invocations and is not
-        reachable: `pkcheck` can express --process or --system-bus-name and
-        nothing else, so it would mean the D-Bus API and python3-gi inside the
-        root daemon. Not worth a dependency to remove a prompt from the one
-        path where prompting is right.
+        reachable: `pkcheck` can express a process or a bus name and nothing
+        else, so it would mean the D-Bus API and python3-gi inside the root
+        daemon. Not worth a dependency to remove a prompt from the one path
+        where prompting is right.
+
+        (Two dashes in a row cannot appear in an XML comment, which is why the
+        flags are named in prose here. The parse failure was caught by the test
+        that reads this file — the second comment in this package to have been
+        more than a comment, after `#DEBHELPER#` in a maintainer script.)
       -->
       <allow_active>auth_admin_keep</allow_active>
     </defaults>
