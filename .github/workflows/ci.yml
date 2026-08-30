@@ -200,6 +200,22 @@ jobs:
             exit 1
           fi
 
+      # Generated in `dist` so the names inside are bare, which is what lets
+      # someone who downloaded both into one directory run `sha256sum -c`
+      # without editing the file first.
+      #
+      # Be clear about what this buys, because checksum files are routinely
+      # credited with more than they do: published beside the file it
+      # describes, it proves the download is *intact*, not that it is
+      # *authentic*. Anyone who could replace the .deb could replace this. It
+      # catches a truncated download and gives a value to compare against, and
+      # signing is a different job — see the release notes.
+      - name: Checksum
+        working-directory: dist
+        run: |
+          sha256sum smbpal_*_all.deb > SHA256SUMS
+          cat SHA256SUMS
+
       # A draft, so a person publishes it. Tagging is a routine act; putting a
       # binary in front of the public is not, and the two should not be the
       # same keystroke. Drop `--draft` here if that ever stops being true.
@@ -237,6 +253,19 @@ jobs:
           One file for every machine: the package is \`Architecture: all\`, so
           the same download installs on arm64, armhf and amd64.
 
+          ## Verify the download
+
+          \`\`\`sh
+          sha256sum -c SHA256SUMS
+          \`\`\`
+
+          Both files come from the same automated build. Note what that does
+          and does not show: a checksum published beside the file it describes
+          proves the download arrived intact, not that it is authentic —
+          anyone who could replace one could replace the other. Signed
+          verification is the apt repository's job, where \`apt\` checks it
+          without anyone having to remember to.
+
           ## Tested on
 
           Raspberry Pi OS Trixie, on a Pi 4. Nothing else has been run in
@@ -253,7 +282,8 @@ jobs:
 
           There is no warranty, to the extent permitted by law.
           NOTES
-          gh release create "$GITHUB_REF_NAME" dist/smbpal_*_all.deb \
+          gh release create "$GITHUB_REF_NAME" \
+            dist/smbpal_*_all.deb dist/SHA256SUMS \
             --draft \
             --title "SMBPal $version" \
             --notes-file notes.md
