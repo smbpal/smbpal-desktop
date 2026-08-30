@@ -24,6 +24,7 @@ from smbpal.errors import (
     SmbpalError,
     UnknownMethod,
 )
+from smbpal.daemon import polkit
 from smbpal.mounts import inventory, systemd, units
 from smbpal.mounts.apply import Mounter
 from smbpal.samba import control, passwd
@@ -68,12 +69,24 @@ SHARE_STATES = (
 class Authoriser:
     """Decides *may act*, which the socket's group guard does not answer (D4).
 
-    **Interim policy, and stated rather than implied.** The plan's answer is
-    polkit, which ships with the policy file at M7. Until then, mutating
-    methods require root or a peer that got through the socket's 0660
-    root:smbpal guard — which is to say, for now *may talk* and *may act* are
-    the same answer. The seam is this one method, so replacing it is a local
-    change, and every mutation is audited in the meantime.
+    The socket's `0660 root:smbpal` mode answers *may talk*. It cannot answer
+    *may act*, because everyone it lets through looks identical to it — and
+    from M2 until 30 August 2026 the daemon did not answer it either: any peer
+    past the guard could do anything. This class is where that stopped.
+
+    **Three policies, and only one of them is for production.** `polkit` is the
+    default and what the package ships. `root` and `group` exist because the
+    daemon has to be runnable where polkit is not — a development machine, a
+    container, macOS — and the honest way to do that is a flag that says which
+    rules are in force and gets logged at startup, rather than a silent
+    fallback that makes the weakest policy the one nobody chose.
+
+    **An unmapped mutating method is refused.** The method table is the list of
+    things that can be asked for; `ACTIONS` is the list of things that have
+    been thought about. A new method appears in the first and not the second by
+    forgetting, and the useful direction to fail in is the one that makes the
+    author notice. A test asserts the two agree, so the refusal is a backstop
+    and not the plan.
     """
 
     READ_ONLY = frozenset(
@@ -91,26 +104,84 @@ class Authoriser:
         }
     )
 
-    def __init__(self, *, allow_group_mutation: bool = True) -> None:
-        self.allow_group_mutation = allow_group_mutation
+    # Every mutating method, and the action a user is prompted for when they
+    # ask for it. Credentials split across two actions rather than getting a
+    # third: an SMB account password is part of sharing a folder, and a
+    # connection's password is part of that connection. Neither is a thing on
+    # its own that someone would sensibly hold a separate opinion about.
+    ACTIONS = {
+        "share.add": polkit.MANAGE_SHARES,
+        "share.remove": polkit.MANAGE_SHARES,
+        "share.make_writable": polkit.MANAGE_SHARES,
+        "apply": polkit.MANAGE_SHARES,
+        "teardown": polkit.MANAGE_SHARES,
+        "credential.set": polkit.MANAGE_SHARES,
+        "credential.remove": polkit.MANAGE_SHARES,
+        "connection.add": polkit.MANAGE_CONNECTIONS,
+        "connection.remove": polkit.MANAGE_CONNECTIONS,
+        "connection.set_credentials": polkit.MANAGE_CONNECTIONS,
+        "connection.use_fallback": polkit.MANAGE_CONNECTIONS,
+        "connection.connect": polkit.USE_CONNECTIONS,
+        "connection.disconnect": polkit.USE_CONNECTIONS,
+    }
+
+    POLICIES = ("polkit", "root", "group")
+
+    def __init__(
+        self,
+        *,
+        policy: str = "polkit",
+        checker: Any | None = None,
+    ) -> None:
+        if policy not in self.POLICIES:
+            raise ValueError(f"unknown authorisation policy: {policy}")
+        self.policy = policy
+        self.checker = checker if checker is not None else polkit.Polkit()
 
     def policy_note(self) -> str:
-        if self.allow_group_mutation:
-            return (
-                "authorisation: mutations allowed for any peer past the socket's "
-                "group guard (polkit lands with the policy file at M7)"
-            )
-        return "authorisation: mutations require uid 0"
+        if self.policy == "polkit":
+            where = self.checker.executable() if hasattr(self.checker, "executable") else None
+            found = where or "NOT FOUND — every mutation will be refused"
+            return f"authorisation: polkit, via {found}"
+        if self.policy == "root":
+            return "authorisation: mutations require uid 0; polkit is not being asked"
+        return (
+            "authorisation: INSECURE — any peer past the socket's group guard may "
+            "mutate. Development only; polkit is not being asked"
+        )
 
     def check(self, peer: PeerCredentials, method: str) -> None:
         if method in self.READ_ONLY:
             return
-        if peer.uid == 0 or self.allow_group_mutation:
+        # root can already do all of this with an editor, and the package's own
+        # prerm calls `smbpal teardown` as root while dpkg holds the machine.
+        # A prompt there would be a removal that hangs waiting for a dialog
+        # nobody is looking at.
+        if peer.uid == 0:
             return
-        raise NotPermitted(
-            f"{method} requires authorisation",
-            detail=f"peer {peer.describe()} is not permitted to perform this action",
-        )
+        if self.policy == "group":
+            return
+        if self.policy == "root":
+            raise self._refusal(peer, method)
+        action = self.ACTIONS.get(method)
+        if action is None:
+            log.error(
+                "%s mutates and has no polkit action; refusing it. Add it to "
+                "Authoriser.ACTIONS.",
+                method,
+            )
+            raise self._refusal(peer, method)
+        if self.checker.check(peer, action):
+            return
+        raise self._refusal(peer, method, action=action)
+
+    def _refusal(
+        self, peer: PeerCredentials, method: str, *, action: str | None = None
+    ) -> NotPermitted:
+        detail = f"peer {peer.describe()} is not permitted to perform this action"
+        if action is not None:
+            detail += f" ({action})"
+        return NotPermitted(f"{method} requires authorisation", detail=detail)
 
 
 class Dispatcher:

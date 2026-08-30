@@ -15,6 +15,7 @@ from pathlib import Path
 from smbpal import PROTOCOL_VERSION
 from smbpal.config import ConfigStore, empty_config
 from smbpal.daemon.handlers import Authoriser, Dispatcher
+from smbpal.daemon.polkit import MANAGE_SHARES
 from smbpal.errors import (
     BadRequest,
     DaemonUnreachable,
@@ -182,6 +183,23 @@ class TestErrors(ServerTestCase):
         self.assertEqual(client.call("ping"), {"pong": True})
 
 
+class RecordingChecker:
+    """A polkit that says the same thing every time and remembers being asked.
+
+    The interesting half is `calls`. A gate that lets the right things through
+    is only half of it; the other half is that it asked about the right action,
+    for the right peer, and did not ask at all about the read-only ones.
+    """
+
+    def __init__(self, *, answer: bool) -> None:
+        self.answer = answer
+        self.calls: list[tuple[PeerCredentials, str]] = []
+
+    def check(self, peer: PeerCredentials, action: str) -> bool:
+        self.calls.append((peer, action))
+        return self.answer
+
+
 class TestPeerAndAuthorisation(ServerTestCase):
     def test_the_peer_identity_comes_from_the_kernel(self) -> None:
         seen: list[PeerCredentials] = []
@@ -204,24 +222,47 @@ class TestPeerAndAuthorisation(ServerTestCase):
         self.assertEqual(seen[0].uid, os.getuid())
         self.assertEqual(seen[0].gid, os.getgid())
 
-    def test_the_strict_policy_refuses_a_mutation_from_a_non_root_peer(self) -> None:
+    def test_the_root_policy_refuses_a_mutation_from_a_non_root_peer(self) -> None:
         if os.getuid() == 0:
             self.skipTest("running as root; the refusal path needs a non-root peer")
-        self.dispatcher.authoriser = Authoriser(allow_group_mutation=False)
+        self.dispatcher.authoriser = Authoriser(policy="root")
         with self.assertRaises(NotPermitted):
             self.client().call("share.add", {"name": "X", "path": "/srv/x"})
 
-    def test_the_interim_policy_allows_a_peer_past_the_socket_guard(self) -> None:
-        # Stated rather than implied: until polkit ships with the policy file at
-        # M7, *may talk* and *may act* are the same answer. This test exists so
-        # that changing the policy breaks something visible.
-        self.assertTrue(self.dispatcher.authoriser.allow_group_mutation)
-        self.assertIn("polkit", self.dispatcher.authoriser.policy_note())
+    def test_a_mutation_is_put_to_polkit_and_allowed_if_it_says_yes(self) -> None:
+        asked = RecordingChecker(answer=True)
+        self.dispatcher.authoriser = Authoriser(policy="polkit", checker=asked)
         share = self.client().call("share.add", {"name": "X", "path": "/srv/x"})
         self.assertEqual(share["id"], "x")
+        self.assertEqual([action for _peer, action in asked.calls], [MANAGE_SHARES])
+
+    def test_a_mutation_is_refused_when_polkit_says_no(self) -> None:
+        self.dispatcher.authoriser = Authoriser(
+            policy="polkit", checker=RecordingChecker(answer=False)
+        )
+        with self.assertRaises(NotPermitted) as raised:
+            self.client().call("share.add", {"name": "X", "path": "/srv/x"})
+        # The action is in the detail because the person who has to fix this is
+        # writing a polkit rule, and a rule is written against an action id.
+        self.assertIn(MANAGE_SHARES, raised.exception.detail or "")
+
+    def test_polkit_is_asked_about_the_peer_the_kernel_reported(self) -> None:
+        """Not about anything in the message, which D4 does not trust."""
+        asked = RecordingChecker(answer=True)
+        self.dispatcher.authoriser = Authoriser(policy="polkit", checker=asked)
+        self.client().call("share.add", {"name": "X", "path": "/srv/x"})
+        peer, _action = asked.calls[0]
+        self.assertEqual(peer.uid, os.getuid())
+
+    def test_a_read_only_method_never_reaches_polkit(self) -> None:
+        asked = RecordingChecker(answer=False)
+        self.dispatcher.authoriser = Authoriser(policy="polkit", checker=asked)
+        self.assertEqual(self.client().call("ping"), {"pong": True})
+        self.assertEqual(self.client().call("share.list"), [])
+        self.assertEqual(asked.calls, [])
 
     def test_read_only_methods_never_reach_the_mutation_gate(self) -> None:
-        self.dispatcher.authoriser = Authoriser(allow_group_mutation=False)
+        self.dispatcher.authoriser = Authoriser(policy="root")
         self.assertEqual(self.client().call("ping"), {"pong": True})
         self.assertEqual(self.client().call("share.list"), [])
 

@@ -17,7 +17,8 @@ Depends: ${python3:Depends},
          ${misc:Depends},
          samba,
          samba-common-bin,
-         cifs-utils
+         cifs-utils,
+         polkitd | policykit-1
 Recommends: python3-gi,
             gir1.2-gtk-4.0,
             avahi-daemon,

@@ -25,7 +25,7 @@ from smbpal.config import ConfigStore
 from smbpal.mounts.apply import MARKER, Mounter
 from smbpal.mounts.credentials import CredentialsStore
 from smbpal.mounts.probe import MountProbe
-from smbpal.daemon.handlers import Dispatcher
+from smbpal.daemon.handlers import Authoriser, Dispatcher
 from smbpal.ipc.server import UnixSocketTransport
 from tests.fakes import FakeSamba
 
@@ -37,7 +37,13 @@ class CliTestCase(unittest.TestCase):
         root = Path(self._dir.name)
         self.socket_path = root / "s.sock"
         self.store = ConfigStore(root / "config.json")
-        self.dispatcher = Dispatcher(self.store)
+        # These are CLI tests and the peer is whoever runs them, so the
+        # daemon is started with authorisation off rather than with a fake
+        # polkit that would answer yes to everything anyway. What guards the
+        # gate itself is test_ipc, and it does it against the gate.
+        self.dispatcher = Dispatcher(
+            self.store, authoriser=Authoriser(policy="group")
+        )
         self.transport = UnixSocketTransport(self.socket_path, group=None)
         self.transport.bind()
         self.thread = threading.Thread(

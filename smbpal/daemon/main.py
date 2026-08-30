@@ -20,7 +20,7 @@ from types import FrameType
 from smbpal import __version__
 from smbpal.config import ConfigStore
 from smbpal.config.store import DEFAULT_CONFIG_PATH
-from smbpal.daemon.handlers import Dispatcher
+from smbpal.daemon.handlers import Authoriser, Dispatcher
 from smbpal.discovery.advertise import DEFAULT_SERVICE_FILE, Advertiser
 from smbpal.errors import SmbpalError
 from smbpal.mounts.apply import Mounter
@@ -93,6 +93,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_CREDENTIALS_DIR,
         help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--authorisation",
+        default="polkit",
+        choices=Authoriser.POLICIES,
+        help="who may perform a mutating method. 'polkit' (default) asks polkit "
+        "for the peer, which is what the package ships. 'root' allows uid 0 and "
+        "refuses everyone else. 'group' allows anyone the socket let through, "
+        "which is no authorisation at all and exists for development on a "
+        "machine with no polkit; the daemon says so at startup.",
     )
     parser.add_argument("--version", action="version", version=f"smbpald {__version__}")
     return parser
@@ -168,8 +178,24 @@ def main(argv: list[str] | None = None) -> int:
             interval=args.watch_interval,
         )
 
-    dispatcher = Dispatcher(store, applier=applier, mounter=mounter, monitor=monitor)
+    dispatcher = Dispatcher(
+        store,
+        authoriser=Authoriser(policy=args.authorisation),
+        applier=applier,
+        mounter=mounter,
+        monitor=monitor,
+    )
+    # Logged at every start, not only when it is interesting. A line saying
+    # which rules are in force is worth nothing if it only appears when they
+    # are the weak ones, because then nobody has ever seen it and nobody reads
+    # for its absence.
     log.info("%s", dispatcher.authoriser.policy_note())
+    if args.authorisation == "group":
+        log.warning(
+            "authorisation is disabled: any process that can open the socket "
+            "can change what this machine shares. Do not run this on a machine "
+            "anyone else uses."
+        )
     _install_signal_handlers(transport)
     if monitor is not None:
         monitor.start()

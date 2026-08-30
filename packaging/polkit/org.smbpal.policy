@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+
+<!--
+  Three actions, not one and not twenty-three.
+
+  One would have made every prompt say the same thing, and the prompt is the
+  only part of this file a user ever reads. Twenty-three — one per mutating
+  IPC method — would be a second copy of the method table, free to drift from
+  the first, and nobody would ever write a rule against `share.make_writable`
+  that they would not write against `share.add`.
+
+  The line that earns a separate action is *configuring the machine* against
+  *using what is already configured*. Everything in the first two actions
+  outlives the session and applies to every user on the machine; the third
+  does not.
+-->
+<policyconfig>
+  <vendor>SMBPal</vendor>
+  <vendor_url>https://github.com/smbpal/smbpal-desktop</vendor_url>
+  <icon_name>smbpal</icon_name>
+
+  <action id="org.smbpal.manage-shares">
+    <description>Change the folders this computer shares</description>
+    <message>Authentication is required to change the folders this computer shares on the network</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <!--
+        _keep, and only here. Adding a share is several calls that look like
+        one action to the person making it: add, set a password, apply. Three
+        prompts for one intention is how people learn to type their password
+        without reading the box.
+      -->
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.smbpal.manage-connections">
+    <description>Change the network shares this computer connects to</description>
+    <message>Authentication is required to change the network shares this computer connects to</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.smbpal.use-connections">
+    <description>Connect to and disconnect from a configured network share</description>
+    <message>Authentication is required to connect to a network share</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <!--
+        `yes`, deliberately, and it is the one value in this file that needs
+        defending.
+
+        A configured connection is an armed systemd automount. Any local user
+        who so much as runs `ls` on the mountpoint mounts it, with no prompt,
+        because that is what an automount is for and §3h chose it on purpose.
+        Putting a password prompt on the button that does the same thing would
+        protect nothing and teach the user that SMBPal's prompts are noise —
+        which is the last thing to teach someone whose next prompt guards
+        changing what the machine shares with the network.
+
+        Disconnecting is a nuisance one logged-in user can inflict on another.
+        On the single-user machine §5 describes that is not worth a prompt.
+        It is the first thing to revisit if SMBPal ever targets a shared one.
+      -->
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+</policyconfig>
