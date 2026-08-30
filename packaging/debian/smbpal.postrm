@@ -14,9 +14,68 @@ set -e
 #
 # The smbpal group is left alone. Debian does not remove system groups on
 # purge, and a stale gid on files elsewhere is worse than an unused group.
+
+# Backstop for the Samba side. prerm's teardown is what normally removes it,
+# and when that has run this is a no-op — but teardown needs /usr/bin/smbpal
+# and a daemon that answers, and there are purge paths with neither: a purge of
+# a package that was already half-removed, a teardown that failed and only
+# warned, a daemon that would not start in the first place. Left behind, the
+# include block sits in somebody else's smb.conf indefinitely with nothing
+# installed that explains it.
+#
+# Every install has a Samba side to clean up, including one that only ever
+# mounted remote shares: SambaApplier.apply writes smbpal.conf and inserts the
+# include unconditionally, and the daemon applies on every commit, so adding a
+# connection is enough to put the block in the file.
+#
+# This duplicates smbpal/samba/include.py in sed, which is a real cost — the
+# two can drift. It is bounded by the markers being a fixed string and the
+# block being written flush-left and never nested, and the alternative is a
+# backstop that cannot run without the binary dpkg has already deleted.
+remove_smb_conf_block() {
+    conf=/etc/samba/smb.conf
+    [ -f "$conf" ] || return 0
+
+    begins=$(grep -c '^[[:space:]]*# >>> smbpal >>>[[:space:]]*$' "$conf" || true)
+    ends=$(grep -c '^[[:space:]]*# <<< smbpal <<<[[:space:]]*$' "$conf" || true)
+
+    if [ "$begins" = 0 ] && [ "$ends" = 0 ]; then
+        return 0
+    fi
+
+    # Refusing beats guessing, the same way include.remove_include refuses an
+    # unterminated block. A `/begin/,/end/d` with no end deletes to the end of
+    # the file, and this is a file we did not write.
+    if [ "$begins" != 1 ] || [ "$ends" != 1 ]; then
+        echo "SMBPal: $conf has $begins opening and $ends closing markers," >&2
+        echo "  which is not the one block SMBPal writes. Leaving it alone;" >&2
+        echo "  remove the block by hand." >&2
+        return 0
+    fi
+
+    tmp=$(mktemp "$conf.smbpal-purge.XXXXXX") || return 0
+    if sed -e '/^[[:space:]]*# >>> smbpal >>>[[:space:]]*$/,/^[[:space:]]*# <<< smbpal <<<[[:space:]]*$/d' \
+           -e '\%^[[:space:]]*include[[:space:]]*=[[:space:]]*/etc/samba/smbpal\.conf[[:space:]]*$%d' \
+           "$conf" > "$tmp"; then
+        # cat rather than mv, so the file keeps its inode, mode and owner
+        # instead of inheriting mktemp's 0600 root.
+        cat "$tmp" > "$conf"
+    fi
+    rm -f "$tmp"
+}
+
 case "$1" in
     purge)
         rm -rf /etc/smbpal
+        remove_smb_conf_block
+        rm -f /etc/samba/smbpal.conf
+        rm -f /etc/avahi/services/smbpal.service
+        # Best effort, and deliberately not fatal: a Samba that will not reload
+        # is worth nothing next to a purge that fails half-done. The file is
+        # already correct on disk either way.
+        if [ -x /usr/sbin/smbcontrol ]; then
+            smbcontrol smbd reload-config >/dev/null 2>&1 || true
+        fi
         ;;
 esac
 
