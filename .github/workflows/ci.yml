@@ -15,6 +15,10 @@ name: CI
 on:
   push:
     branches: [main]
+    # A tag runs the whole thing, deliberately. The release job takes the
+    # artifact from `package`, which is the job that installs, removes and
+    # purges it — so a tag cannot produce a download that was never exercised.
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -156,3 +160,101 @@ jobs:
           name: deb
           path: dist/*.deb
           if-no-files-found: error
+
+  # Only on a tag. §11.3 needs every release tagged and matching the exact
+  # build, because under GPL the obligation attaches to the Corresponding
+  # Source for *that* binary rather than to whatever `main` holds. Attaching
+  # the .deb to the tag is what makes that structural instead of a promise.
+  #
+  # The CI artifact above cannot be the download: `upload-artifact` files need
+  # a logged-in GitHub account to fetch and expire after 90 days.
+  release:
+    name: release
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: deb
+          path: dist
+
+      # The failure this prevents is unfixable after the fact: a file named for
+      # one version containing another is already on somebody's disk by the
+      # time anyone notices. `tests` checks that the three files in the tree
+      # agree; this is the only moment the tag exists to be checked against.
+      - name: The tag and the package must be the same version
+        run: |
+          deb=$(ls dist/smbpal_*_all.deb)
+          built=$(dpkg-deb --field "$deb" Version)
+          tagged=${GITHUB_REF_NAME#v}
+          echo "tag $GITHUB_REF_NAME -> $tagged, package $built ($(basename "$deb"))"
+          if [ "$built" != "$tagged" ]; then
+            echo "the tag says $tagged and the package says $built" >&2
+            echo "fix debian/changelog, pyproject.toml and smbpal/__init__.py," >&2
+            echo "then move the tag. Do not publish this build." >&2
+            exit 1
+          fi
+
+      # A draft, so a person publishes it. Tagging is a routine act; putting a
+      # binary in front of the public is not, and the two should not be the
+      # same keystroke. Drop `--draft` here if that ever stops being true.
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          cat > notes.md <<NOTES
+          ## Install
+
+          Raspberry Pi OS, or any Debian-based system. **Three steps, and the
+          second is not optional.**
+
+          \`\`\`sh
+          sudo apt install ./smbpal_${version}_all.deb
+          sudo usermod -aG smbpal \$USER
+          \`\`\`
+
+          Then log out and back in.
+
+          The second step is what lets you talk to the daemon: SMBPal's socket
+          is guarded by the \`smbpal\` group, and the package deliberately does
+          not add anyone to it, because granting it is granting access to a
+          service running as root and that is the machine administrator's
+          decision. Installing by double-clicking the file will appear to work
+          and then leave the app unable to reach the daemon — graphical
+          installers hide the message that tells you this.
+
+          Use \`apt install ./...\` rather than \`dpkg -i\`. It pulls in samba,
+          cifs-utils and polkit; \`dpkg\` will stop on them and leave the
+          package half-configured. The leading \`./\` matters — without a slash
+          apt reads the argument as a package name.
+
+          One file for every machine: the package is \`Architecture: all\`, so
+          the same download installs on arm64, armhf and amd64.
+
+          ## Tested on
+
+          Raspberry Pi OS Trixie, on a Pi 4. Nothing else has been run in
+          anger — it is expected to work on other Debian-based systems, but
+          that is an expectation and not a report.
+
+          ## Source
+
+          SMBPal is free software under the GNU General Public License,
+          version 3 or later. The complete corresponding source for this build
+          is the \`$GITHUB_REF_NAME\` tag of this repository:
+
+          https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_REF_NAME}
+
+          There is no warranty, to the extent permitted by law.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" dist/smbpal_*_all.deb \
+            --draft \
+            --title "SMBPal $version" \
+            --notes-file notes.md
+          echo "Draft release created. Review it, then publish it by hand."

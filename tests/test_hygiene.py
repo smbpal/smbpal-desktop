@@ -603,3 +603,42 @@ class TestTheLicence(unittest.TestCase):
         self.assertEqual(
             1, len(authors), f"history shows more than one author: {authors}"
         )
+
+
+class TestTheVersionIsOneNumber(unittest.TestCase):
+    """The version is written in three files, and a release tag makes a fourth.
+
+    §11.3 requires every release tagged and matching the exact build, because
+    under GPL the obligation attaches to the Corresponding Source for *that*
+    binary and not to whatever `main` happens to hold. That promise is only as
+    good as the four numbers agreeing, and nothing checked them: `pyproject`
+    feeds the wheel, `smbpal/__init__.py` feeds `--version` and the daemon's
+    startup line, and `debian/changelog` alone decides what the `.deb` is
+    called. A release built from a tree where they disagree ships a file named
+    for one version containing another, which is unfixable after the fact —
+    the wrong file is already on somebody's machine.
+
+    The tag is checked in CI, at the only moment it exists.
+    """
+
+    def version(self) -> str:
+        from smbpal import __version__
+
+        return __version__
+
+    def test_pyproject_matches(self) -> None:
+        import tomllib
+
+        data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertEqual(self.version(), data["project"]["version"])
+
+    def test_the_debian_changelog_matches(self) -> None:
+        # `smbpal (0.1.0) unstable; urgency=medium` — the version in parentheses
+        # is what names the .deb, so it is the one that reaches a user's disk.
+        first = (
+            (ROOT / "packaging" / "debian" / "changelog")
+            .read_text(encoding="utf-8")
+            .splitlines()[0]
+        )
+        opened, closed = first.index("("), first.index(")")
+        self.assertEqual(self.version(), first[opened + 1 : closed])
