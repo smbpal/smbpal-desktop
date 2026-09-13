@@ -214,3 +214,20 @@ vendored code in the tree.
 Contributions need a CLA before they can be merged — see
 [`CONTRIBUTING.md`](CONTRIBUTING.md) for why, in one paragraph.
 
+### Trademark
+
+**The name SMBPal and the SMBPal wordmark are not licensed with the code.**
+Rights under trademark law are declined as a supplementary term under GPL-3.0
+§7(e), which permits exactly this. It restricts nothing about copying, modifying
+or distributing the software, and SMBPal remains free software with or without
+it. The reason is that this package installs a daemon running as root, so "whose
+software is this, and who do I report a problem to" is a security question
+rather than a branding one.
+
+Fork it freely and give the result its own name. Packagers may distribute it
+under its own name with the patches packaging normally needs, without asking.
+The three status icons in `packaging/icons/` **are** GPL and stay GPL: they went
+public under it and they are glyphs, not a mark.
+
+Full policy: [TRADEMARK.md](https://github.com/smbpal/.github/blob/main/TRADEMARK.md).
+
