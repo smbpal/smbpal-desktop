@@ -4,9 +4,10 @@ Thanks for looking. Issues and pull requests are welcome.
 
 ## The CLA, and the one reason it exists
 
-**A pull request cannot be merged until its author has signed the contributor
-licence agreement.** This is not boilerplate and it is not about ownership for
-its own sake — it buys exactly one thing, and losing it is permanent.
+**A pull request cannot be merged until its author has signed the
+[contributor licence agreement](https://github.com/smbpal/.github/blob/main/CLA.md).**
+This is not boilerplate and it is not about ownership for its own sake — it buys
+exactly one thing, and losing it is permanent.
 
 SMBPal is GPL-3.0-or-later. Apple's App Store terms and the GPL are in
 long-standing conflict: the App Store adds usage restrictions the GPL forbids
@@ -16,10 +17,27 @@ build, same code, two grants — and dual-licensing is only available to a singl
 copyright holder. One merged contribution whose copyright sits elsewhere ends
 the ability to ship SMBPal on iOS at all, for everyone, forever.
 
-So the CLA asks a contributor to assign or licence their copyright broadly
-enough that the dual-licence stays possible. Everything contributed remains
-GPL-3.0-or-later here, in this repository, permanently — that part is not
-something the CLA can take away.
+So the CLA asks a contributor to licence their copyright broadly enough that the
+dual-licence stays possible. **It is a licence and not an assignment**: you keep
+your copyright and may use your own work anywhere else, under any terms you like.
+
+Everything contributed remains GPL-3.0-or-later here, in this repository,
+permanently — that part is not something the CLA can take away, and clause 4
+says so in the agreement itself rather than only here. It also binds the other
+direction: a later version of the CLA cannot be applied backwards to something
+already submitted under this one.
+
+**To sign**, put this in the description of your first pull request:
+
+```
+I have read and agree to the SMBPal Contributor Licence Agreement, version 1.0.
+Signed: <your name>, <date>
+```
+
+There is no bot. One maintainer and no contributors yet makes a manual process
+the honest one. Signatures are recorded in `CONTRIBUTORS.md` in the `.github`
+repository when the pull request merges, so what was agreed and when is public
+rather than buried in a thread.
 
 If you would rather not sign one, an issue describing the bug or the design is
 genuinely as useful, and often more so.
