@@ -41,6 +41,8 @@ if Gio is not None:
         MENU_INTERFACE,
         MENU_INTROSPECTION,
         MENU_PATH,
+        NEW_CONNECTION_ID,
+        NEW_SHARE_ID,
         OPEN_ID,
         QUIT_ID,
         ROOT_ID,
@@ -538,10 +540,17 @@ class TestTheMenusLayout(unittest.TestCase):
         _revision, (_id, _properties, children) = self.layout()
         return {child_id: properties for child_id, properties, _g in children}
 
-    def test_the_menu_is_manage_then_close(self) -> None:
+    def test_the_menu_is_new_share_new_connection_manage_close(self) -> None:
         _revision, (item_id, _properties, children) = self.layout()
         self.assertEqual(item_id, ROOT_ID)
-        self.assertEqual([child[0] for child in children], [OPEN_ID, QUIT_ID])
+        self.assertEqual(
+            [child[0] for child in children],
+            [NEW_SHARE_ID, NEW_CONNECTION_ID, OPEN_ID, QUIT_ID],
+        )
+        self.assertEqual(
+            [child[1]["label"] for child in children[:2]],
+            ["New Share", "New Connection"],
+        )
         for child_id, properties, grandchildren in children:
             with self.subTest(item=child_id):
                 self.assertEqual(grandchildren, [])
@@ -695,6 +704,29 @@ class TestStopping(unittest.TestCase):
         self.tray.open_window = lambda: opened.append(True)
         self.event(OPEN_ID, "clicked")
         self.assertEqual((opened, self.quits), ([True], 0))
+
+    def test_the_new_items_open_the_gui_with_their_form(self) -> None:
+        """Still enabled with the window open: the form comes up in it."""
+        launched: list[tuple[str, ...]] = []
+        self.tray.open_window = lambda *extra: launched.append(extra)
+        self.tray.gui_appeared(None, "org.smbpal.Smbpal", ":1.9")
+        self.event(NEW_SHARE_ID, "clicked")
+        self.event(NEW_CONNECTION_ID, "clicked")
+        self.event(NEW_SHARE_ID, "hovered")
+        self.assertEqual(launched, [("--new-share",), ("--new-connection",)])
+        self.assertEqual(self.quits, 0)
+
+    def test_the_flags_are_appended_to_the_launch_command(self) -> None:
+        """A source tree's launch is several words; the flag goes on the end."""
+        started: list[list[str]] = []
+        tray = Tray(FakeSession(), launch=["python3", "-m", "smbpal.gui.app"])
+        original = Gio.Subprocess.new
+        Gio.Subprocess.new = lambda argv, _flags: started.append(argv)
+        try:
+            tray.open_window("--new-share")
+        finally:
+            Gio.Subprocess.new = original
+        self.assertEqual(started[0][1:], ["-m", "smbpal.gui.app", "--new-share"])
 
     def test_clicking_manage_while_the_gui_is_open_does_nothing(self) -> None:
         """A panel holding a stale layout can still deliver a click on it."""

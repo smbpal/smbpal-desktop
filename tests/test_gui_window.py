@@ -211,3 +211,24 @@ class TestARowIsHeldWhileItsOwnCallIsInFlight(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+@needs_gtk
+class TestTheFormFlags(unittest.TestCase):
+    """The tray runs `smbpal-gui --new-share`; nothing checks the spelling but this."""
+
+    def test_the_tray_flags_are_the_app_actions(self) -> None:
+        from smbpal.gui import app, tray
+
+        self.assertEqual(
+            sorted(flag for _label, flag in tray.FORM_ITEMS.values()),
+            sorted(f"--{name}" for name in app.FORMS),
+        )
+
+    def test_every_form_action_names_a_window_action(self) -> None:
+        from smbpal.gui import app
+
+        window = Window(None, FakeSession())
+        for form in app.FORMS.values():
+            with self.subTest(action=form):
+                self.assertIsNotNone(window.lookup_action(form))

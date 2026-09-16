@@ -32,6 +32,12 @@ from smbpal.ipc.server import DEFAULT_SOCKET_PATH  # noqa: E402
 
 log = logging.getLogger(__name__)
 
+# Application actions that open the window with a form already up, keyed by
+# the command-line flag's spelling, valued by the window action behind the
+# header bar's Add button. The tray's New Share and New Connection items run
+# `smbpal-gui --new-share` and `--new-connection`.
+FORMS = {"new-share": "add-share", "new-connection": "add-connection"}
+
 
 def to_main_thread(callback: Callable[[], None]) -> None:
     """Run it on the GTK main loop.
@@ -54,6 +60,25 @@ class Application(Gtk.Application):
     def do_startup(self) -> None:  # noqa: N802 - GObject vfunc name
         Gtk.Application.do_startup(self)
         install_css()
+        for name, form in FORMS.items():
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", self._open_form, form)
+            self.add_action(action)
+
+    def _open_form(self, _action: Gio.SimpleAction, _param: object, form: str) -> None:
+        """The window first, then its form — the same one the Add button opens.
+
+        Through the window's own action rather than building the dialog here,
+        so a second request raises the form already open instead of stacking
+        another: `add_menu` keeps that one-per-kind rule and this reuses it.
+        """
+        self.activate()
+        window = self.get_active_window()
+        action = window.lookup_action(form) if window is not None else None
+        if action is None:
+            log.error("no window action %s to open", form)
+            return
+        action.activate(None)
 
     def do_activate(self) -> None:  # noqa: N802 - GObject vfunc name
         window = self.get_active_window()
@@ -85,12 +110,40 @@ def main(argv: list[str] | None = None) -> int:
         help="path to the daemon's socket (for testing against a second daemon)",
     )
     parser.add_argument("--debug", action="store_true", help="log at debug level")
+    forms = parser.add_mutually_exclusive_group()
+    for name in FORMS:
+        forms.add_argument(
+            f"--{name}",
+            dest="form",
+            action="store_const",
+            const=name,
+            help=f"open the window with the {name.replace('-', ' ')} form up",
+        )
     args, rest = parser.parse_known_args(argv if argv is not None else sys.argv[1:])
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
     )
-    return Application(args.socket).run([sys.argv[0], *rest])
+    application = Application(args.socket)
+    if args.form is None:
+        return application.run([sys.argv[0], *rest])
+    # **Registered first, because a flag is not something `run` forwards.**
+    # With `FLAGS_NONE` a second launch sends the running instance a bare
+    # Activate and exits, so `--new-share` would only raise the window. An
+    # action is forwarded: on a remote instance `activate_action` is a D-Bus
+    # call to the primary, which runs the handler there.
+    application.register(None)
+    if application.get_is_remote():
+        application.activate_action(args.form, None)
+        # The call is queued, not sent; exiting now can drop it.
+        connection = application.get_dbus_connection()
+        if connection is not None:
+            connection.flush_sync(None)
+        return 0
+    GLib.idle_add(
+        lambda: (application.activate_action(args.form, None), GLib.SOURCE_REMOVE)[1]
+    )
+    return application.run([sys.argv[0], *rest])
 
 
 if __name__ == "__main__":  # pragma: no cover

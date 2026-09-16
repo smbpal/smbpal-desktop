@@ -71,12 +71,22 @@ SINGLETON_FLAGS = (
 )
 
 # dbusmenu item ids. 0 is the root by convention. The ids are not the order:
-# Manage was added after Close and sits above it, and an id a panel has cached
-# must not change meaning, so Close keeps 1.
+# items were added above Close over time, and an id a panel has cached must
+# not change meaning, so each keeps the one it was given.
 ROOT_ID = 0
 QUIT_ID = 1
 OPEN_ID = 2
-MENU_ORDER = (OPEN_ID, QUIT_ID)
+NEW_SHARE_ID = 3
+NEW_CONNECTION_ID = 4
+MENU_ORDER = (NEW_SHARE_ID, NEW_CONNECTION_ID, OPEN_ID, QUIT_ID)
+
+# Label, and the `smbpal-gui` flag that opens the window with that form up.
+# The flags are `app.FORMS`; spelled out here because the tray cannot import
+# `app` without loading Gtk.
+FORM_ITEMS = {
+    NEW_SHARE_ID: ("New Share", "--new-share"),
+    NEW_CONNECTION_ID: ("New Connection", "--new-connection"),
+}
 
 # Which icon for which status is `model.ICONS`, with the rest of the
 # decisions. Re-exported so `from ...tray import ICONS` keeps working.
@@ -126,7 +136,7 @@ INTROSPECTION = """
 """
 
 # The menu, as a second interface on a second object path. All of it is owed
-# for two items: on Wayland a client cannot place a popup at the panel's
+# for a handful of items: on Wayland a client cannot place a popup at the panel's
 # coordinates — it has no surface there — so the panel draws the menu and this
 # is the only way to describe one to it. Plan §3g decided Quit as the only
 # item; Manage joined it on 16 September 2026, because GNOME's AppIndicator
@@ -530,6 +540,15 @@ class Tray:
         """One item's properties, in dbusmenu's vocabulary."""
         if item_id == ROOT_ID:
             return {"children-display": GLib.Variant("s", "submenu")}
+        if item_id in FORM_ITEMS:
+            # Enabled whether or not the window is open: with it open, the
+            # form comes up in it.
+            label, _flag = FORM_ITEMS[item_id]
+            return {
+                "label": GLib.Variant("s", label),
+                "enabled": GLib.Variant("b", True),
+                "visible": GLib.Variant("b", True),
+            }
         if item_id == OPEN_ID:
             # "Manage", not "Open SMBPal": it is the verb for what the window
             # is for. Disabled rather than hidden while the window is open: an
@@ -680,6 +699,8 @@ class Tray:
             # Checked here too: a panel that cached the layout before the GUI
             # started can still deliver a click on an item now disabled.
             self.open_window()
+        elif item_id in FORM_ITEMS:
+            self.open_window(FORM_ITEMS[item_id][1])
 
     # --- stopping ----------------------------------------------------------
 
@@ -706,8 +727,8 @@ class Tray:
 
     # --- the click ---------------------------------------------------------
 
-    def open_window(self) -> None:
-        argv = list(self.launch)
+    def open_window(self, *extra: str) -> None:
+        argv = [*self.launch, *extra]
         argv[0] = shutil.which(argv[0]) or argv[0]
         try:
             Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE)
