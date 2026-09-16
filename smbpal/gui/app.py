@@ -23,15 +23,12 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Gio, GLib, Gtk  # noqa: E402
 
+from smbpal.gui import APP_ID  # noqa: E402
 from smbpal.gui.session import Session  # noqa: E402
 from smbpal.gui.window import Window, install_css  # noqa: E402
 from smbpal.ipc.client import Client  # noqa: E402
 from smbpal.ipc.server import DEFAULT_SOCKET_PATH  # noqa: E402
 
-# Provisional until M7 settles the packaging identity: this string ends up in
-# the .desktop file name, the icon name and the tray's bus name, and changing
-# it after those exist is three coordinated renames.
-APP_ID = "org.smbpal.Smbpal"
 
 log = logging.getLogger(__name__)
 

@@ -34,7 +34,7 @@ from typing import Any
 
 from gi.repository import Gio, GLib
 
-from smbpal.gui import model
+from smbpal.gui import APP_ID, model
 from smbpal.gui.session import Session
 from smbpal.ipc.client import Client
 from smbpal.ipc.server import DEFAULT_SOCKET_PATH
@@ -70,9 +70,13 @@ SINGLETON_FLAGS = (
     Gio.BusNameOwnerFlags.ALLOW_REPLACEMENT | Gio.BusNameOwnerFlags.REPLACE
 )
 
-# dbusmenu item ids. 0 is the root by convention; the menu holds one item.
+# dbusmenu item ids. 0 is the root by convention. The ids are not the order:
+# Manage was added after Close and sits above it, and an id a panel has cached
+# must not change meaning, so Close keeps 1.
 ROOT_ID = 0
 QUIT_ID = 1
+OPEN_ID = 2
+MENU_ORDER = (OPEN_ID, QUIT_ID)
 
 # Which icon for which status is `model.ICONS`, with the rest of the
 # decisions. Re-exported so `from ...tray import ICONS` keeps working.
@@ -122,10 +126,12 @@ INTROSPECTION = """
 """
 
 # The menu, as a second interface on a second object path. All of it is owed
-# for one item: on Wayland a client cannot place a popup at the panel's
+# for two items: on Wayland a client cannot place a popup at the panel's
 # coordinates — it has no surface there — so the panel draws the menu and this
 # is the only way to describe one to it. Plan §3g decided Quit as the only
-# item; the interface cost is the same either way and the item count is not.
+# item; Manage joined it on 16 September 2026, because GNOME's AppIndicator
+# extension sends a single left click to the menu whatever `ItemIsMenu` says,
+# and there the menu is the only single-click way to the window.
 MENU_INTROSPECTION = """
 <node>
   <interface name="com.canonical.dbusmenu">
@@ -189,8 +195,9 @@ MENU_INTROSPECTION = """
 class Tray:
     """One StatusNotifierItem, fed by the same `Session` the window uses."""
 
-    # The menu never changes, so the revision never has to. It exists in the
-    # protocol for menus that rebuild themselves; this one is one item.
+    # Bumped when an item's properties change, which is only Manage being
+    # enabled and disabled as the GUI comes and goes. The items themselves
+    # never change.
     menu_revision = 1
 
     def __init__(
@@ -221,6 +228,11 @@ class Tray:
         # Set by `main`, so that both ways out of the process — the menu's Quit
         # and losing the singleton name to a newer tray — go through one place.
         self.on_quit: Any = None
+
+        # Whether a GUI owns `APP_ID` on the session bus. Watched by `main`;
+        # False until told otherwise, so a tray that cannot watch leaves Manage
+        # usable rather than stuck disabled.
+        self.gui_open = False
 
         self._offline: str | None = None
         self._watcher_present = False
@@ -433,7 +445,11 @@ class Tray:
         if name == "ItemIsMenu":
             # Still false, and the menu does not change it. False means a left
             # click reaches `Activate` and opens the window, which is what the
-            # icon is mostly for; the menu is what a right click gets.
+            # icon is mostly for; the menu is what a right click gets. Not on
+            # GNOME's AppIndicator extension, which ignores this: a single left
+            # click there opens the menu and only a double click reaches
+            # `Activate` (`indicatorStatusIcon.js`). Accepted, with Manage in
+            # the menu as the single-click way in.
             return GLib.Variant("b", False)
         if name == "Menu":
             return GLib.Variant("o", MENU_PATH)
@@ -475,12 +491,54 @@ class Tray:
             self.open_window()
         invocation.return_value(None)
 
+    # --- the window --------------------------------------------------------
+
+    def gui_appeared(self, *_a: Any) -> None:
+        self._set_gui_open(True)
+
+    def gui_vanished(self, *_a: Any) -> None:
+        self._set_gui_open(False)
+
+    def _set_gui_open(self, is_open: bool) -> None:
+        """Grey Manage out while the window exists, and tell the panel.
+
+        The bus name is the GUI's own `Gio.Application` registration, held
+        from startup to exit, and GTK exits the application when its last
+        window closes — so owning the name and having a window are the same
+        thing, give or take the moment between startup and `present`.
+        """
+        if self.gui_open == is_open:
+            return
+        self.gui_open = is_open
+        self.menu_revision += 1
+        if self._connection is None:
+            return
+        self._connection.emit_signal(
+            None,
+            MENU_PATH,
+            MENU_INTERFACE,
+            "ItemsPropertiesUpdated",
+            GLib.Variant(
+                "(a(ia{sv})a(ias))",
+                ([(OPEN_ID, {"enabled": GLib.Variant("b", not is_open)})], []),
+            ),
+        )
+
     # --- the menu ----------------------------------------------------------
 
     def _menu_properties(self, item_id: int) -> dict[str, Any]:
         """One item's properties, in dbusmenu's vocabulary."""
         if item_id == ROOT_ID:
             return {"children-display": GLib.Variant("s", "submenu")}
+        if item_id == OPEN_ID:
+            # "Manage", not "Open SMBPal": it is the verb for what the window
+            # is for. Disabled rather than hidden while the window is open: an
+            # item that comes and goes moves Close under the pointer.
+            return {
+                "label": GLib.Variant("s", "Manage"),
+                "enabled": GLib.Variant("b", not self.gui_open),
+                "visible": GLib.Variant("b", True),
+            }
         if item_id == QUIT_ID:
             # Not "Quit SMBPal". This closes the tray process and nothing
             # else: smbpald is a system service, the shares keep being served
@@ -516,17 +574,18 @@ class Tray:
         from a built variant and has to be, because the layout type is
         recursive and there is no other way to express a child.
         """
-        if parent == QUIT_ID:
+        if parent in MENU_ORDER:
             return GLib.Variant(
                 "(u(ia{sv}av))",
-                (self.menu_revision, (QUIT_ID, self._filtered(QUIT_ID, wanted), [])),
+                (self.menu_revision, (parent, self._filtered(parent, wanted), [])),
             )
-        child = GLib.Variant(
-            "(ia{sv}av)", (QUIT_ID, self._filtered(QUIT_ID, wanted), [])
-        )
+        children = [
+            GLib.Variant("(ia{sv}av)", (item_id, self._filtered(item_id, wanted), []))
+            for item_id in MENU_ORDER
+        ]
         return GLib.Variant(
             "(u(ia{sv}av))",
-            (self.menu_revision, (ROOT_ID, self._filtered(ROOT_ID, wanted), [child])),
+            (self.menu_revision, (ROOT_ID, self._filtered(ROOT_ID, wanted), children)),
         )
 
     def _menu_property_read(
@@ -567,7 +626,7 @@ class Tray:
             return
         if method == "GetGroupProperties":
             ids, wanted = args
-            asked = list(ids) or [ROOT_ID, QUIT_ID]
+            asked = list(ids) or [ROOT_ID, *MENU_ORDER]
             invocation.return_value(
                 GLib.Variant(
                     "(a(ia{sv}))",
@@ -596,8 +655,9 @@ class Tray:
             invocation.return_value(GLib.Variant("(ai)", ([],)))
             return
         if method == "AboutToShow":
-            # The menu is one static item, so it never needs rebuilding before
-            # it opens. False is the answer that says so.
+            # The items never change, only Manage's `enabled`, and that is
+            # pushed by `ItemsPropertiesUpdated` as it happens. So nothing
+            # needs rebuilding before the menu opens; False says so.
             invocation.return_value(GLib.Variant("(b)", (False,)))
             return
         if method == "AboutToShowGroup":
@@ -606,14 +666,20 @@ class Tray:
         invocation.return_value(None)
 
     def _menu_event(self, item_id: int, event: str) -> None:
-        """`clicked` on the one item is the only event that does anything.
+        """`clicked` is the only event that does anything.
 
         Hosts also send `hovered` and `opened`/`closed`, and quitting on a
         hover would be memorable. The event name is checked, not just the id.
         """
-        if item_id == QUIT_ID and event == "clicked":
+        if event != "clicked":
+            return
+        if item_id == QUIT_ID:
             log.info("quitting: the menu asked")
             self.quit()
+        elif item_id == OPEN_ID and not self.gui_open:
+            # Checked here too: a panel that cached the layout before the GUI
+            # started can still deliver a click on an item now disabled.
+            self.open_window()
 
     # --- stopping ----------------------------------------------------------
 
@@ -724,6 +790,16 @@ def main(argv: list[str] | None = None) -> int:
         Gio.BusNameWatcherFlags.NONE,
         tray.watcher_appeared,
         tray.watcher_vanished,
+    )
+
+    # Whether a window is open, for Manage's enabled state. Held for the life of
+    # the process like the watcher: the GUI comes and goes many times.
+    Gio.bus_watch_name(
+        Gio.BusType.SESSION,
+        APP_ID,
+        Gio.BusNameWatcherFlags.NONE,
+        tray.gui_appeared,
+        tray.gui_vanished,
     )
 
     session.start()

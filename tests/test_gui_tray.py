@@ -41,6 +41,7 @@ if Gio is not None:
         MENU_INTERFACE,
         MENU_INTROSPECTION,
         MENU_PATH,
+        OPEN_ID,
         QUIT_ID,
         ROOT_ID,
         SINGLETON_FLAGS,
@@ -70,12 +71,18 @@ class FakeConnection:
 
     def __init__(self) -> None:
         self.announcements: list[str] = []
+        self.signals: list[tuple[str, str, str, Any]] = []
 
     def register_object(self, *_a: Any) -> int:
         return 1
 
     def call(self, _name: str, _path: str, _iface: str, method: str, *_a: Any) -> None:
         self.announcements.append(method)
+
+    def emit_signal(
+        self, _dest: Any, path: str, iface: str, name: str, parameters: Any
+    ) -> None:
+        self.signals.append((path, iface, name, parameters))
 
 
 class FakeInvocation:
@@ -527,16 +534,52 @@ class TestTheMenusLayout(unittest.TestCase):
     def layout(self, parameters: Any = None) -> Any:
         return self.call("GetLayout", parameters).returned[0].unpack()
 
-    def test_the_menu_holds_exactly_one_item_and_it_is_quit(self) -> None:
+    def children(self) -> dict[int, dict[str, Any]]:
+        _revision, (_id, _properties, children) = self.layout()
+        return {child_id: properties for child_id, properties, _g in children}
+
+    def test_the_menu_is_manage_then_close(self) -> None:
         _revision, (item_id, _properties, children) = self.layout()
         self.assertEqual(item_id, ROOT_ID)
-        self.assertEqual(len(children), 1)
-        child_id, properties, grandchildren = children[0]
-        self.assertEqual(child_id, QUIT_ID)
-        self.assertEqual(grandchildren, [])
-        self.assertTrue(properties["label"])
-        self.assertTrue(properties["enabled"])
-        self.assertTrue(properties["visible"])
+        self.assertEqual([child[0] for child in children], [OPEN_ID, QUIT_ID])
+        for child_id, properties, grandchildren in children:
+            with self.subTest(item=child_id):
+                self.assertEqual(grandchildren, [])
+                self.assertTrue(properties["label"])
+                self.assertTrue(properties["enabled"])
+                self.assertTrue(properties["visible"])
+
+    def test_manage_is_labelled_manage(self) -> None:
+        self.assertEqual(self.children()[OPEN_ID]["label"], "Manage")
+
+    def test_manage_is_disabled_while_the_gui_is_open_and_not_hidden(self) -> None:
+        """Hidden would move Close up under the pointer as the GUI comes and goes."""
+        self.tray.gui_appeared(None, "org.smbpal.Smbpal", ":1.9")
+        manage = self.children()[OPEN_ID]
+        self.assertFalse(manage["enabled"])
+        self.assertTrue(manage["visible"])
+        self.tray.gui_vanished(None, "org.smbpal.Smbpal")
+        self.assertTrue(self.children()[OPEN_ID]["enabled"])
+
+    def test_the_panel_is_told_when_manage_changes(self) -> None:
+        """libdbusmenu caches the layout; without the signal the grey never shows."""
+        connection = FakeConnection()
+        self.tray.register(connection)
+        revision = self.tray.menu_revision
+        self.tray.gui_appeared(None, "org.smbpal.Smbpal", ":1.9")
+        self.tray.gui_appeared(None, "org.smbpal.Smbpal", ":1.9")
+        self.assertEqual(len(connection.signals), 1)
+        path, iface, name, parameters = connection.signals[0]
+        self.assertEqual(
+            (path, iface, name), (MENU_PATH, MENU_INTERFACE, "ItemsPropertiesUpdated")
+        )
+        declared = next(sig for sig in self.declared.signals if sig.name == name)
+        self.assertEqual(
+            parameters.get_type_string(),
+            "(" + "".join(a.signature for a in declared.args) + ")",
+        )
+        self.assertEqual(parameters.unpack(), ([(OPEN_ID, {"enabled": False})], []))
+        self.assertGreater(self.tray.menu_revision, revision)
 
     def test_the_label_does_not_promise_to_quit_smbpal(self) -> None:
         """It quits this process. smbpald, smbd and the mounts carry on.
@@ -546,9 +589,7 @@ class TestTheMenusLayout(unittest.TestCase):
         — with the shares still being served. The item can only take the icon
         away, so that is all it is allowed to claim.
         """
-        _revision, (_id, _properties, children) = self.layout()
-        _child_id, properties, _grandchildren = children[0]
-        self.assertNotIn("smbpal", properties["label"].lower())
+        self.assertNotIn("smbpal", self.children()[QUIT_ID]["label"].lower())
 
     def test_the_root_says_it_has_a_submenu(self) -> None:
         """Without `children-display` a panel draws the root and no children."""
@@ -567,7 +608,8 @@ class TestTheMenusLayout(unittest.TestCase):
         _revision, (_id, _properties, children) = self.layout(
             GLib.Variant("(iias)", (0, -1, ["label"]))
         )
-        self.assertEqual(list(children[0][1]), ["label"])
+        for _child_id, properties, _grandchildren in children:
+            self.assertEqual(list(properties), ["label"])
 
     def test_group_properties_answers_for_every_id_asked(self) -> None:
         answered = self.call("GetGroupProperties").returned[0].unpack()[0]
@@ -647,6 +689,20 @@ class TestStopping(unittest.TestCase):
             FakeInvocation(),
         )
         self.assertEqual(self.quits, 1)
+
+    def test_clicking_manage_opens_the_window_and_does_not_quit(self) -> None:
+        opened: list[bool] = []
+        self.tray.open_window = lambda: opened.append(True)
+        self.event(OPEN_ID, "clicked")
+        self.assertEqual((opened, self.quits), ([True], 0))
+
+    def test_clicking_manage_while_the_gui_is_open_does_nothing(self) -> None:
+        """A panel holding a stale layout can still deliver a click on it."""
+        opened: list[bool] = []
+        self.tray.open_window = lambda: opened.append(True)
+        self.tray.gui_appeared(None, "org.smbpal.Smbpal", ":1.9")
+        self.event(OPEN_ID, "clicked")
+        self.assertEqual(opened, [])
 
     def test_losing_the_singleton_name_quits(self) -> None:
         """Last one wins, and the polarity is the decision.
