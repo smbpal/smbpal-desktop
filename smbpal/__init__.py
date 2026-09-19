@@ -1,6 +1,6 @@
 """SMBPal — daemon, CLI and GUI as one installable (D4: no version skew)."""
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 # The IPC wire version, sent as `v` on every message from the first commit (D4).
 # Independent of __version__: the application can move without the protocol moving.
