@@ -26,7 +26,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 
-from gi.repository import Gdk, Gtk  # noqa: E402
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 from smbpal.errors import SmbpalError  # noqa: E402
 from smbpal.gui import model  # noqa: E402
@@ -348,6 +348,9 @@ class Window(Gtk.ApplicationWindow):
         if action == model.SET_CREDENTIALS:
             self._ask_for_credentials(row)
             return
+        if action == model.SET_SMB_PASSWORD:
+            self._ask_for_smb_password(row)
+            return
         question = model.confirmation(row, action)
         if question is None:
             self._send(row, action)
@@ -411,6 +414,20 @@ class Window(Gtk.ApplicationWindow):
         if isinstance(result, dict) and result.get("note"):
             self._say(result["note"], problem=False)
         self.session.refresh()
+
+    def _ask_for_smb_password(self, row: model.Row) -> None:
+        # A share that names no account takes any account with an SMB
+        # password, so the person at the keyboard's is the one to set.
+        username = row.account or GLib.get_user_name()
+
+        def save(password: str) -> None:
+            self._send(
+                row,
+                model.SET_SMB_PASSWORD,
+                {"username": username, "password": password},
+            )
+
+        SmbPasswordDialog(self, username, save).present()
 
     def _ask_for_credentials(self, row: model.Row) -> None:
         def save(username: str, password: str) -> None:
@@ -526,3 +543,86 @@ class CredentialsDialog(Gtk.Window):
             return
         self.close()
         self._save(username, password)
+
+
+class SmbPasswordDialog(Gtk.Window):
+    """The password other devices use to open this computer's shares.
+
+    Asked for twice, because nobody sees it typed and a mistyped one is found
+    out only on another machine, as "the password is wrong", later.
+
+    **Says which password it is.** Samba's are its own (§3b): this is not the
+    login password and does not change it. The Ubuntu report that caused this
+    dialog was someone typing their login password on a Mac and being refused.
+    """
+
+    def __init__(
+        self, parent: Gtk.Window, username: str, save: Callable[[str], None]
+    ) -> None:
+        super().__init__(transient_for=parent, modal=True, title="SMB password")
+        self.set_default_size(420, -1)
+        self._save = save
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        body.set_margin_top(20)
+        body.set_margin_bottom(20)
+        body.set_margin_start(20)
+        body.set_margin_end(20)
+        body.append(
+            Gtk.Label(
+                label=f"Set the password other devices use to sign in as {username}.",
+                xalign=0,
+                wrap=True,
+            )
+        )
+        note = Gtk.Label(
+            label="This is separate from the login password, and does not change it.",
+            xalign=0,
+            wrap=True,
+        )
+        note.add_css_class("row-hint")
+        body.append(note)
+
+        self._password = Gtk.PasswordEntry(show_peek_icon=True)
+        self._password.set_property("placeholder-text", "SMB password")
+        self._again = Gtk.PasswordEntry(show_peek_icon=True)
+        self._again.set_property("placeholder-text", "The same again")
+        body.append(self._password)
+        body.append(self._again)
+
+        self._mismatch = Gtk.Label(
+            label="The two do not match.", xalign=0, visible=False
+        )
+        self._mismatch.add_css_class("row-hint")
+        body.append(self._mismatch)
+
+        buttons = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=8, halign=Gtk.Align.END
+        )
+        cancel = Gtk.Button(label="Cancel")
+        cancel.connect("clicked", lambda _b: self.close())
+        self._go = Gtk.Button(label="Set password")
+        self._go.add_css_class("suggested-action")
+        self._go.set_sensitive(False)
+        self._go.connect("clicked", self._accept)
+        buttons.append(cancel)
+        buttons.append(self._go)
+        body.append(buttons)
+        self.set_child(body)
+
+        self._password.connect("changed", self._recheck)
+        self._again.connect("changed", self._recheck)
+        self._again.connect("activate", self._accept)
+
+    def _recheck(self, _entry: Gtk.Widget) -> None:
+        first, second = self._password.get_text(), self._again.get_text()
+        self._mismatch.set_visible(bool(second) and first != second)
+        self._go.set_sensitive(bool(first) and first == second)
+
+    def _accept(self, _widget: Gtk.Widget) -> None:
+        first, second = self._password.get_text(), self._again.get_text()
+        if not first or first != second:
+            return
+        self.close()
+        self._save(first)
+

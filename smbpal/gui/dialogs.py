@@ -23,7 +23,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import Gio, Gtk  # noqa: E402
+from gi.repository import Gio, GLib, Gtk  # noqa: E402
 
 from smbpal.errors import SmbpalError  # noqa: E402
 from smbpal.gui.session import Session  # noqa: E402
@@ -151,20 +151,89 @@ class AddShareDialog(_Form):
             "Name people will see", self._name, "Filled in from the folder name."
         )
 
-        self._user = Gtk.Entry(placeholder_text="pi")
+        # Required, and filled in with whoever is sitting here. The old hint
+        # said leaving it empty opened the share to anyone; it did not, since
+        # our shares are `guest ok = no`, and on a fresh machine it meant
+        # nobody at all could sign in.
+        self._user = Gtk.Entry(text=GLib.get_user_name())
         self.labelled(
-            "Serve it as",
+            "Other devices sign in as",
             self._user,
-            "An account that already exists on this computer (§3b). Without "
-            "one, the share is open to anyone on the network and SMBPal cannot "
-            "tell whether the folder is writable.",
+            "An account that already exists on this computer.",
         )
+
+        # The SMB password, asked for here only when the account has none.
+        # Samba's passwords are its own (§3b), so without this a share made
+        # from the window could be opened by nobody: found on Ubuntu.
+        self._password = Gtk.PasswordEntry(show_peek_icon=True, hexpand=True)
+        self._password.set_property("placeholder-text", "SMB password")
+        self._again = Gtk.PasswordEntry(show_peek_icon=True, hexpand=True)
+        self._again.set_property("placeholder-text", "The same again")
+        self._password_note = Gtk.Label(label="", xalign=0, wrap=True)
+        self._password_note.add_css_class("row-detail")
+        self._password_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self._password_caption = Gtk.Label(label="SMB password", xalign=0)
+        for widget in (
+            self._password_caption,
+            self._password,
+            self._again,
+            self._password_note,
+        ):
+            self._password_box.append(widget)
+        self.fields.append(self._password_box)
+        # Who has an SMB password already. None until the daemon answers, or
+        # if it cannot, in which case a password is offered but not required.
+        self._accounts: set[str] | None = None
 
         self._read_only = Gtk.CheckButton(label="Share it read-only")
         self.fields.append(self._read_only)
 
         self._path.connect("changed", self._path_changed)
         self._name.connect("changed", self.recheck)
+        self._user.connect("changed", self._account_changed)
+        self._password.connect("changed", self.recheck)
+        self._again.connect("changed", self.recheck)
+        self._account_changed()
+        # Read-only, so no prompt: names only, never a hash (passwd.list_users).
+        session.submit(
+            "credential.list",
+            then=self._got_accounts,
+            catch=lambda _exc: self._got_accounts(None),
+        )
+
+    def _got_accounts(self, accounts: Any) -> None:
+        self._accounts = set(accounts) if isinstance(accounts, list) else None
+        self._account_changed()
+
+    def _needs_password(self) -> bool | None:
+        """True when the account has no SMB password, None when unknown."""
+        if self._accounts is None:
+            return None
+        return self._user.get_text().strip() not in self._accounts
+
+    def _account_changed(self, *_args: object) -> None:
+        user = self._user.get_text().strip()
+        needed = self._needs_password()
+        entries = needed is not False
+        self._password.set_visible(entries)
+        self._again.set_visible(entries)
+        self._password_caption.set_visible(entries)
+        if needed is False:
+            self._password_note.set_text(
+                f"{user} already has an SMB password. Other devices sign in with it."
+            )
+        elif needed:
+            self._password_note.set_text(
+                f"{user} has no SMB password yet, so nobody could open the share. "
+                "Other devices sign in with this one. It is separate from the "
+                "login password and does not change it."
+            )
+        else:
+            self._password_note.set_text(
+                "Leave empty to keep an existing SMB password. It is separate "
+                "from the login password."
+            )
+        self.recheck()
 
     def _path_changed(self, _entry: Gtk.Widget) -> None:
         text = self._path.get_text().rstrip("/")
@@ -173,7 +242,16 @@ class AddShareDialog(_Form):
         self.recheck()
 
     def _ready(self) -> bool:
-        return bool(self._path.get_text().strip() and self._name.get_text().strip())
+        if not (
+            self._path.get_text().strip()
+            and self._name.get_text().strip()
+            and self._user.get_text().strip()
+        ):
+            return False
+        first, second = self._password.get_text(), self._again.get_text()
+        if first != second:
+            return False
+        return bool(first) or not self._needs_password()
 
     def _pick_folder(self) -> None:
         """The native folder picker.
@@ -206,14 +284,27 @@ class AddShareDialog(_Form):
 
     def _submit(self) -> None:
         self.working(True)
+        user = self._user.get_text().strip()
+        password = self._password.get_text()
+        if password and self._password.get_visible():
+            # The password first: a share nobody can open is the failure this
+            # form exists to prevent, so it is not added until it can be.
+            self.session.submit(
+                "credential.set",
+                {"username": user, "password": password},
+                then=lambda _r: self._add_share(user),
+                catch=self.failed,
+            )
+            return
+        self._add_share(user)
+
+    def _add_share(self, user: str) -> None:
         params: dict[str, Any] = {
             "name": self._name.get_text().strip(),
             "path": self._path.get_text().strip(),
             "read_only": self._read_only.get_active(),
+            "credential_ref": user,
         }
-        user = self._user.get_text().strip()
-        if user:
-            params["credential_ref"] = user
         self.session.submit(
             "share.add", params, then=self.succeeded, catch=self.failed
         )

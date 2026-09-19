@@ -508,3 +508,58 @@ class TestTeardownIsReachable(ApplyTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWhoCanSignIn(ApplyTestCase):
+    """Found on Ubuntu: a share served correctly that nobody could open.
+
+    Samba's passwords are its own (§3b) and our shares are `guest ok = no`, so
+    a share served as an account with no SMB password is useless while every
+    other check says `serving`.
+    """
+
+    def status_row(self, **kw) -> dict:
+        store = ConfigStore(self.root / "config.json")
+        doc = self.config_with_share(**kw)
+        store.save(doc)
+        self.applier.apply(doc)
+        dispatcher = Dispatcher(store, applier=self.applier)
+        return dispatcher._status(None, None)["shares"][0]
+
+    def test_an_account_with_no_smb_password_cannot_sign_in(self) -> None:
+        self.assertIs(self.status_row()["can_sign_in"], False)
+
+    def test_once_it_has_one_it_can(self) -> None:
+        self.samba.smb_users.append(_username())
+        self.assertIs(self.status_row()["can_sign_in"], True)
+
+    def test_someone_elses_password_does_not_open_a_share_served_as_me(self) -> None:
+        self.samba.smb_users.append("somebody-else")
+        self.assertIs(self.status_row()["can_sign_in"], False)
+
+    def test_a_share_naming_no_account_needs_any_account_with_a_password(self) -> None:
+        from smbpal.daemon.handlers import _can_sign_in
+
+        share = {"name": "Open"}
+        self.assertIs(_can_sign_in(share, set()), False)
+        self.assertIs(_can_sign_in(share, {"anyone"}), True)
+
+    def test_samba_that_cannot_be_asked_is_unknown_not_no(self) -> None:
+        from smbpal.daemon.handlers import _can_sign_in
+
+        self.assertIsNone(_can_sign_in({"credential_ref": "pi"}, None))
+
+    def test_setting_the_password_from_a_share_row_is_accepted(self) -> None:
+        """The window sends the row's `ref` along with it, as every row action does."""
+        store = ConfigStore(self.root / "config.json")
+        dispatcher = Dispatcher(store, applier=self.applier)
+        dispatcher._credential_set(
+            Request(
+                id=1,
+                method="credential.set",
+                params={"ref": "media", "username": _username(), "password": "x-1"},
+            ),
+            _PEER,
+        )
+        self.assertIn(_username(), self.samba.smb_users)
+

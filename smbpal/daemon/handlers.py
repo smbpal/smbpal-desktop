@@ -332,6 +332,19 @@ class Dispatcher:
             "unaccounted": self._unaccounted(config),
         }
 
+    def _smb_accounts(self) -> set[str] | None:
+        """Who has an SMB password here, or None when Samba cannot be asked.
+
+        Plain `pdbedit -L`, names only (see `passwd.list_users`): no hash ever
+        leaves Samba to answer this.
+        """
+        runner = self.applier.runner if self.applier else None
+        try:
+            return set(passwd.list_users(runner=runner))
+        except SmbpalError as exc:
+            log.debug("could not list SMB accounts: %s", exc.message)
+            return None
+
     def _unaccounted(self, config: dict[str, Any]) -> list[dict[str, Any]]:
         """Mounts and units on this machine that `config` does not describe."""
         if self.mounter is None:
@@ -392,10 +405,12 @@ class Dispatcher:
         except SmbpalError:
             effective = None
         serving = None if effective is None else set(effective)
+        accounts = self._smb_accounts()
 
         rows = []
         for planned in self.applier.plan(config):
             row = planned.to_wire()
+            row["can_sign_in"] = _can_sign_in(planned.share, accounts)
             if not planned.share.get("enabled", True):
                 row["state"] = SHARE_DISABLED
             elif serving is None:
@@ -796,6 +811,28 @@ class Dispatcher:
             raise InvalidParams("'timeout' must be a number of seconds")
         timeout = max(1.0, min(float(timeout), 30.0))
         return [machine.to_wire() for machine in discover(timeout=timeout)]
+
+
+def _can_sign_in(share: dict[str, Any], accounts: set[str] | None) -> bool | None:
+    """Whether anybody can open this share from another machine at all.
+
+    Found on Ubuntu, 19 September 2026: a folder shared from the window was
+    served correctly and nobody could open it. Samba's passwords are its own,
+    separate from the login password (§3b), our shares say `guest ok = no`,
+    and on a fresh machine nobody has one. `smb.conf` was right and the share
+    was useless, which only this can say.
+
+    A share served as one account needs that account to have an SMB password.
+    A share with no account named takes any account that has one, so it needs
+    at least one. None when Samba could not be asked, which is not the same as
+    no.
+    """
+    if accounts is None:
+        return None
+    user = share.get("credential_ref")
+    if user:
+        return user in accounts
+    return bool(accounts)
 
 
 def _owner_from(peer: PeerCredentials) -> str | None:

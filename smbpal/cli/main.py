@@ -286,11 +286,37 @@ def _cmd_status(client: Client, args: argparse.Namespace) -> int:
                 "no connections configured",
             ),
         ]
+        blocks.extend(share_notes(status["shares"]))
         blocks.extend(connection_notes(status["connections"]))
         blocks.extend(unaccounted_notes(status.get("unaccounted", [])))
         return "\n".join(blocks)
 
     return _emit(args, status, human)
+
+
+def share_notes(shares: list[dict[str, Any]]) -> list[str]:
+    """A share that is served and that nobody can open, said with the fix.
+
+    Found on Ubuntu: served correctly, and useless, because no account had an
+    SMB password. The table's `serving` is true and misleading, so the reason
+    and the command go underneath it.
+    """
+    notes = []
+    for share in shares:
+        if share.get("can_sign_in") is not False:
+            continue
+        user = share.get("credential_ref")
+        if user:
+            notes.append(
+                f"  {share.get('name')}: nobody can sign in yet, {user} has no SMB "
+                f"password. Set one with: smbpal credential set {user}"
+            )
+        else:
+            notes.append(
+                f"  {share.get('name')}: nobody can sign in yet, no account has an SMB "
+                "password. Set one with: smbpal credential set <user>"
+            )
+    return [""] + notes if notes else []
 
 
 def connection_notes(connections: list[dict[str, Any]]) -> list[str]:
