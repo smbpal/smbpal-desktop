@@ -25,6 +25,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from smbpal.discovery import identity
+
 # Tones, not colours. The view decides what "attention" looks like in a theme
 # we do not control.
 OK = "ok"
@@ -193,6 +195,9 @@ class Screen:
     connections: list[Row] = field(default_factory=list)
     unaccounted: list[Row] = field(default_factory=list)
     daemon: str = ""
+    # How other devices reach this one: `identity.describe()`'s text, or ""
+    # when nothing is known. Shown in the window's header.
+    here: str = ""
 
     @property
     def problems(self) -> list[Row]:
@@ -478,6 +483,7 @@ def screen(status: dict[str, Any]) -> Screen:
         connections=[connection_row(c) for c in status.get("connections", [])],
         unaccounted=[unaccounted_row(f) for f in status.get("unaccounted", [])],
         daemon=f"smbpald {daemon.get('version', '?')} · {daemon.get('config', '')}",
+        here=identity.describe(status.get("host")),
     )
 
 

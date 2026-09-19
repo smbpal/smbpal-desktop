@@ -270,6 +270,43 @@ class TestTheScrollPositionSurvivesAnUpdate(unittest.TestCase):
 
 
 @needs_gtk
+class TestTheHeaderSaysHowToReachThisComputer(unittest.TestCase):
+    """Asked for from the Pi: show this machine's .local name and address."""
+
+    def setUp(self) -> None:
+        self.window = Window(None, FakeSession())
+
+    def test_the_identity_is_the_subtitle_and_the_daemon_its_tooltip(self) -> None:
+        self.window._show(
+            model.screen(
+                {
+                    **STATUS,
+                    "daemon": {"version": "0.2.1", "config": "/etc/smbpal/config.json"},
+                    "host": {"hostname": "nas", "mdns": "nas.local",
+                             "addresses": ["192.0.2.10"]},
+                }
+            )
+        )
+        self.assertEqual(self.window._subtitle.get_text(), "nas.local · 192.0.2.10")
+        self.assertIn("smbpald 0.2.1", self.window._subtitle.get_tooltip_text())
+        self.assertTrue(self.window._subtitle.get_selectable())
+
+    def test_without_an_identity_the_daemon_line_stays(self) -> None:
+        self.window._show(model.screen({**STATUS, "daemon": {"version": "0.2.1"}}))
+        self.assertIn("smbpald 0.2.1", self.window._subtitle.get_text())
+
+    def test_an_event_does_not_lose_it(self) -> None:
+        """`_on_event` rebuilt the screen field by field, which drops new fields."""
+        self.window._show(
+            model.screen(
+                {**STATUS, "host": {"mdns": "nas.local", "addresses": []}}
+            )
+        )
+        self.window._on_event({"id": "c1", "state": "failed"})
+        self.assertEqual(self.window._screen.here, "nas.local")
+
+
+@needs_gtk
 class TestAskingBeforeSomethingIrreversible(unittest.TestCase):
     def setUp(self) -> None:
         self.session = FakeSession()

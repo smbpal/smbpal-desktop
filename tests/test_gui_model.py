@@ -169,6 +169,18 @@ class TestScreen(unittest.TestCase):
         self.assertEqual(model.screen(quiet).problems, [])
 
 
+class TestHowThisComputerIsReached(unittest.TestCase):
+    def test_the_status_identity_becomes_the_header_line(self) -> None:
+        built = model.screen(
+            {"host": {"hostname": "nas", "mdns": "nas.local",
+                      "addresses": ["192.0.2.10"]}}
+        )
+        self.assertEqual(built.here, "nas.local · 192.0.2.10")
+
+    def test_an_older_daemon_with_no_identity_leaves_it_empty(self) -> None:
+        self.assertEqual(model.screen({"daemon": {"version": "0.2.1"}}).here, "")
+
+
 class TestPushedEvents(unittest.TestCase):
     """M5 pushes; the window folds it in rather than re-fetching."""
 

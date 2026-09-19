@@ -16,6 +16,7 @@ from smbpal import PROTOCOL_VERSION, __version__
 from smbpal.config import ConfigStore
 from smbpal.config import operations as ops
 from smbpal.discovery import discover
+from smbpal.discovery.identity import Identity, identify
 from smbpal.errors import (
     AlreadyExists,
     InvalidParams,
@@ -195,8 +196,12 @@ class Dispatcher:
         applier: Applier | None = None,
         mounter: Mounter | None = None,
         monitor: StateMonitor | None = None,
+        identity: Callable[[], Identity] = identify,
     ) -> None:
         self.store = store
+        # How this machine is reached from others. Injected so tests do not
+        # depend on the host's Avahi or its network interfaces.
+        self.identity = identity
         self.authoriser = authoriser or Authoriser()
         # None means config-only: useful on a development machine with no
         # Samba, and the reason --no-apply exists.
@@ -315,6 +320,10 @@ class Dispatcher:
                 "config": str(self.store.path),
                 "applying": self.applier is not None,
             },
+            # What another device types to reach this one (§3d: reported,
+            # never set). Asked on every status: two short commands, and a DHCP
+            # lease or an Avahi rename can change the answer at any time.
+            "host": self.identity().to_wire(),
             "shares": self._share_states(config),
             "connections": self._connection_states(config),
             # Reported without being asked for. The case this exists for is one

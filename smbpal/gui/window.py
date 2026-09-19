@@ -18,6 +18,7 @@ state, and more ways to show something that is no longer true.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Callable
 
 import gi
@@ -147,7 +148,11 @@ class Window(Gtk.ApplicationWindow):
         self.session = session
         self._screen = model.Screen()
 
-        self._subtitle = Gtk.Label(label="", xalign=0.5)
+        # This computer's name and addresses, which is what someone standing
+        # here needs in order to reach it from another device. Selectable, so
+        # it can be copied rather than retyped. The daemon's version and config
+        # path, which used to sit here, are in its tooltip.
+        self._subtitle = Gtk.Label(label="", xalign=0.5, selectable=True)
         self._subtitle.add_css_class("row-detail")
         self.set_titlebar(self._header())
 
@@ -217,15 +222,16 @@ class Window(Gtk.ApplicationWindow):
 
     def _show(self, screen: model.Screen) -> None:
         self._screen = screen
-        self._subtitle.set_text(screen.daemon)
+        self._subtitle.set_text(screen.here or screen.daemon)
+        self._subtitle.set_tooltip_text(screen.daemon if screen.here else None)
         self._rebuild()
 
     def _on_event(self, data: dict[str, Any]) -> None:
-        self._screen = model.Screen(
-            shares=self._screen.shares,
+        # `replace`, not a new Screen field by field: a field added later (as
+        # `here` was) would otherwise be dropped by every event.
+        self._screen = dataclasses.replace(
+            self._screen,
             connections=model.apply_event(self._screen.connections, data),
-            unaccounted=self._screen.unaccounted,
-            daemon=self._screen.daemon,
         )
         self._rebuild()
 
