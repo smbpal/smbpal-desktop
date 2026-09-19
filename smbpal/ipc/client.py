@@ -67,8 +67,8 @@ class Client:
         self,
         path: Path | str = DEFAULT_SOCKET_PATH,
         *,
-        timeout: float = DEFAULT_TIMEOUT,
-        reply_timeout: float = REPLY_TIMEOUT,
+        timeout: float | None = DEFAULT_TIMEOUT,
+        reply_timeout: float | None = REPLY_TIMEOUT,
         on_denied: Callable[[], bool] | None = None,
     ) -> None:
         self.path = Path(path)

@@ -161,8 +161,16 @@ class TestAgainstARealDaemon(DaemonTestCase):
         """
         made: list[Client] = []
 
+        # **Both timeouts short, and that is the whole point of this test.**
+        # The first version set only `timeout` and left `reply_timeout` at its
+        # 130s default, then waited one second: it could not have seen the
+        # listener time out, and it did not. The bug came back exactly that
+        # way. `connect()` applies `reply_timeout` to the socket after
+        # connecting, so a listener that cleared only `timeout` still gave up
+        # after 130 quiet seconds, and the Pi flashed "no reply from the daemon
+        # within 130s" whenever nothing had changed for that long.
         def factory() -> Client:
-            client = Client(self.socket_path, timeout=0.2)
+            client = Client(self.socket_path, timeout=0.2, reply_timeout=0.2)
             made.append(client)
             return client
 
@@ -176,7 +184,10 @@ class TestAgainstARealDaemon(DaemonTestCase):
         # Five times the timeout with the daemon up and saying nothing.
         _sleep_through_retries(rounds=10, interval=0.1)
         self.assertTrue(self.main.idle(), "the listener reported something")
-        self.assertIsNone(made[0].timeout, "the listener must not time out")
+        listener = made[0]._sock
+        self.assertIsNotNone(listener)
+        # The socket itself, not an attribute that may or may not reach it.
+        self.assertIsNone(listener.gettimeout(), "the listener must not time out")
 
     def test_a_command_still_gives_up_on_a_daemon_that_stops_answering(self) -> None:
         """The other socket keeps its timeout, and for the opposite reason."""
