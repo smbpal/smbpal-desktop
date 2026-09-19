@@ -161,6 +161,31 @@ jobs:
           path: dist/*.deb
           if-no-files-found: error
 
+  # The same .deb, on each distribution the site names, in that
+  # distribution's own container: dependency resolution against its archive,
+  # its Python and PyGObject, and a share added, removed and purged with
+  # smb.conf compared byte for byte. The runner job above covers what a
+  # container cannot: systemd, Type=notify and polkit.
+  distros:
+    name: install on ${{ matrix.image }}
+    needs: package
+    runs-on: ubuntu-latest
+    strategy:
+      # One distribution failing says nothing about the others, and hiding
+      # their results would cost a second run to find out.
+      fail-fast: false
+      matrix:
+        image: ['debian:12', 'debian:13', 'ubuntu:24.04', 'ubuntu:26.04']
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: deb
+          path: dist
+      - name: Install, share, remove, purge
+        run: sh packaging/check-distro.sh dist/smbpal_*_all.deb
+
   # Only on a tag. §11.3 needs every release tagged and matching the exact
   # build, because under GPL the obligation attaches to the Corresponding
   # Source for *that* binary rather than to whatever `main` holds. Attaching
@@ -170,7 +195,9 @@ jobs:
   # a logged-in GitHub account to fetch and expire after 90 days.
   release:
     name: release
-    needs: package
+    # And the distributions: a tag whose .deb fails to install on one the site
+    # names must not become a download.
+    needs: [package, distros]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
