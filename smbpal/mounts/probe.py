@@ -35,6 +35,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import socket
 import threading
 import time
 from dataclasses import dataclass
@@ -377,3 +378,22 @@ class MountProbe:
         if reachable is None:
             return CHECKING
         return MOUNTED if reachable else UNREACHABLE
+
+
+SMB_PORT = 445
+
+
+def server_reachable(host: str, *, port: int = SMB_PORT, timeout: float = 1.5) -> bool:
+    """Whether something answers on the SMB port at `host`, right now.
+
+    A plain TCP connect and nothing more: no SMB, no credentials. It answers
+    "is that machine on the network I am on", which is the question
+    `auto_connect: on_this_network` asks before a connection is primed. A name
+    that does not resolve is simply not reachable here; the monitor asks again
+    on its next tick.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False

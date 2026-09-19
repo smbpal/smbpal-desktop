@@ -81,9 +81,18 @@ def reset_failed(unit: str, *, runner: CommandRunner | None = None) -> None:
     execute([SYSTEMCTL, "reset-failed", unit])
 
 
-def start(unit: str, *, runner: CommandRunner | None = None) -> None:
+def start(
+    unit: str, *, block: bool = True, runner: CommandRunner | None = None
+) -> None:
+    """Start a unit. `block=False` queues the job and returns at once.
+
+    A mount's start job runs `mount.cifs`, which for a server that is switched
+    off waits out its timeout. A caller that must not stall on that, such as
+    the monitor priming a connection, passes `block=False`.
+    """
     execute = runner or run
-    result = execute([SYSTEMCTL, "start", unit])
+    flags = [] if block else ["--no-block"]
+    result = execute([SYSTEMCTL, "start", *flags, unit])
     if not result.ok:
         raise SystemdError(
             f"could not start {unit}",
