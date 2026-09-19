@@ -31,6 +31,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          # The whole history, not the default single commit. test_one_author
+          # reads `git log`, and on a one-commit clone it passes whatever the
+          # history holds: the squash merges of #1 and #2 added a second author
+          # identity that CI could not see and a local run caught.
+          fetch-depth: 0
 
       # python3-gi and gir1.2-gtk-4.0 are Recommends of the package, not
       # Depends, and the suite skips its GUI tests without them. xvfb is here
