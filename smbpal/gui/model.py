@@ -42,6 +42,9 @@ REMOVE = "remove"
 USE_FALLBACK = "use_fallback"
 MAKE_WRITABLE = "make_writable"
 SET_CREDENTIALS = "set_credentials"
+# A share's: the SMB password other devices sign in with. Not SET_CREDENTIALS,
+# which is a connection's username and password for somebody else's server.
+SET_SMB_PASSWORD = "set_smb_password"
 
 SHARE = "share"
 CONNECTION = "connection"
@@ -57,6 +60,7 @@ ACTION_LABELS = {
     USE_FALLBACK: "Use the fallback address",
     MAKE_WRITABLE: "Make writable\u2026",
     SET_CREDENTIALS: "Set password\u2026",
+    SET_SMB_PASSWORD: "Set password\u2026",
 }
 
 # Everything that changes the machine and cannot be undone by pressing it again.
@@ -70,6 +74,7 @@ _METHODS = {
     (CONNECTION, SET_CREDENTIALS): "connection.set_credentials",
     (SHARE, REMOVE): "share.remove",
     (SHARE, MAKE_WRITABLE): "share.make_writable",
+    (SHARE, SET_SMB_PASSWORD): "credential.set",
 }
 
 # What each connection state looks like, and what it says when the daemon has
@@ -181,6 +186,9 @@ class Row:
     # methods depending on the answer, and the view must not be the thing that
     # knows which.
     section: str = CONNECTION
+    # A share's account: who other devices sign in as. None for connections,
+    # and for a share that names no account.
+    account: str | None = None
 
     @property
     def needs_attention(self) -> bool:
@@ -445,6 +453,29 @@ def share_row(share: dict[str, Any]) -> Row:
         )
         if share.get("credential_ref"):
             actions.append(MAKE_WRITABLE)
+
+    account = share.get("credential_ref") or None
+    hint = None
+    served = state in ("serving", "read-only")
+    if served and share.get("can_sign_in") is False:
+        # Served correctly and unusable, which is worse than read-only and
+        # outranks it: found on Ubuntu, where a share made from the window
+        # could not be opened by anyone because nobody had an SMB password.
+        tone = ATTENTION
+        message = (
+            f"nobody can sign in yet: {account} has no SMB password"
+            if account
+            else "nobody can sign in yet: no account on this computer has an "
+            "SMB password"
+        )
+        actions.insert(0, SET_SMB_PASSWORD)
+    elif served and share.get("can_sign_in") and account:
+        # Said once, where the share is, because the wrong password here is
+        # the login password and nothing else would tell anyone otherwise.
+        hint = (
+            f"Other devices sign in as {account}, with the SMB password "
+            "(not the login password)."
+        )
     actions.append(REMOVE)
 
     return Row(
@@ -455,7 +486,9 @@ def share_row(share: dict[str, Any]) -> Row:
         message=message,
         tone=tone,
         actions=tuple(actions),
+        hint=hint,
         section=SHARE,
+        account=account,
     )
 
 

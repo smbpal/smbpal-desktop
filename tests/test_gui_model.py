@@ -181,6 +181,45 @@ class TestHowThisComputerIsReached(unittest.TestCase):
         self.assertEqual(model.screen({"daemon": {"version": "0.2.1"}}).here, "")
 
 
+class TestWhoCanSignInToAShare(unittest.TestCase):
+    SERVING = {"id": "m", "name": "Media", "path": "/srv/m", "state": "serving",
+               "credential_ref": "luke"}
+
+    def test_nobody_can_sign_in_is_flagged_with_the_fix_first(self) -> None:
+        row = model.share_row({**self.SERVING, "can_sign_in": False})
+        self.assertTrue(row.needs_attention)
+        self.assertIn("nobody can sign in yet", row.message)
+        self.assertIn("luke has no SMB password", row.message)
+        self.assertEqual(row.actions[0], model.SET_SMB_PASSWORD)
+        self.assertEqual(row.account, "luke")
+
+    def test_a_share_naming_no_account_says_so(self) -> None:
+        share = {**self.SERVING, "credential_ref": None, "can_sign_in": False}
+        row = model.share_row(share)
+        self.assertIn("no account on this computer has an SMB password", row.message)
+        self.assertIsNone(row.account)
+
+    def test_a_share_people_can_open_says_how(self) -> None:
+        row = model.share_row({**self.SERVING, "can_sign_in": True})
+        self.assertFalse(row.needs_attention)
+        self.assertNotIn(model.SET_SMB_PASSWORD, row.actions)
+        self.assertIn("sign in as luke", row.hint)
+        self.assertIn("not the login password", row.hint)
+
+    def test_unknown_changes_nothing(self) -> None:
+        """An older daemon, or Samba that could not be asked."""
+        row = model.share_row(self.SERVING)
+        self.assertFalse(row.needs_attention)
+        self.assertIsNone(row.hint)
+
+    def test_the_action_sets_the_smb_password_and_asks_nothing_first(self) -> None:
+        row = model.share_row({**self.SERVING, "can_sign_in": False})
+        self.assertEqual(
+            model.method_for(row, model.SET_SMB_PASSWORD), "credential.set"
+        )
+        self.assertIsNone(model.confirmation(row, model.SET_SMB_PASSWORD))
+
+
 class TestPushedEvents(unittest.TestCase):
     """M5 pushes; the window folds it in rather than re-fetching."""
 

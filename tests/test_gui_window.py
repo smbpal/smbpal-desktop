@@ -307,6 +307,130 @@ class TestTheHeaderSaysHowToReachThisComputer(unittest.TestCase):
 
 
 @needs_gtk
+class TestSettingTheSmbPassword(unittest.TestCase):
+    """Found on Ubuntu: a share nobody could open, and no way to fix it here."""
+
+    def setUp(self) -> None:
+        from smbpal.gui.window import SmbPasswordDialog
+
+        self.saved: list[str] = []
+        self.dialog = SmbPasswordDialog(None, "luke", self.saved.append)
+
+    def type(self, first: str, second: str) -> None:
+        self.dialog._password.set_text(first)
+        self.dialog._again.set_text(second)
+
+    def test_it_will_not_save_until_both_match(self) -> None:
+        self.type("one", "two")
+        self.assertFalse(self.dialog._go.get_sensitive())
+        self.assertTrue(self.dialog._mismatch.get_visible())
+        self.type("same", "same")
+        self.assertTrue(self.dialog._go.get_sensitive())
+        self.dialog._accept(None)
+        self.assertEqual(self.saved, ["same"])
+
+    def test_a_share_row_sends_the_account_and_the_password(self) -> None:
+        session = FakeSession()
+        window = Window(None, session)
+        row = model.share_row(
+            {"id": "m", "name": "Media", "path": "/srv/m", "state": "serving",
+             "credential_ref": "luke", "can_sign_in": False}
+        )
+        opened: list[Any] = []
+        import smbpal.gui.window as window_module
+
+        original = window_module.SmbPasswordDialog
+
+        class Capture:
+            def __init__(self, _parent: Any, username: str, save: Any) -> None:
+                opened.append(username)
+                save("secret-1")
+
+            def present(self) -> None:
+                pass
+
+        window_module.SmbPasswordDialog = Capture
+        self.addCleanup(setattr, window_module, "SmbPasswordDialog", original)
+        window._invoke(row, model.SET_SMB_PASSWORD)
+        self.assertEqual(opened, ["luke"])
+        method, params = session.submitted[-1]
+        self.assertEqual(method, "credential.set")
+        self.assertEqual((params["username"], params["password"]), ("luke", "secret-1"))
+
+
+@needs_gtk
+class TestSharingAFolderSetsUpSigningIn(unittest.TestCase):
+    def setUp(self) -> None:
+        from smbpal.gui.dialogs import AddShareDialog
+
+        self.session = FakeSession()
+        self.form = AddShareDialog(None, self.session)
+        self.form._path.set_text("/srv/media")
+        self.form._user.set_text("luke")
+        # The form asks who already has an SMB password as it opens.
+        self.assertEqual(self.session.submitted[0][0], "credential.list")
+
+    def answer_accounts(self, accounts: list[str]) -> None:
+        self.session.then[0](accounts)
+
+    def test_an_account_with_no_password_must_be_given_one(self) -> None:
+        self.answer_accounts([])
+        self.assertTrue(self.form._password.get_visible())
+        self.assertFalse(self.form._go.get_sensitive())
+        self.form._password.set_text("pw-1")
+        self.form._again.set_text("pw-1")
+        self.assertTrue(self.form._go.get_sensitive())
+
+    def test_the_password_is_set_before_the_share_is_added(self) -> None:
+        self.answer_accounts([])
+        self.form._password.set_text("pw-1")
+        self.form._again.set_text("pw-1")
+        self.form._submit()
+        self.assertEqual(self.session.submitted[-1][0], "credential.set")
+        self.assertEqual(self.session.submitted[-1][1]["username"], "luke")
+        self.session.reply({"username": "luke"})
+        method, params = self.session.submitted[-1]
+        self.assertEqual(method, "share.add")
+        self.assertEqual(params["credential_ref"], "luke")
+
+    def test_a_failed_password_adds_no_share(self) -> None:
+        self.answer_accounts([])
+        self.form._password.set_text("pw-1")
+        self.form._again.set_text("pw-1")
+        self.form._submit()
+        self.session.fail(SmbpalError("smbpasswd said no"))
+        self.assertNotIn("share.add", [m for m, _p in self.session.submitted])
+        self.assertTrue(self.form._error.get_visible())
+
+    def test_an_account_that_has_one_is_not_asked_again(self) -> None:
+        self.answer_accounts(["luke"])
+        self.assertFalse(self.form._password.get_visible())
+        self.assertIn(
+            "already has an SMB password", self.form._password_note.get_text()
+        )
+        self.assertTrue(self.form._go.get_sensitive())
+        self.form._submit()
+        self.assertEqual(self.session.submitted[-1][0], "share.add")
+
+    def test_unknown_accounts_make_the_password_optional(self) -> None:
+        self.session.catch[0](SmbpalError("pdbedit failed"))
+        self.assertTrue(self.form._password.get_visible())
+        self.assertTrue(self.form._go.get_sensitive())
+
+    def test_the_account_is_required(self) -> None:
+        self.answer_accounts(["luke"])
+        self.form._user.set_text("")
+        self.assertFalse(self.form._go.get_sensitive())
+
+    def test_it_starts_filled_in_with_whoever_is_here(self) -> None:
+        from gi.repository import GLib
+        from smbpal.gui.dialogs import AddShareDialog
+
+        fresh = AddShareDialog(None, FakeSession())
+        self.assertEqual(fresh._user.get_text(), GLib.get_user_name())
+
+
+@needs_gtk
 class TestAskingBeforeSomethingIrreversible(unittest.TestCase):
     def setUp(self) -> None:
         self.session = FakeSession()

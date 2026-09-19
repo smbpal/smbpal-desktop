@@ -419,3 +419,27 @@ class TestUnaccounted(CliTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestShareNotes(unittest.TestCase):
+    def test_a_share_nobody_can_open_gets_the_command_that_fixes_it(self) -> None:
+        from smbpal.cli.main import share_notes
+
+        notes = share_notes(
+            [
+                {"name": "Media", "credential_ref": "luke", "can_sign_in": False},
+                {"name": "Fine", "credential_ref": "luke", "can_sign_in": True},
+                {"name": "Old", "credential_ref": "luke"},
+            ]
+        )
+        text = "\n".join(notes)
+        self.assertIn("Media: nobody can sign in yet", text)
+        self.assertIn("smbpal credential set luke", text)
+        self.assertNotIn("Fine", text)
+        self.assertNotIn("Old", text)
+
+    def test_nothing_to_say_says_nothing(self) -> None:
+        from smbpal.cli.main import share_notes
+
+        self.assertEqual(share_notes([{"name": "Fine", "can_sign_in": True}]), [])
+
