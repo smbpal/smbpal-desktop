@@ -75,6 +75,69 @@ def install_css() -> None:
     )
 
 
+class _Section:
+    """One heading and its list, made once and kept for the life of the window.
+
+    **Updated in place, never emptied.** The window used to tear its whole body
+    down and rebuild it on every `state.changed`, which is correct content and
+    the wrong behaviour: emptying the body collapses the scrolled window's
+    content, so the scroll position went back to the top on every event, while
+    somebody was scrolling to the row that had just gone wrong
+    (`ideas/window-at-scale.md`). Now a row is matched by id, keeps its widget
+    while its content is unchanged, is replaced where it stands when it
+    changes, and is removed when it goes. Nothing else moves.
+    """
+
+    def __init__(
+        self,
+        body: Gtk.Box,
+        heading: str,
+        empty: str,
+        make_row: Callable[[model.Row], Gtk.ListBoxRow],
+    ) -> None:
+        self.make_row = make_row
+        self.head = Gtk.Label(label=heading, xalign=0)
+        self.head.add_css_class("section-head")
+        self.placeholder = Gtk.Label(label=empty, xalign=0, wrap=True)
+        self.placeholder.add_css_class("empty")
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.frame = Gtk.Frame()
+        self.frame.set_child(self.listbox)
+        for widget in (self.head, self.placeholder, self.frame):
+            body.append(widget)
+        # Row id -> the row as last drawn, and the widget drawing it.
+        self.drawn: dict[str, tuple[model.Row, Gtk.ListBoxRow]] = {}
+
+    def show(self, rows: list[model.Row], *, hide_when_empty: bool = False) -> None:
+        empty = not rows
+        self.head.set_visible(not (empty and hide_when_empty))
+        self.placeholder.set_visible(empty and not hide_when_empty)
+        self.frame.set_visible(not empty)
+
+        drawn: dict[str, tuple[model.Row, Gtk.ListBoxRow]] = {}
+        wanted: list[Gtk.ListBoxRow] = []
+        for row in rows:
+            previous = self.drawn.get(row.id)
+            # `Row` is a frozen dataclass, so equality is the whole content.
+            if previous is not None and previous[0] == row:
+                widget = previous[1]
+            else:
+                widget = self.make_row(row)
+            drawn[row.id] = (row, widget)
+            wanted.append(widget)
+
+        for row_id, (_row, widget) in self.drawn.items():
+            if drawn.get(row_id, (None, None))[1] is not widget:
+                self.listbox.remove(widget)
+        for index, widget in enumerate(wanted):
+            if self.listbox.get_row_at_index(index) is not widget:
+                if widget.get_parent() is not None:
+                    self.listbox.remove(widget)
+                self.listbox.insert(widget, index)
+        self.drawn = drawn
+
+
 class Window(Gtk.ApplicationWindow):
     """One window, one `Session`, three lists."""
 
@@ -96,23 +159,33 @@ class Window(Gtk.ApplicationWindow):
         self._body.set_margin_end(12)
         self._body.set_margin_bottom(12)
 
-        scroller = Gtk.ScrolledWindow(vexpand=True)
-        scroller.set_child(self._body)
+        self._scroller = Gtk.ScrolledWindow(vexpand=True)
+        self._scroller.set_child(self._body)
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         outer.set_margin_top(8)
         outer.set_margin_start(12)
         outer.set_margin_end(12)
         outer.append(self._banner)
-        outer.append(scroller)
+        outer.append(self._scroller)
         self.set_child(outer)
 
         # Row ids with a call in flight. Kept here rather than on the buttons
-        # because `_rebuild` destroys every widget it has ever made: an
-        # unrelated `state.changed` arriving mid-call would otherwise hand
-        # back a live Remove for something already being removed.
+        # because `_rebuild` replaces the widgets of any row whose content
+        # changed: an unrelated `state.changed` arriving mid-call would
+        # otherwise hand back a live Remove for something already being
+        # removed.
         self._in_flight: set[str] = set()
         self._row_buttons: dict[str, list[Gtk.Button]] = {}
+
+        self._shares = _Section(
+            self._body, "Shared from this computer", "Nothing is shared yet.", self._row
+        )
+        self._connections = _Section(
+            self._body, "Connected to", "No connections yet.", self._row
+        )
+        self._unaccounted = _Section(self._body, "Not managed by SMBPal", "", self._row)
+        self._rebuild()
 
         session.on_screen = self._show
         session.on_event = self._on_event
@@ -179,45 +252,36 @@ class Window(Gtk.ApplicationWindow):
     # --- building ----------------------------------------------------------
 
     def _rebuild(self) -> None:
-        while (child := self._body.get_first_child()) is not None:
-            self._body.remove(child)
-        self._row_buttons = {}
-        self._section(
-            "Shared from this computer",
-            self._screen.shares,
-            "Nothing is shared yet.",
-        )
-        self._section(
-            "Connected to",
-            self._screen.connections,
-            "No connections yet.",
-        )
-        if self._screen.unaccounted:
-            # Only when there is something to say. A permanently empty section
-            # headed "not managed by SMBPal" would teach people to skip it, and
-            # the one time it matters is the one time it is not empty.
-            self._section("Not managed by SMBPal", self._screen.unaccounted, "")
+        """Bring the sections up to `self._screen`, changing only what changed."""
+        self._shares.show(self._screen.shares)
+        self._connections.show(self._screen.connections)
+        # Only when there is something to say. A permanently empty section
+        # headed "not managed by SMBPal" would teach people to skip it, and
+        # the one time it matters is the one time it is not empty.
+        self._unaccounted.show(self._screen.unaccounted, hide_when_empty=True)
 
-    def _section(self, heading: str, rows: list[model.Row], empty: str) -> None:
-        label = Gtk.Label(label=heading, xalign=0)
-        label.add_css_class("section-head")
-        self._body.append(label)
-
-        if not rows:
-            placeholder = Gtk.Label(label=empty, xalign=0, wrap=True)
-            placeholder.add_css_class("empty")
-            self._body.append(placeholder)
-            return
-
-        listbox = Gtk.ListBox()
-        listbox.set_selection_mode(Gtk.SelectionMode.NONE)
-        for row in rows:
-            listbox.append(self._row(row))
-        frame = Gtk.Frame()
-        frame.set_child(listbox)
-        self._body.append(frame)
+        shown = {
+            row.id
+            for rows in (
+                self._screen.shares,
+                self._screen.connections,
+                self._screen.unaccounted,
+            )
+            for row in rows
+        }
+        for row_id in list(self._row_buttons):
+            if row_id not in shown:
+                del self._row_buttons[row_id]
+        # A kept row keeps its buttons, so their sensitivity has to be re-read
+        # from `_in_flight` here rather than only when a button is made.
+        for row_id, buttons in self._row_buttons.items():
+            for button in buttons:
+                button.set_sensitive(row_id not in self._in_flight)
 
     def _row(self, row: model.Row) -> Gtk.ListBoxRow:
+        # A replacement row's buttons replace the old ones, which are about to
+        # leave the window with the widget that held them.
+        self._row_buttons.pop(row.id, None)
         line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         line.set_margin_top(10)
         line.set_margin_bottom(10)
@@ -331,7 +395,7 @@ class Window(Gtk.ApplicationWindow):
 
     def _failed(self, exc: SmbpalError) -> None:
         # The row is still there and its buttons are still dead, because only
-        # a rebuild re-reads `_in_flight` and an error does not refresh.
+        # `_rebuild` re-reads `_in_flight` and an error does not refresh.
         self._on_error(exc)
         self._rebuild()
 
