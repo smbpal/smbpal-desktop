@@ -365,6 +365,148 @@ class TestMonitor(MonitorTestCase):
         self.assertIsNotNone(broken._thread)
 
 
+class TestPriming(MonitorTestCase):
+    """An armed automount nobody has touched is invisible in the file manager.
+
+    Found on the Pi, 19 September 2026: a connection set up and healthy did
+    not appear in the sidebar until its path was opened by hand, because GIO
+    hides `autofs` (plan §3h). The monitor now mounts each connection once.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.up = True
+        self.asked: list[str] = []
+
+        def reachable(host: str) -> bool:
+            self.asked.append(host)
+            return self.up
+
+        self.monitor = StateMonitor(
+            self.store,
+            self.mounter,
+            runner=self.samba,
+            prime=True,
+            reachable=reachable,
+        )
+
+    def starts(self) -> list[tuple[str, ...]]:
+        return [c for c in self.samba.calls if c[:2] == ("systemctl", "start")]
+
+    def mount_it(self) -> None:
+        self.mountinfo.write_text(
+            self.armed
+            + "37 25 0:32 / /mnt/nas rw,relatime shared:23 - cifs "
+            "//nas.local/Media rw,vers=3.1.1\n",
+            encoding="utf-8",
+        )
+
+    def eject_it(self) -> None:
+        self.mountinfo.write_text(self.armed, encoding="utf-8")
+
+    def set_connection(self, **changes: str) -> None:
+        doc = self.store.load()
+        doc["connections"][0].update(changes)
+        self.store.save(doc)
+
+    def test_an_armed_idle_connection_is_mounted_without_blocking(self) -> None:
+        self.monitor.poll()
+        self.assertEqual(
+            self.starts(), [("systemctl", "start", "--no-block", self.unit)]
+        )
+
+    def test_it_is_primed_once_not_on_every_poll(self) -> None:
+        self.monitor.poll()
+        self.monitor.poll()
+        self.monitor.poll()
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_on_this_network_waits_for_the_server_and_then_primes(self) -> None:
+        """A Pi that boots before its network, or a laptop that comes home."""
+        self.up = False
+        self.monitor.poll()
+        self.monitor.poll()
+        self.assertEqual(self.starts(), [])
+        self.assertEqual(self.asked, ["nas.local", "nas.local"])
+        self.up = True
+        self.monitor.poll()
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_always_does_not_wait_for_the_server(self) -> None:
+        self.set_connection(auto_connect="always")
+        self.up = False
+        self.monitor.poll()
+        self.assertEqual(len(self.starts()), 1)
+        self.assertEqual(self.asked, [])
+
+    def test_never_is_never_primed(self) -> None:
+        self.set_connection(auto_connect="never")
+        self.monitor.poll()
+        self.assertEqual(self.starts(), [])
+
+    def test_an_eject_is_respected(self) -> None:
+        """Mounted, then unmounted by somebody: that was a choice."""
+        self.monitor.poll()
+        self.mount_it()
+        self.monitor.poll()
+        self.eject_it()
+        self.monitor.poll()
+        self.monitor.poll()
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_a_connection_already_mounted_is_never_primed_after_an_eject(self) -> None:
+        self.mount_it()
+        self.monitor.poll()
+        self.eject_it()
+        self.monitor.poll()
+        self.assertEqual(self.starts(), [])
+
+    def test_pointing_it_somewhere_else_primes_it_again(self) -> None:
+        self.monitor.poll()
+        self.set_connection(share="Photos")
+        self.monitor.poll()
+        self.assertEqual(len(self.starts()), 2)
+
+    def test_a_failed_connection_is_left_to_its_own_retry(self) -> None:
+        self.samba.unit_state[self.unit] = {
+            "ActiveState": "failed",
+            "Result": "exit-code",
+        }
+        self.samba.journals[self.unit] = M0_AUTH_FAILURE
+        self.monitor.poll()
+        self.assertEqual(self.starts(), [])
+
+    def test_a_refused_start_is_tried_again_next_poll(self) -> None:
+        self.samba.latched.add(self.unit)
+        self.monitor.poll()
+        self.samba.latched.discard(self.unit)
+        self.monitor.poll()
+        self.assertEqual(len(self.starts()), 2)
+
+    def test_a_monitor_not_asked_to_prime_never_starts_anything(self) -> None:
+        quiet = StateMonitor(self.store, self.mounter, runner=self.samba)
+        quiet.poll()
+        self.assertEqual(self.starts(), [])
+
+
+class TestIsTheServerThere(unittest.TestCase):
+    """The real TCP check, against a listener this test owns."""
+
+    def test_a_listening_port_is_reachable_and_a_closed_one_is_not(self) -> None:
+        import socket
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        self.assertTrue(probe_module.server_reachable("127.0.0.1", port=port))
+        listener.close()
+        self.assertFalse(probe_module.server_reachable("127.0.0.1", port=port))
+
+    def test_a_name_that_does_not_resolve_is_not_reachable(self) -> None:
+        self.assertFalse(probe_module.server_reachable("no-such-host.invalid"))
+
+
 class TestAnOccupiedMountpoint(MonitorTestCase):
     """The whole path, from the mount table to what a person is told."""
 

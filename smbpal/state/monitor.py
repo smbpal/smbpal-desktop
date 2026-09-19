@@ -14,6 +14,27 @@ is cheap and cannot block:
 - **`journalctl` is read only on a transition into failure**, never on every
   tick, because the journal is the expensive part and the reason does not change
   while the state does not.
+
+**It also primes connections.** An armed automount that nobody has touched is
+invisible in every GIO file manager (plan §3h: `autofs` is on GIO's
+system-internal list), so a connection that is set up and healthy did not
+appear in the sidebar until somebody opened its path by hand. Found on the Pi,
+19 September 2026. So the monitor mounts each connection once, the first time
+it sees it armed and idle:
+
+- **`--no-block`, always.** Arming without mounting was chosen so that a
+  switched-off NAS cannot delay boot (M0 §4). Priming keeps that: the start is
+  queued and the monitor moves on; `mount.cifs` waits out its timeout on its own.
+- **`on_this_network` waits for the server.** It is primed only once something
+  answers on port 445, and asked again every tick until then, which covers a Pi
+  that boots before its network and a laptop that comes home. `always` is
+  primed at once, and a server that is not there is then reported, which is
+  what "always" asked for. `never` is never primed.
+- **Once per connection per daemon run.** After that, an unmounted connection
+  is one somebody chose to unmount, with the file manager's eject button or
+  `umount`, and mounting it straight back would be arguing with them. The
+  automount stays armed, so the next access mounts it as it always did.
+  Changing where a connection points counts as a new connection.
 """
 
 from __future__ import annotations
@@ -27,7 +48,7 @@ from smbpal.errors import SmbpalError
 from smbpal.mounts import probe as probe_module
 from smbpal.mounts import systemd, units
 from smbpal.mounts.apply import Mounter
-from smbpal.state.machine import ConnectionState, derive
+from smbpal.state.machine import CONNECTED, IDLE, ConnectionState, derive
 from smbpal.state.translate import Cause, translate_journal
 from smbpal.system.run import CommandRunner, run
 
@@ -49,6 +70,8 @@ class StateMonitor:
         broadcast: Broadcast | None = None,
         interval: float = DEFAULT_INTERVAL,
         runner: CommandRunner | None = None,
+        prime: bool = False,
+        reachable: Callable[[str], bool] = probe_module.server_reachable,
     ) -> None:
         self.store = store
         self.mounter = mounter
@@ -56,6 +79,13 @@ class StateMonitor:
         self.interval = interval
         self.runner = runner or mounter.runner
         self._states: dict[str, ConnectionState] = {}
+        # Off unless asked for: the daemon turns it on, and a test that only
+        # wants states does not want a TCP connect to nas.local on every poll.
+        self.prime = prime
+        self.reachable = reachable
+        # Connection id -> what it pointed at when it was primed, or was first
+        # seen already mounted. See the module docstring for why this is once.
+        self._primed: dict[str, tuple[str, str, str]] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -107,6 +137,8 @@ class StateMonitor:
 
         for connection in config.get("connections", []):
             state = self._state_of(connection, servers)
+            if self.prime:
+                self._maybe_prime(connection, state)
             current[state.id] = state
             with self._lock:
                 previous = self._states.get(state.id)
@@ -166,6 +198,42 @@ class StateMonitor:
             )
             if mounted
             else None,
+        )
+
+    def _maybe_prime(self, connection: dict[str, Any], state: ConnectionState) -> None:
+        """Mount an armed, idle connection once, so the file manager shows it."""
+        target = (
+            connection.get("host", ""),
+            connection.get("share", ""),
+            connection["mountpoint"],
+        )
+        if self._primed.get(connection["id"]) == target:
+            return
+        if state.state == CONNECTED:
+            # Already mounted, by us earlier or by somebody opening it. Counts:
+            # an eject after this is a choice to respect.
+            self._primed[connection["id"]] = target
+            return
+        if state.state != IDLE:
+            # Disabled, failed, occupied by somebody else's filesystem, already
+            # mounting: none of these is "armed and waiting".
+            return
+        auto = connection.get("auto_connect") or "on_this_network"
+        if auto == "never":
+            return
+        if auto == "on_this_network" and not self.reachable(connection.get("host", "")):
+            return
+        mount_name, _ = units.unit_names(connection["mountpoint"])
+        try:
+            systemd.start(mount_name, block=False, runner=self.runner)
+        except SmbpalError as exc:
+            log.warning("could not prime %s: %s", connection["id"], exc.message)
+            return
+        self._primed[connection["id"]] = target
+        log.info(
+            "%s: primed %s so it shows in the file manager",
+            connection["id"],
+            mount_name,
         )
 
     def _journal_cause(self, unit_name: str) -> Cause | None:

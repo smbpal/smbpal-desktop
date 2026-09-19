@@ -182,6 +182,9 @@ def main(argv: list[str] | None = None) -> int:
             # connection changes rather than asking repeatedly.
             broadcast=lambda event, data: transport.broadcast(encode_event(event, data)),
             interval=args.watch_interval,
+            # Mount each connection once, so it appears in the file manager
+            # without anybody opening its path first. See state/monitor.py.
+            prime=True,
         )
 
     dispatcher = Dispatcher(
