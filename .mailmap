@@ -4,3 +4,7 @@
 # copyright ownership being *demonstrable*, and a public history showing two
 # author identities makes a reader check rather than see. This makes them one.
 Luke Hynek <luke.hynek@aiminternet.co.uk> <302187058+lukehynek-png@users.noreply.github.com>
+# And a third spelling of the same person: a squash merge on GitHub authors the
+# commit with the account's login as the name, since the profile has no display
+# name, and the real address. Seen first on the merges of #1 and #2.
+Luke Hynek <luke.hynek@aiminternet.co.uk> lukehynek-png <luke.hynek@aiminternet.co.uk>
