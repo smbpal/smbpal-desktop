@@ -26,6 +26,7 @@ from smbpal.mounts.apply import MARKER, Mounter
 from smbpal.mounts.credentials import CredentialsStore
 from smbpal.mounts.probe import MountProbe
 from smbpal.daemon.handlers import Authoriser, Dispatcher
+from smbpal.discovery.identity import Identity
 from smbpal.ipc.server import UnixSocketTransport
 from tests.fakes import FakeSamba
 
@@ -41,8 +42,12 @@ class CliTestCase(unittest.TestCase):
         # daemon is started with authorisation off rather than with a fake
         # polkit that would answer yes to everything anyway. What guards the
         # gate itself is test_ipc, and it does it against the gate.
+        # A fixed identity, so what `status` prints does not depend on the
+        # machine running the tests.
         self.dispatcher = Dispatcher(
-            self.store, authoriser=Authoriser(policy="group")
+            self.store,
+            authoriser=Authoriser(policy="group"),
+            identity=lambda: Identity("nas", "nas.local", ["192.0.2.10"]),
         )
         self.transport = UnixSocketTransport(self.socket_path, group=None)
         self.transport.bind()
@@ -76,6 +81,19 @@ class TestBasics(CliTestCase):
         self.assertEqual(code, EXIT_OK)
         self.assertIn("no shares configured", out)
         self.assertIn("no connections configured", out)
+
+    def test_status_says_how_to_reach_this_computer(self) -> None:
+        _, out, _ = self.run_cli("status")
+        self.assertIn("reach this computer at nas.local · 192.0.2.10", out)
+
+    def test_status_json_carries_the_identity(self) -> None:
+        import json
+
+        _, out, _ = self.run_cli("--json", "status")
+        self.assertEqual(
+            json.loads(out)["host"],
+            {"hostname": "nas", "mdns": "nas.local", "addresses": ["192.0.2.10"]},
+        )
 
     def test_json_output_is_parseable(self) -> None:
         import json

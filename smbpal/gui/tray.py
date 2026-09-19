@@ -25,6 +25,7 @@ called that part free, and this is where it is collected.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import os
 import shlex
@@ -261,11 +262,9 @@ class Tray:
     def _event(self, data: dict[str, Any]) -> None:
         # The point of M5, and the reason this process is worth running: a
         # mount that drops changes the icon without anybody asking it to.
-        self._screen = model.Screen(
-            shares=self._screen.shares,
+        self._screen = dataclasses.replace(
+            self._screen,
             connections=model.apply_event(self._screen.connections, data),
-            unaccounted=self._screen.unaccounted,
-            daemon=self._screen.daemon,
         )
         self._republish()
 

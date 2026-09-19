@@ -24,6 +24,7 @@ from typing import Any, Callable
 from smbpal import version_banner
 from smbpal.cli.agent import TtyAgent
 from smbpal.cli.format import render_json, render_table
+from smbpal.discovery import identity
 from smbpal.errors import DaemonUnreachable, NotFound, SmbpalError
 from smbpal.ipc.client import Client
 from smbpal.ipc.server import DEFAULT_SOCKET_PATH
@@ -265,6 +266,11 @@ def _cmd_status(client: Client, args: argparse.Namespace) -> int:
             f"smbpald {daemon['version']} (protocol {daemon['protocol']}), "
             f"pid {daemon['pid']}",
             f"config {daemon['config']}",
+        ]
+        here = identity.describe(status.get("host"))
+        if here:
+            blocks.append(f"reach this computer at {here}")
+        blocks += [
             "",
             _section(
                 "Shares",
