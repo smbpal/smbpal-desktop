@@ -20,6 +20,7 @@ belong; this file is for the logic that was hiding among them.
 
 from __future__ import annotations
 
+import time
 import unittest
 from typing import Any
 
@@ -105,7 +106,7 @@ class TestWhatTheWindowDraws(unittest.TestCase):
         self.assertEqual(set(self.window._row_buttons), {"s1", "s2", "c1"})
 
     def test_a_row_with_no_screen_leaves_nothing_behind(self) -> None:
-        """`_rebuild` empties the body, so a stale row cannot survive it."""
+        """A row the screen no longer has leaves nothing behind, buttons included."""
         self.window._show(model.Screen())
         self.assertEqual(self.window._row_buttons, {})
 
@@ -113,6 +114,159 @@ class TestWhatTheWindowDraws(unittest.TestCase):
         self.window._on_error(SmbpalError("it did not work"))
         self.assertIn("it did not work", self.window._banner.get_label())
         self.assertTrue(self.window._banner.get_visible())
+
+
+@needs_gtk
+class TestTheWindowUpdatesInPlace(unittest.TestCase):
+    """The scroll position used to go back to the top on every event.
+
+    `_rebuild` emptied the body and built every row again, which collapses the
+    scrolled window's content, so an update anywhere sent somebody scrolling
+    towards a broken row back to the top: exactly while a network is
+    misbehaving, which is exactly when they are scrolling
+    (`ideas/window-at-scale.md`). The scroll position itself cannot be read
+    without a realised, laid-out window, so these pin the mechanism: nothing
+    the update did not change is replaced, and the body is never emptied.
+    """
+
+    def setUp(self) -> None:
+        self.session = FakeSession()
+        self.window = Window(None, self.session)
+        self.window._show(model.screen(STATUS))
+
+    def widgets(self) -> dict[str, Any]:
+        sections = (
+            self.window._shares,
+            self.window._connections,
+            self.window._unaccounted,
+        )
+        return {i: w for s in sections for i, (_r, w) in s.drawn.items()}
+
+    def order(self, section: Any) -> list[Any]:
+        listbox, rows, index = section.listbox, [], 0
+        while (row := listbox.get_row_at_index(index)) is not None:
+            rows.append(row)
+            index += 1
+        return rows
+
+    def test_an_event_replaces_only_the_row_it_is_about(self) -> None:
+        before = self.widgets()
+        self.window._on_event({"id": "c1", "state": "failed", "message": "gone"})
+        after = self.widgets()
+        self.assertIsNot(after["c1"], before["c1"])
+        self.assertIs(after["s1"], before["s1"])
+        self.assertIs(after["s2"], before["s2"])
+
+    def test_a_screen_that_did_not_change_changes_no_widget(self) -> None:
+        before = self.widgets()
+        self.window._show(model.screen(STATUS))
+        self.assertEqual(
+            {i: id(w) for i, w in self.widgets().items()},
+            {i: id(w) for i, w in before.items()},
+        )
+
+    def test_the_body_is_never_emptied(self) -> None:
+        """What collapsed the scroll. The body's own children are made once."""
+        body, children, child = self.window._body, [], None
+        child = body.get_first_child()
+        while child is not None:
+            children.append(child)
+            child = child.get_next_sibling()
+        self.window._on_event({"id": "c1", "state": "failed"})
+        self.window._show(model.Screen())
+        self.window._show(model.screen(STATUS))
+        after, child = [], body.get_first_child()
+        while child is not None:
+            after.append(child)
+            child = child.get_next_sibling()
+        self.assertEqual([id(c) for c in after], [id(c) for c in children])
+
+    def test_a_new_row_lands_where_the_screen_puts_it(self) -> None:
+        status = {
+            **STATUS,
+            "shares": [
+                STATUS["shares"][0],
+                {"id": "s3", "name": "Music", "state": "serving", "path": "/srv/music"},
+                STATUS["shares"][1],
+            ],
+        }
+        self.window._show(model.screen(status))
+        drawn = self.window._shares.drawn
+        self.assertEqual(
+            self.order(self.window._shares),
+            [drawn["s1"][1], drawn["s3"][1], drawn["s2"][1]],
+        )
+
+    def test_a_row_that_went_leaves_the_list(self) -> None:
+        gone = self.widgets()["s2"]
+        self.window._show(model.screen({**STATUS, "shares": STATUS["shares"][:1]}))
+        self.assertNotIn(gone, self.order(self.window._shares))
+        self.assertNotIn("s2", self.window._row_buttons)
+
+    def test_an_empty_section_says_so_and_the_unaccounted_one_hides(self) -> None:
+        self.window._show(model.Screen())
+        self.assertTrue(self.window._shares.placeholder.get_visible())
+        self.assertFalse(self.window._shares.frame.get_visible())
+        self.assertFalse(self.window._unaccounted.head.get_visible())
+        self.assertFalse(self.window._unaccounted.placeholder.get_visible())
+
+
+@needs_gtk
+class TestTheScrollPositionSurvivesAnUpdate(unittest.TestCase):
+    """The defect itself, measured on a window that is really on screen.
+
+    Sixty-five rows, scrolled most of the way down, then one connection
+    changes state. Before the fix this read 2650 before the event and 16
+    after it: the top of the window.
+    """
+
+    def pump(self, until: Any = None, timeout: float = 3.0) -> None:
+        from gi.repository import GLib
+
+        end = time.monotonic() + timeout
+        context = GLib.MainContext.default()
+        while time.monotonic() < end:
+            context.iteration(False)
+            if until is not None and until():
+                return
+
+    def test_an_event_does_not_scroll_the_window_to_the_top(self) -> None:
+        status = {
+            "shares": [
+                {
+                    "id": f"s{i}",
+                    "name": f"Share {i}",
+                    "state": "serving",
+                    "path": f"/srv/{i}",
+                }
+                for i in range(40)
+            ],
+            "connections": [
+                {"id": f"c{i}", "name": f"Server {i}", "state": "connected"}
+                for i in range(25)
+            ],
+        }
+        window = Window(None, FakeSession())
+        self.addCleanup(window.destroy)
+        window._show(model.screen(status))
+        window.present()
+        adjustment = window._scroller.get_vadjustment()
+        self.pump(until=lambda: adjustment.get_upper() > adjustment.get_page_size() * 2)
+        if adjustment.get_upper() <= adjustment.get_page_size() * 2:
+            self.skipTest("the window was never laid out, so nothing can scroll")
+
+        adjustment.set_value(adjustment.get_upper() * 0.6)
+        self.pump(timeout=0.3)
+        before = adjustment.get_value()
+        self.assertGreater(before, 0)
+
+        window._on_event({"id": "c12", "state": "failed", "message": "gone"})
+        self.pump(timeout=0.3)
+        self.assertEqual(adjustment.get_value(), before)
+
+        window._show(model.screen(status))
+        self.pump(timeout=0.3)
+        self.assertEqual(adjustment.get_value(), before)
 
 
 @needs_gtk
@@ -176,10 +330,10 @@ class TestARowIsHeldWhileItsOwnCallIsInFlight(unittest.TestCase):
     def test_a_rebuild_mid_call_does_not_hand_back_a_live_button(self) -> None:
         """Why the held set lives on the window and not on the widgets.
 
-        `_rebuild` destroys every widget it has ever made and builds fresh
-        ones, and an unrelated `state.changed` arriving mid-call is exactly
-        when that happens — a network misbehaving is why somebody is removing
-        a row in the first place. Disabling the widget alone is undone by it.
+        `_rebuild` replaces the widgets of any row whose content changed, and
+        an unrelated `state.changed` arriving mid-call is exactly when that
+        happens — a network misbehaving is why somebody is removing a row in
+        the first place. Disabling the widget alone is undone by it.
         """
         self.window._send(self.share, model.REMOVE)
         self.window._rebuild()
