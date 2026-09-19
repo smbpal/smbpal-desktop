@@ -1,3 +1,30 @@
+smbpal (0.2.0) trixie; urgency=medium
+
+  * The tray icon has a menu: New Share, New Connection, Manage and Close.
+    New Share and New Connection open the window with that form already up,
+    or bring the form up in the window if it is open. Manage opens the window
+    and is greyed out while it is already open. A left click still opens the
+    window; on Ubuntu's GNOME, whose tray extension sends a single click to
+    the menu, a double click does.
+  * Connections now appear in the file manager without being opened first.
+    A connection is mounted once, the first time the daemon sees it ready,
+    without holding up boot: "When this network is available" waits until
+    the server answers, "Always" does not wait, and "Only when I ask" is
+    never mounted by itself. Ejecting it from the file manager is respected
+    until it is next opened.
+  * The window keeps its scroll position when a connection changes state,
+    instead of jumping back to the top on every update.
+  * Each release now carries a SHA256SUMS file and a build attestation, so a
+    download can be checked for damage and traced to the workflow run that
+    built it.
+  * Every build is installed, used to share a folder, removed and purged on
+    Debian 12, Debian 13, Ubuntu 24.04 and Ubuntu 26.04, with smb.conf
+    compared byte for byte before and after. A release is not published
+    unless all four pass. That covers installation and removal; the desktop
+    itself is tested by hand on Raspberry Pi OS Trixie on a Raspberry Pi 4.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Sat, 19 Sep 2026 17:02:53 +0000
+
 smbpal (0.1.0) trixie; urgency=medium
 
   * First release. SMBPal shares folders over SMB and connects to shares on

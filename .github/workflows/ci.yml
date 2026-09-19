@@ -328,9 +328,15 @@ jobs:
 
           ## Tested on
 
-          Raspberry Pi OS Trixie, on a Pi 4. Nothing else has been run in
-          anger — it is expected to work on other Debian-based systems, but
-          that is an expectation and not a report.
+          By hand: Raspberry Pi OS Trixie, on a Pi 4. Nothing else has been
+          run in anger on a desktop.
+
+          Automatically, on every build: installed, used to share a folder,
+          removed and purged on Debian 12, Debian 13, Ubuntu 24.04 and Ubuntu
+          26.04, with \`smb.conf\` compared byte for byte before and after.
+          This release was not published unless all four passed. That proves
+          the package installs and uninstalls cleanly there; it says nothing
+          about the window or the tray on those desktops.
 
           ## Source
 
