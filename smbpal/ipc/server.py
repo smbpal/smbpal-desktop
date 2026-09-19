@@ -261,12 +261,26 @@ class UnixSocketTransport:
             ) from None
 
     def serve_forever(self, handler: Handler) -> None:
-        if self._listener is None:
+        listener = self._listener
+        if listener is None:
+            if self._stopping.is_set():
+                return
             raise RuntimeError("bind() before serve_forever()")
         selector = selectors.DefaultSelector()
-        selector.register(self._listener, selectors.EVENT_READ)
-        if self._wake_r is not None:
-            selector.register(self._wake_r, selectors.EVENT_READ)
+        try:
+            selector.register(listener, selectors.EVENT_READ)
+            if self._wake_r is not None:
+                selector.register(self._wake_r, selectors.EVENT_READ)
+        except (ValueError, OSError):
+            # `shutdown()` landed between starting this thread and registering
+            # the listener, and closed it: a closed socket's fd is -1 and the
+            # selector refuses it. Stopping before serving is still stopping.
+            # Seen in CI on the v0.2.2 tag, where the thread's traceback landed
+            # in the next test's captured stderr and failed that test instead.
+            selector.close()
+            if self._stopping.is_set():
+                return
+            raise
         try:
             self._accept_loop(selector, handler)
         finally:

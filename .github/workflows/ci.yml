@@ -202,8 +202,11 @@ jobs:
   release:
     name: release
     # And the distributions: a tag whose .deb fails to install on one the site
-    # names must not become a download.
-    needs: [package, distros]
+    # names must not become a download. And the tests: v0.2.2's tag run failed
+    # its tests and drafted a release anyway, because this did not wait for
+    # them. The failure was a race in the tests' own server shutdown, but the
+    # rule cannot depend on which failures turn out to be harmless.
+    needs: [tests, package, distros]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
