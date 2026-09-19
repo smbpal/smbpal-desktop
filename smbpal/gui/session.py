@@ -242,7 +242,14 @@ class Session:
             # machine, so a daemon that dies closes its end and the read
             # returns rather than hanging. There is no half-open case to
             # detect and so nothing a heartbeat would buy.
+            #
+            # **Both timeouts.** `connect()` gives the socket `reply_timeout`
+            # once it is connected, so clearing only `timeout` left the
+            # listener giving up after REPLY_TIMEOUT of quiet: the flapping
+            # above came back as "no reply from the daemon within 130s" every
+            # time nothing changed for two minutes, in 0.1.0 and 0.2.0.
             client.timeout = None
+            client.reply_timeout = None
         client.connect()
         with self._clients_lock:
             if self._stopping.is_set():
