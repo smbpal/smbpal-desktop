@@ -1,3 +1,13 @@
+smbpal (0.2.1) trixie; urgency=medium
+
+  * The window and the tray no longer report the daemon as lost after two
+    minutes in which nothing changed. The connection they listen on for
+    updates was timing out after 130 quiet seconds, so "no reply from the
+    daemon within 130s" flashed up in the window, and the tray briefly said
+    the service was not running, on a machine where nothing was wrong.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Sat, 19 Sep 2026 17:55:28 +0000
+
 smbpal (0.2.0) trixie; urgency=medium
 
   * The tray icon has a menu: New Share, New Connection, Manage and Close.
