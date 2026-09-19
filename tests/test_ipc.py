@@ -74,6 +74,35 @@ class ServerTestCase(unittest.TestCase):
         return sock
 
 
+class TestStoppingBeforeServing(unittest.TestCase):
+    """`shutdown()` can land before the serve thread has registered anything.
+
+    The CLI tests start a server thread and, for a test that never connects,
+    stop it almost at once. Once in a while the listener was closed between
+    the thread starting and it registering the socket, and the selector
+    refused fd -1 with a traceback that ended up in the next test's stderr.
+    """
+
+    def setUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory(dir="/tmp", prefix="smbpal-")
+        self.addCleanup(self._dir.cleanup)
+        self.transport = UnixSocketTransport(
+            Path(self._dir.name) / "s.sock", group=None
+        )
+        self.transport.bind()
+
+    def test_shutdown_first_means_serve_returns_quietly(self) -> None:
+        self.transport.shutdown()
+        self.transport.serve_forever(lambda _c, _f: None)
+
+    def test_a_listener_closed_under_it_is_a_stop_not_a_crash(self) -> None:
+        """The exact interleaving: the thread has the listener, then it closes."""
+        self.transport._stopping.set()
+        self.transport._listener.close()
+        self.transport.serve_forever(lambda _c, _f: None)
+        self.transport.shutdown()
+
+
 class TestMethods(ServerTestCase):
     def test_ping(self) -> None:
         self.assertEqual(self.client().call("ping"), {"pong": True})
