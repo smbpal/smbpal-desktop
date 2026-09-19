@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "smbpal"
-version = "0.2.1"
+version = "0.2.2"
 description = "SMB share manager — daemon, CLI and GUI in one package"
 requires-python = ">=3.11"
 

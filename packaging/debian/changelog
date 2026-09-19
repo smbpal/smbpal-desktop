@@ -1,3 +1,21 @@
+smbpal (0.2.2) trixie; urgency=medium
+
+  * A folder shared from the window can now be opened from other devices.
+    Samba keeps its own passwords, separate from the login password, and
+    the Share a folder form never asked for one, so on a fresh machine
+    nobody could sign in to a share made there. The form now fills in your
+    account, and if that account has no SMB password it asks for one and
+    sets it before the share is added.
+  * A share that nobody can sign in to is flagged in the window with a Set
+    password button, and in "smbpal status" with the command that fixes it.
+    A share that works says which account to sign in as, and that it takes
+    the SMB password rather than the login password.
+  * The window's header shows how to reach this computer from another
+    device: its .local name, as Avahi actually answers to it, and its
+    addresses. "smbpal status" prints the same.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Sat, 19 Sep 2026 20:21:03 +0000
+
 smbpal (0.2.1) trixie; urgency=medium
 
   * The window and the tray no longer report the daemon as lost after two
