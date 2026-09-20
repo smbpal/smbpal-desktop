@@ -259,9 +259,21 @@ NO_TRAY = "no-tray"
 # that is what the caller passes; the name does not, so it is written once.
 EXTENSION = "gnome-shell-extension-appindicator"
 
+# **Installing it is not enough, and this cost a runbook its accuracy.**
+# Enabling a GNOME extension means listing its id in the per-user GSettings
+# key `org.gnome.shell enabled-extensions`, which no package's files can do
+# for a user who has not logged in yet. Ubuntu gets away with shipping it
+# enabled because `ubuntu-settings` overrides that key's default; Debian ships
+# no such override, and the step was confirmed necessary on both Debian 12 and
+# Debian 13 on 20 September 2026.
+#
+# The id is not the package name and is not the same everywhere: Ubuntu
+# renamed the upstream extension and Debian carries Ubuntu's naming, while
+# Fedora ships it under the author's. Both were read from the two archives'
+# own file lists rather than remembered.
 _INSTALL = {
-    "apt": f"sudo apt install {EXTENSION}",
-    "dnf": f"sudo dnf install {EXTENSION}",
+    "apt": (f"sudo apt install {EXTENSION}", "ubuntu-appindicators@ubuntu.com"),
+    "dnf": (f"sudo dnf install {EXTENSION}", "appindicatorsupport@rgcjonas.gmail.com"),
 }
 
 
@@ -310,11 +322,22 @@ def tray_notice(*, desktop: str, installer: str | None) -> Notice:
             "This desktop is not showing tray icons, so SMBPal has no icon. "
             "Nothing is missing: this window is the whole of SMBPal.",
         )
-    how = _INSTALL.get(installer or "", f"install {EXTENSION}")
+    known = _INSTALL.get(installer or "")
+    if known is None:
+        how = (
+            f"install {EXTENSION}, enable it in the Extensions app, and log "
+            "out and back in"
+        )
+    else:
+        install, extension_id = known
+        how = (
+            f"{install}, then gnome-extensions enable {extension_id}, then "
+            "log out and back in"
+        )
     return Notice(
         NO_TRAY,
         "GNOME does not show tray icons on its own, so SMBPal has no icon. "
-        f"To add one: {how} \u2014 then log out and back in. "
+        f"To add one: {how}. "
         "Nothing is missing without it: this window is the whole of SMBPal.",
     )
 
