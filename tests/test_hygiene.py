@@ -606,17 +606,20 @@ class TestTheLicence(unittest.TestCase):
 
 
 class TestTheVersionIsOneNumber(unittest.TestCase):
-    """The version is written in three files, and a release tag makes a fourth.
+    """The version is written in four files, and a release tag makes a fifth.
 
     §11.3 requires every release tagged and matching the exact build, because
     under GPL the obligation attaches to the Corresponding Source for *that*
     binary and not to whatever `main` happens to hold. That promise is only as
     good as the four numbers agreeing, and nothing checked them: `pyproject`
     feeds the wheel, `smbpal/__init__.py` feeds `--version` and the daemon's
-    startup line, and `debian/changelog` alone decides what the `.deb` is
-    called. A release built from a tree where they disagree ships a file named
-    for one version containing another, which is unfixable after the fact —
-    the wrong file is already on somebody's machine.
+    startup line, `debian/changelog` alone decides what the `.deb` is called,
+    and `packaging/rpm/smbpal.spec` alone decides what the `.rpm` is called
+    **and** what its source tarball must be named, since the CI job reads the
+    version back out of the spec to build one. A release built from a tree
+    where they disagree ships a file named for one version containing another,
+    which is unfixable after the fact — the wrong file is already on somebody's
+    machine.
 
     The tag is checked in CI, at the only moment it exists.
     """
@@ -631,6 +634,21 @@ class TestTheVersionIsOneNumber(unittest.TestCase):
 
         data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertEqual(self.version(), data["project"]["version"])
+
+    def test_the_rpm_spec_matches(self) -> None:
+        # `Version:        0.2.2` — and the tarball the spec unpacks is named
+        # from it, so a disagreement here is a build that cannot find its own
+        # source rather than a mislabelled package.
+        for line in (
+            (ROOT / "packaging" / "rpm" / "smbpal.spec")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ):
+            if line.startswith("Version:"):
+                self.assertEqual(self.version(), line.split(":", 1)[1].strip())
+                break
+        else:  # pragma: no cover - the spec always has one
+            self.fail("packaging/rpm/smbpal.spec has no Version: line")
 
     def test_the_debian_changelog_matches(self) -> None:
         # `smbpal (0.1.0) unstable; urgency=medium` — the version in parentheses
