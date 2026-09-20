@@ -182,8 +182,9 @@ fi
 # installed. Between leaving those on disk indefinitely and losing a config
 # that can be rebuilt in a minute from the window, this takes the config.
 #
-# Keep it first if you want it: `cp -a /etc/smbpal /etc/smbpal.keep` before
-# erasing, and copy it back before the daemon's first start.
+# If you want to keep it, take a copy of /etc/smbpal somewhere else before
+# erasing and put it back before the daemon's first start. The Fedora runbook
+# in smbpal-docs has the commands.
 if [ $1 -eq 0 ]; then
     rm -rf %{_sysconfdir}/smbpal
     remove_smb_conf_block() {
@@ -234,7 +235,7 @@ fi
 %{_sysusersdir}/smbpal.conf
 %{_datadir}/polkit-1/actions/org.smbpal.policy
 %{_datadir}/applications/smbpal.desktop
-%{_sysconfdir}/xdg/autostart/smbpal-tray.desktop
+%config(noreplace) %{_sysconfdir}/xdg/autostart/smbpal-tray.desktop
 %{_datadir}/icons/hicolor/scalable/status/smbpal.svg
 %{_datadir}/icons/hicolor/scalable/status/smbpal-idle.svg
 %{_datadir}/icons/hicolor/scalable/status/smbpal-attention.svg
