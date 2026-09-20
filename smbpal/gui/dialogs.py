@@ -317,6 +317,11 @@ class AddConnectionDialog(_Form):
         super().__init__(parent, session, "Connect to a share", "Connect")
         self.set_default_size(520, -1)
 
+        # The connection this form made, once it has made one. Set here so a
+        # retry after refused credentials corrects it rather than adding a
+        # second connection to the same share.
+        self._connection: dict[str, Any] | None = None
+
         # Neutral, and it teaches the thing people do not expect: an address
         # works as well as a name. Never a real machine from anybody's network
         # — a placeholder reads as a suggestion.
@@ -444,6 +449,16 @@ class AddConnectionDialog(_Form):
 
     def _submit(self) -> None:
         self.working(True)
+        # **Add once.** This form makes two calls, and a second press after the
+        # credentials were refused used to make the first one again — a new
+        # connection, to the same share, under a mountpoint `default_mountpoint`
+        # had politely moved out of the way. Reported from a Pi on 20 September
+        # 2026 as "added the share but now i have 2". Once the connection
+        # exists, pressing Connect again means *try these credentials*, which
+        # is what somebody who has just corrected a typo is asking for.
+        if self._connection is not None:
+            self._set_credentials(self._connection)
+            return
         params: dict[str, Any] = {
             "host": self._host.get_text().strip(),
             "share": self._share.get_text().strip(),
@@ -459,19 +474,44 @@ class AddConnectionDialog(_Form):
         )
 
     def _added(self, connection: dict[str, Any]) -> None:
+        # Held so a retry corrects this connection rather than making another.
+        self._connection = connection
         username = self._user.get_text().strip()
         password = self._password.get_text()
         if not username or not password:
             self.succeeded(connection)
             return
+        self._set_credentials(connection)
+
+    def _set_credentials(self, connection: dict[str, Any]) -> None:
         # Two calls, the same as the CLI's: the connection exists first, then
-        # it is given credentials. A failure here leaves a connection that
-        # mounts as a guest, which is recoverable from the row.
+        # it is given credentials.
         self.session.submit(
             "connection.set_credentials",
-            {"ref": connection["id"], "username": username, "password": password},
+            {
+                "ref": connection["id"],
+                "username": self._user.get_text().strip(),
+                "password": self._password.get_text(),
+            },
             then=self.succeeded,
-            catch=self.failed,
+            catch=self._credentials_failed,
+        )
+
+    def _credentials_failed(self, exc: SmbpalError) -> None:
+        """Say that the connection exists, because it does.
+
+        The bare error read as *nothing happened*, and the obvious response to
+        nothing happening is to fill the form in again — which is how one
+        rejected password became two connections. The connection is kept rather
+        than undone: it is a real connection that needs a password, and the row
+        behind this form can sign it in later. What was missing was saying so.
+        """
+        self.failed(exc)
+        self._error.set_text(
+            f"{self._error.get_text()}\n\n"
+            "The connection was created and is waiting for a password. "
+            "Correct it above and press Connect again to try it against the "
+            "same connection, or close this and use Sign in on its row."
         )
 
 

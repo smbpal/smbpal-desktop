@@ -100,6 +100,48 @@ class TestConnections(unittest.TestCase):
         with self.assertRaises(AlreadyExists):
             ops.add_connection(doc, host="b", share="T", mountpoint="/mnt/x")
 
+    def test_the_same_share_twice_is_refused(self) -> None:
+        """The mountpoint check cannot catch this, which is how it shipped.
+
+        `default_mountpoint` exists to step around a taken mountpoint, so the
+        second connection to a share is given one of its own and never reaches
+        the test below. On a Pi on 20 September 2026 that produced two
+        connections to one share, one of them holding a password that had
+        already been refused.
+        """
+        doc, _ = ops.add_connection(
+            empty_config(), host="nas.local", share="Media", mountpoint="/mnt/a"
+        )
+        # A *different* mountpoint, which is what the form's second press
+        # produced: the check below never sees a collision to refuse.
+        with self.assertRaises(AlreadyExists) as caught:
+            ops.add_connection(
+                doc, host="nas.local", share="Media", mountpoint="/mnt/b"
+            )
+        # It has to name the one that exists, or "already" is unactionable.
+        self.assertIn("nas-local-media", str(caught.exception))
+
+    def test_the_same_share_in_a_different_case_is_the_same_share(self) -> None:
+        # SMB treats both as case-insensitive, and a person retyping a name is
+        # not proposing a second connection by capitalising it differently.
+        doc, _ = ops.add_connection(
+            empty_config(), host="nas.local", share="Media", mountpoint="/mnt/a"
+        )
+        with self.assertRaises(AlreadyExists):
+            ops.add_connection(
+                doc, host="NAS.local", share="MEDIA", mountpoint="/mnt/b"
+            )
+
+    def test_a_different_share_on_the_same_host_is_fine(self) -> None:
+        doc, _ = ops.add_connection(
+            empty_config(), host="nas.local", share="Media", mountpoint="/mnt/a"
+        )
+        doc, second = ops.add_connection(
+            doc, host="nas.local", share="Backups", mountpoint="/mnt/b"
+        )
+        self.assertEqual(len(doc["connections"]), 2)
+        self.assertEqual(second["share"], "Backups")
+
     def test_remove_by_mountpoint(self) -> None:
         doc, _ = ops.add_connection(
             empty_config(), host="a", share="S", mountpoint="/mnt/x"
