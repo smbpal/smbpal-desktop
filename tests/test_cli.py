@@ -237,7 +237,17 @@ class TestErrors(CliTestCase):
         code, out, err = self.run_cli("share", "add", "bad\nname", "/srv/x")
         self.assertEqual(code, EXIT_ERROR)
         self.assertNotIn("Traceback", err + out)
-        self.assertTrue(err.startswith("smbpal: "))
+        # **The message says what it found, because this failed once in CI and
+        # could not be reproduced.** `redirect_stderr` catches everything the
+        # process writes while it is in force, not only the CLI: a WARNING from
+        # any thread reaches `logging.lastResort`, and `warnings.warn` goes to
+        # stderr too. Either lands in front of the CLI's own line and fails this
+        # assertion, and knowing *which* is the difference between a fix and a
+        # guess. The bare assertTrue said only "False is not true".
+        self.assertTrue(
+            err.startswith("smbpal: "),
+            f"something wrote to stderr before the CLI did: {err!r}",
+        )
 
     def test_an_absent_daemon_has_its_own_exit_code(self) -> None:
         # Distinguishable from "the daemon refused", so a script can tell
