@@ -206,20 +206,27 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `latest` and nothing else until this job has run once and said what
-        # `latest` is. A guessed release number is a job that fails because the
-        # container tag does not exist, which says nothing about the package.
-        # The second row, and CentOS Stream after it, get added from that
-        # answer.
-        image: ['fedora:latest']
+        # `latest` was Fedora 44 when this job first ran, on 20 September
+        # 2026, so 43 is the release behind it and the pair is the same shape
+        # as the .deb matrix: what people have now, and what they had last.
+        # CentOS Stream is the obvious third row and is not here yet.
+        image: ['fedora:latest', 'fedora:43']
     container: ${{ matrix.image }}
     steps:
+      # **Before the checkout, and that is the whole point.** `actions/checkout`
+      # clones with git when git is there and falls back to downloading a
+      # tarball over the REST API when it is not. A Fedora container has no git,
+      # so the fallback is what ran, and the tree it left had no `.git` for
+      # `git archive` to read. The step order is the fix.
+      - name: Install git before the checkout
+        run: dnf install -y git-core
+
       - uses: actions/checkout@v5
 
       - name: Install the build chain
         run: |
           dnf install -y rpm-build rpmdevtools python3-devel systemd-rpm-macros \
-            git-core tar findutils
+            tar findutils
 
       # `git archive` and not `tar`: the tarball has to hold what the tag holds
       # and nothing else, and a tree that has been built in has `.pytest_cache`
@@ -256,7 +263,7 @@ jobs:
       - uses: actions/upload-artifact@v5
         if: always()
         with:
-          name: rpm
+          name: rpm-${{ strategy.job-index }}
           path: dist/*.rpm
           if-no-files-found: error
 
