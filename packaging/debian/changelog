@@ -1,3 +1,26 @@
+smbpal (0.2.3) trixie; urgency=medium
+
+  * Connecting to a share with the wrong password no longer breaks the
+    connection. Correcting the password reported "the daemon hit an
+    internal error" and changed nothing: a mount that has just failed
+    leaves the folder it mounts on in a state the daemon could not read,
+    and it stopped there rather than writing the corrected credentials.
+    Found on a Raspberry Pi running Bookworm.
+  * A connection whose password is refused is no longer added twice. The
+    Connect form said only that it had failed, which read as though nothing
+    had happened, so filling it in again made a second connection to the
+    same share. It now says the connection was made and is waiting for a
+    password, and trying again corrects that connection instead of adding
+    another.
+  * SMBPal refuses a second connection to a share it is already connected
+    to, and says which one already has it.
+  * A change the daemon could not apply is no longer left in the
+    configuration. Failures it expected were already undone; failures it
+    did not expect were not, which is the case where least is known about
+    what reached the machine.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Sun, 20 Sep 2026 14:38:03 +0000
+
 smbpal (0.2.2) trixie; urgency=medium
 
   * A folder shared from the window can now be opened from other devices.
