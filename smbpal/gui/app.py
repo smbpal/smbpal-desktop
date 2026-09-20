@@ -1,7 +1,9 @@
 """`smbpal-gui`: a GTK application that is a third client of the D4 socket.
 
 **Not a second daemon.** It holds no state the daemon does not hold, writes no
-config, and touches no unit file. Everything it does is a method the CLI can
+config, and touches no unit file. The one file it does write is
+`smbpal.gui.prefs`, which remembers nothing about the machine — only that
+somebody told a notice to stop appearing. Everything it does is a method the CLI can
 call too, which is why every behaviour it has could be found by driving the CLI
 first — the working method the Pi runs have justified twice now.
 
@@ -14,6 +16,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import shutil
 import sys
 from typing import Callable
 
@@ -23,7 +27,7 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Gio, GLib, Gtk  # noqa: E402
 
-from smbpal.gui import APP_ID  # noqa: E402
+from smbpal.gui import APP_ID, model  # noqa: E402
 from smbpal.gui.session import Session  # noqa: E402
 from smbpal.gui.window import Window, install_css  # noqa: E402
 from smbpal.ipc.client import Client  # noqa: E402
@@ -37,6 +41,28 @@ log = logging.getLogger(__name__)
 # header bar's Add button. The tray's New Share and New Connection items run
 # `smbpal-gui --new-share` and `--new-connection`.
 FORMS = {"new-share": "add-share", "new-connection": "add-connection"}
+
+# The same name `smbpal.gui.tray` registers with. Nobody owning it means no
+# tray icon can appear, from SMBPal or anyone.
+WATCHER_NAME = "org.kde.StatusNotifierWatcher"
+
+# How long to let the desktop finish starting before believing there is no
+# tray. A panel that starts after the window would otherwise flash a notice
+# and take it away again, which is worse than either answer on its own.
+SETTLE_SECONDS = 3
+
+
+def installer() -> str | None:
+    """Which package manager to name in a notice, or none to name.
+
+    By what is on `PATH`, not by reading `/etc/os-release`: a derivative can
+    call itself anything and still be apt, and a machine with neither should
+    be told to install the extension without being told a lie about how.
+    """
+    for name in ("apt", "dnf"):
+        if shutil.which(name):
+            return name
+    return None
 
 
 def to_main_thread(callback: Callable[[], None]) -> None:
@@ -56,6 +82,8 @@ class Application(Gtk.Application):
         )
         self.socket_path = socket_path
         self.session: Session | None = None
+        self._watch = 0
+        self._tray_host = True
 
     def do_startup(self) -> None:  # noqa: N802 - GObject vfunc name
         Gtk.Application.do_startup(self)
@@ -90,12 +118,54 @@ class Application(Gtk.Application):
         )
         window = Window(self, self.session)
         window.present()
+        self._watch_tray_host(window)
         self.session.start()
         # After the window is on screen, not before: the first `status` reply
         # has nowhere to go until there is something to draw it on.
         self.session.refresh()
 
+    # --- is anything hosting tray icons ------------------------------------
+
+    def _watch_tray_host(self, window: Window) -> None:
+        """Tell the window when this desktop turns out to have no tray.
+
+        Here rather than in `Window` because it needs the session bus, and the
+        window is deliberately testable without one. A watch, not a one-off
+        question, so that a panel starting late takes the notice away again.
+        """
+        try:
+            self._watch = Gio.bus_watch_name(
+                Gio.BusType.SESSION,
+                WATCHER_NAME,
+                Gio.BusNameWatcherFlags.NONE,
+                lambda *_a: self._tray_host_is(window, True),
+                lambda *_a: self._tray_host_is(window, False),
+            )
+        except GLib.Error as exc:  # pragma: no cover - needs a broken bus
+            log.debug("cannot watch %s: %s", WATCHER_NAME, exc)
+
+    def _tray_host_is(self, window: Window, present: bool) -> None:
+        self._tray_host = present
+        if present:
+            window.show_notice(None)
+            return
+        GLib.timeout_add_seconds(SETTLE_SECONDS, self._no_tray_host, window)
+
+    def _no_tray_host(self, window: Window) -> bool:
+        if not self._tray_host:
+            log.info("nothing on this desktop is hosting tray icons")
+            window.show_notice(
+                model.tray_notice(
+                    desktop=os.environ.get("XDG_CURRENT_DESKTOP", ""),
+                    installer=installer(),
+                )
+            )
+        return GLib.SOURCE_REMOVE
+
     def do_shutdown(self) -> None:  # noqa: N802 - GObject vfunc name
+        if self._watch:
+            Gio.bus_unwatch_name(self._watch)
+            self._watch = 0
         if self.session is not None:
             self.session.stop()
             self.session = None

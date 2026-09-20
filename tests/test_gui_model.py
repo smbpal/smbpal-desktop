@@ -507,5 +507,57 @@ class TestTheTrayIndicator(unittest.TestCase):
         self.assertIn("already up are unaffected", found.detail)
 
 
+class TestTheNoTrayNotice(unittest.TestCase):
+    """The wording somebody reads when their desktop has no tray.
+
+    The decision this encodes is that a missing icon is *not* a fault: GNOME
+    removed its tray, the window was always the product, and a notice that
+    sounded like an error would send people looking for a broken install.
+    """
+
+    def notice(self, desktop: str, installer: str | None = "apt") -> model.Notice:
+        return model.tray_notice(desktop=desktop, installer=installer)
+
+    def test_it_names_the_extension_and_the_log_out(self) -> None:
+        text = self.notice("GNOME").text
+        self.assertIn("sudo apt install gnome-shell-extension-appindicator", text)
+        self.assertIn("log out", text)
+
+    def test_fedora_is_told_dnf(self) -> None:
+        self.assertIn(
+            "sudo dnf install gnome-shell-extension-appindicator",
+            self.notice("GNOME", "dnf").text,
+        )
+
+    def test_with_no_package_manager_it_still_names_the_package(self) -> None:
+        """Better to name the thing than to invent a command for a machine
+        whose package manager we did not recognise."""
+        text = self.notice("GNOME", None).text
+        self.assertIn("gnome-shell-extension-appindicator", text)
+        self.assertNotIn("sudo", text)
+
+    def test_ubuntus_spelling_of_gnome_is_gnome(self) -> None:
+        # XDG_CURRENT_DESKTOP is a list. Ubuntu's is `ubuntu:GNOME`, and
+        # matching the whole string would miss it.
+        self.assertIn("GNOME does not show tray icons", self.notice("ubuntu:GNOME").text)
+        self.assertIn("GNOME does not show tray icons", self.notice("GNOME-Classic:GNOME").text)
+
+    def test_a_desktop_that_is_not_gnome_is_not_told_to_install_anything(self) -> None:
+        """On a bare window manager the extension would do nothing at all."""
+        text = self.notice("LXDE").text
+        self.assertNotIn("install", text)
+        self.assertIn("this window is the whole of SMBPal", text)
+
+    def test_every_version_says_nothing_is_missing(self) -> None:
+        for desktop in ("GNOME", "ubuntu:GNOME", "LXDE", "KDE", ""):
+            with self.subTest(desktop=desktop):
+                self.assertIn("Nothing is missing", self.notice(desktop).text)
+
+    def test_the_key_is_stable_across_the_wording(self) -> None:
+        # What `prefs` writes down. It must not move when the prose does.
+        for desktop in ("GNOME", "LXDE"):
+            self.assertEqual(self.notice(desktop).key, "no-tray")
+
+
 if __name__ == "__main__":
     unittest.main()
