@@ -253,6 +253,20 @@ class Dispatcher:
         being in the config means being applied. If Samba will not take the
         change, the config goes back to what it was and the previous state is
         re-applied, rather than leaving a record of a share that is not served.
+
+        **The undo is not conditioned on what went wrong, and that was a
+        defect.** It caught `SmbpalError` alone, which is the failure we
+        anticipated; anything else fell past it to `handle`'s catch-all, which
+        told the caller "the daemon hit an internal error" and left the saved
+        record in place. Reported from a Pi on 20 September 2026: a connection
+        added with the wrong password failed that way, and adding it again
+        after correcting the password produced **two** connections, one of
+        which had never worked. The unanticipated failure is exactly the one
+        where least is known about what was applied, so it is the one where
+        the config is least entitled to claim anything. `BaseException`
+        rather than `Exception` because this is an undo that re-raises
+        immediately: nothing is swallowed, and an apply stopped by anything at
+        all must not leave the file describing it as done.
         """
         self.store.save(updated)
         if self.applier is None and self.mounter is None:
@@ -265,7 +279,7 @@ class Dispatcher:
                 # disk would reap them — see Mounter.apply.
                 self.mounter.apply(updated, previous=previous)
             return report
-        except SmbpalError:
+        except BaseException:
             log.warning("apply failed; rolling the config back")
             self.store.save(previous)
             try:
@@ -273,7 +287,11 @@ class Dispatcher:
                     self.applier.apply(previous)
                 if self.mounter is not None:
                     self.mounter.apply(previous, previous=updated)
-            except SmbpalError:
+            except Exception:
+                # Not BaseException here: this one does not re-raise, so
+                # swallowing an interrupt would be swallowing it for good. A
+                # failure to restore is logged and the original error is what
+                # the caller gets, since that is what they asked about.
                 log.exception("could not re-apply the previous config after rollback")
             raise
 
