@@ -10,7 +10,7 @@
 # no second removal step.
 
 Name:           smbpal
-Version:        0.2.2
+Version:        0.2.3
 Release:        1%{?dist}
 Summary:        Share folders over SMB, and connect to shares on other machines
 
@@ -241,5 +241,10 @@ fi
 %{_datadir}/icons/hicolor/scalable/status/smbpal-attention.svg
 
 %changelog
+* Sun Sep 20 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.3-1
+- Fixes for a connection whose password was refused: the corrected
+  password now applies, the connection is not added twice, and a change
+  that could not be applied is not left in the configuration.
+
 * Sun Sep 20 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.2-1
 - First RPM packaging, following the .deb file for file.
