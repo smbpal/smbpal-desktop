@@ -30,6 +30,7 @@ from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 from smbpal.errors import SmbpalError  # noqa: E402
 from smbpal.gui import model  # noqa: E402
+from smbpal.gui import prefs  # noqa: E402
 from smbpal.gui.dialogs import add_menu  # noqa: E402
 from smbpal.gui.session import Session  # noqa: E402
 
@@ -156,6 +157,25 @@ class Window(Gtk.ApplicationWindow):
         self._subtitle.add_css_class("row-detail")
         self.set_titlebar(self._header())
 
+        # Two strips, not one. The error banner is transient and anything can
+        # clear it; a notice is about the desktop itself and has to survive an
+        # error arriving on top of it, so they are separate widgets and the
+        # notice sits above.
+        self._notice = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=8, visible=False
+        )
+        self._notice.add_css_class("banner")
+        self._notice.add_css_class("banner-note")
+        self._notice_text = Gtk.Label(
+            label="", xalign=0, wrap=True, hexpand=True, selectable=True
+        )
+        self._notice.append(self._notice_text)
+        self._notice_key = ""
+        for label, forever in (("Not now", False), ("Don't show again", True)):
+            button = Gtk.Button(label=label, valign=Gtk.Align.CENTER)
+            button.connect("clicked", self._dismiss_notice, forever)
+            self._notice.append(button)
+
         self._banner = Gtk.Label(label="", xalign=0, wrap=True, visible=False)
         self._banner.add_css_class("banner")
 
@@ -171,6 +191,7 @@ class Window(Gtk.ApplicationWindow):
         outer.set_margin_top(8)
         outer.set_margin_start(12)
         outer.set_margin_end(12)
+        outer.append(self._notice)
         outer.append(self._banner)
         outer.append(self._scroller)
         self.set_child(outer)
@@ -254,6 +275,29 @@ class Window(Gtk.ApplicationWindow):
 
     def _clear_banner(self) -> None:
         self._banner.set_visible(False)
+
+    # --- notices -----------------------------------------------------------
+
+    def show_notice(self, notice: model.Notice | None) -> None:
+        """Show it, or take it away when the thing it described has changed.
+
+        Passed in rather than worked out here, because deciding it needs the
+        session bus and this module is the one that has to stay testable
+        without one. `smbpal.gui.app` watches the bus and calls this.
+        """
+        if notice is None:
+            self._notice.set_visible(False)
+            return
+        if prefs.is_dismissed(notice.key):
+            return
+        self._notice_key = notice.key
+        self._notice_text.set_text(notice.text)
+        self._notice.set_visible(True)
+
+    def _dismiss_notice(self, _button: Gtk.Button, forever: bool) -> None:
+        if forever and self._notice_key:
+            prefs.dismiss(self._notice_key)
+        self._notice.set_visible(False)
 
     # --- building ----------------------------------------------------------
 

@@ -252,6 +252,73 @@ class Indicator:
         return self.status == PROBLEM
 
 
+NO_TRAY = "no-tray"
+
+# The package is called the same thing on Debian, Ubuntu and Fedora, checked
+# against all three archives on 20 September 2026. The installer differs, so
+# that is what the caller passes; the name does not, so it is written once.
+EXTENSION = "gnome-shell-extension-appindicator"
+
+_INSTALL = {
+    "apt": f"sudo apt install {EXTENSION}",
+    "dnf": f"sudo dnf install {EXTENSION}",
+}
+
+
+@dataclass(frozen=True)
+class Notice:
+    """Something true about this desktop that the window says once.
+
+    Not an error and not a state: a `Row` describes something SMBPal manages,
+    and a notice describes the place SMBPal is running. It carries its own
+    `key` because dismissing it is permanent and the file that remembers that
+    (`smbpal.gui.prefs`) has to outlive the wording.
+    """
+
+    key: str
+    text: str
+
+
+def is_gnome(desktop: str) -> bool:
+    """`XDG_CURRENT_DESKTOP` is a colon-separated list, not one name.
+
+    Ubuntu sets `ubuntu:GNOME`, GNOME Classic sets `GNOME-Classic:GNOME`, and
+    a bare GNOME sets `GNOME`. Matching the whole string would miss two of the
+    three.
+    """
+    return any(
+        part.strip().upper().startswith("GNOME") for part in desktop.split(":")
+    )
+
+
+def tray_notice(*, desktop: str, installer: str | None) -> Notice:
+    """What to say on a desktop where nothing is hosting tray icons.
+
+    Called only when `org.kde.StatusNotifierWatcher` has no owner, which is
+    the whole of the test: it is true on stock GNOME, false on Pi OS's panel,
+    on KDE, and on Ubuntu, where the extension ships enabled. So a machine
+    that is fine never sees this, and the one that is missing an icon is told
+    why rather than left to wonder.
+
+    **The last sentence is the important one.** The icon is a convenience; the
+    window is the product. Somebody who reads this and does nothing has lost
+    nothing, and saying so is what keeps this a notice rather than a warning.
+    """
+    if not is_gnome(desktop):
+        return Notice(
+            NO_TRAY,
+            "This desktop is not showing tray icons, so SMBPal has no icon. "
+            "Nothing is missing: this window is the whole of SMBPal.",
+        )
+    how = _INSTALL.get(installer or "", f"install {EXTENSION}")
+    return Notice(
+        NO_TRAY,
+        "GNOME does not show tray icons on its own, so SMBPal has no icon. "
+        f"To add one: {how} \u2014 then log out and back in. "
+        "Nothing is missing without it: this window is the whole of SMBPal.",
+    )
+
+
 _SERVING = frozenset({"serving", "read-only"})
 
 # Which themed icon each status asks the panel for. A decision, so it lives

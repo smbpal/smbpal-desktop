@@ -20,9 +20,12 @@ belong; this file is for the logic that was hiding among them.
 
 from __future__ import annotations
 
+import os
+import tempfile
 import time
 import unittest
 from typing import Any
+from unittest import mock
 
 try:
     import gi
@@ -37,7 +40,7 @@ except ImportError:  # pragma: no cover - a machine without python3-gi
 
 if _HAVE_DISPLAY:
     from smbpal.errors import SmbpalError
-    from smbpal.gui import model
+    from smbpal.gui import model, prefs
     from smbpal.gui.window import Window
 
 needs_gtk = unittest.skipUnless(
@@ -596,3 +599,76 @@ class TestTheFormFlags(unittest.TestCase):
         for form in app.FORMS.values():
             with self.subTest(action=form):
                 self.assertIsNotNone(window.lookup_action(form))
+
+
+@needs_gtk
+class TestTheNoTrayNotice(unittest.TestCase):
+    """The strip that says this desktop is not showing tray icons.
+
+    Two things are worth pinning. The notice is not the error banner — an
+    error arriving must not take it away, and clearing the banner must not
+    either — and "Don't show again" has to mean again: the window that writes
+    the dismissal is rarely the window that would have shown it next.
+    """
+
+    def setUp(self) -> None:
+        self.home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.home.cleanup)
+        patched = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.home.name})
+        patched.start()
+        self.addCleanup(patched.stop)
+        self.session = FakeSession()
+        self.window = Window(None, self.session)
+        self.notice = model.tray_notice(desktop="GNOME", installer="apt")
+
+    def buttons(self) -> dict[str, Any]:
+        found, child = {}, self.window._notice.get_first_child()
+        while child is not None:
+            if isinstance(child, Gtk.Button):
+                found[child.get_label()] = child
+            child = child.get_next_sibling()
+        return found
+
+    def test_nothing_is_shown_until_something_says_so(self) -> None:
+        self.assertFalse(self.window._notice.get_visible())
+
+    def test_it_says_what_the_model_decided(self) -> None:
+        self.window.show_notice(self.notice)
+        self.assertTrue(self.window._notice.get_visible())
+        self.assertEqual(self.window._notice_text.get_label(), self.notice.text)
+
+    def test_a_tray_host_turning_up_takes_it_away(self) -> None:
+        self.window.show_notice(self.notice)
+        self.window.show_notice(None)
+        self.assertFalse(self.window._notice.get_visible())
+
+    def test_an_error_does_not_displace_it(self) -> None:
+        self.window.show_notice(self.notice)
+        self.window._on_error(SmbpalError("something else went wrong"))
+        self.assertTrue(self.window._notice.get_visible())
+        self.assertEqual(self.window._notice_text.get_label(), self.notice.text)
+
+    def test_clearing_the_banner_does_not_take_it_away_either(self) -> None:
+        self.window.show_notice(self.notice)
+        self.window._clear_banner()
+        self.assertTrue(self.window._notice.get_visible())
+
+    def test_not_now_hides_it_and_remembers_nothing(self) -> None:
+        self.window.show_notice(self.notice)
+        self.buttons()["Not now"].emit("clicked")
+        self.assertFalse(self.window._notice.get_visible())
+        self.assertFalse(prefs.is_dismissed(self.notice.key))
+        # And the next window shows it again, which is the whole point of the
+        # difference between the two buttons.
+        later = Window(None, FakeSession())
+        later.show_notice(self.notice)
+        self.assertTrue(later._notice.get_visible())
+
+    def test_dont_show_again_means_again(self) -> None:
+        self.window.show_notice(self.notice)
+        self.buttons()["Don't show again"].emit("clicked")
+        self.assertFalse(self.window._notice.get_visible())
+        self.assertTrue(prefs.is_dismissed(self.notice.key))
+        later = Window(None, FakeSession())
+        later.show_notice(self.notice)
+        self.assertFalse(later._notice.get_visible())
