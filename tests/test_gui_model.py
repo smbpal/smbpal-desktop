@@ -523,11 +523,30 @@ class TestTheNoTrayNotice(unittest.TestCase):
         self.assertIn("sudo apt install gnome-shell-extension-appindicator", text)
         self.assertIn("log out", text)
 
-    def test_fedora_is_told_dnf(self) -> None:
+    def test_installing_it_is_not_the_whole_of_it(self) -> None:
+        """Enabling is a separate step and Debian does not do it for you.
+
+        Confirmed on Debian 12 and Debian 13 on 20 September 2026: the icon
+        stays absent until the extension is enabled, because enabling means
+        writing a per-user GSettings key that no package's files can set.
+        Advice that stopped at `apt install` would leave somebody with a
+        command that appeared to do nothing.
+        """
+        text = self.notice("GNOME").text
         self.assertIn(
-            "sudo dnf install gnome-shell-extension-appindicator",
-            self.notice("GNOME", "dnf").text,
+            "gnome-extensions enable ubuntu-appindicators@ubuntu.com", text
         )
+
+    def test_fedora_is_told_dnf_and_its_own_extension_id(self) -> None:
+        """The id is not the package name, and Fedora's is not Debian's:
+        Ubuntu renamed the upstream extension and Debian carries Ubuntu's
+        naming, while Fedora ships it under the author's."""
+        text = self.notice("GNOME", "dnf").text
+        self.assertIn("sudo dnf install gnome-shell-extension-appindicator", text)
+        self.assertIn(
+            "gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com", text
+        )
+        self.assertNotIn("ubuntu-appindicators", text)
 
     def test_with_no_package_manager_it_still_names_the_package(self) -> None:
         """Better to name the thing than to invent a command for a machine
@@ -535,6 +554,10 @@ class TestTheNoTrayNotice(unittest.TestCase):
         text = self.notice("GNOME", None).text
         self.assertIn("gnome-shell-extension-appindicator", text)
         self.assertNotIn("sudo", text)
+        # And it must still say that enabling is a step, without guessing at
+        # an id it cannot know the packaging of.
+        self.assertIn("enable", text)
+        self.assertNotIn("@", text)
 
     def test_ubuntus_spelling_of_gnome_is_gnome(self) -> None:
         # XDG_CURRENT_DESKTOP is a list. Ubuntu's is `ubuntu:GNOME`, and
