@@ -359,6 +359,55 @@ class TestSettingTheSmbPassword(unittest.TestCase):
 
 
 @needs_gtk
+class TestRefusedCredentialsDoNotMakeASecondConnection(unittest.TestCase):
+    """Reported from a Pi on 20 September 2026: "now i have 2".
+
+    The form makes two calls. The connection is added, its credentials are
+    refused, and the error read as though nothing had happened — so the form
+    was filled in again, the second press added a *second* connection, and
+    `default_mountpoint` politely gave it a mountpoint of its own rather than
+    colliding with the first.
+    """
+
+    def setUp(self) -> None:
+        from smbpal.gui.dialogs import AddConnectionDialog
+
+        self.session = FakeSession()
+        self.form = AddConnectionDialog(None, self.session)
+        self.form._host.set_text("nas.local")
+        self.form._share.set_text("Media")
+        self.form._user.set_text("luke")
+        self.form._password.set_text("wrong")
+
+    def refuse(self) -> None:
+        self.form._submit()
+        self.assertEqual(self.session.submitted[-1][0], "connection.add")
+        self.session.reply({"id": "nas-media", "mountpoint": "/media/luke/Media"})
+        self.assertEqual(self.session.submitted[-1][0], "connection.set_credentials")
+        self.session.fail(SmbpalError("the username or password was refused"))
+
+    def test_a_retry_corrects_the_connection_it_already_made(self) -> None:
+        self.refuse()
+        self.form._password.set_text("right")
+        self.form._submit()
+        method, params = self.session.submitted[-1]
+        self.assertEqual(method, "connection.set_credentials")
+        self.assertEqual(params["ref"], "nas-media")
+        self.assertEqual(params["password"], "right")
+        # The whole point: no second connection was ever asked for.
+        self.assertEqual(
+            [m for m, _ in self.session.submitted].count("connection.add"), 1
+        )
+
+    def test_the_error_says_the_connection_exists(self) -> None:
+        self.refuse()
+        text = self.form._error.get_text()
+        self.assertIn("refused", text)
+        # Without this sentence the obvious next move is to add it again.
+        self.assertIn("connection was created", text)
+
+
+@needs_gtk
 class TestSharingAFolderSetsUpSigningIn(unittest.TestCase):
     def setUp(self) -> None:
         from smbpal.gui.dialogs import AddShareDialog

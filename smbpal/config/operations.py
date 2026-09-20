@@ -281,6 +281,30 @@ def add_connection(
             host=host,
         )
 
+    # **Same host and share first, because the mountpoint check cannot see it.**
+    # `default_mountpoint` exists to avoid collisions, so a second connection to
+    # a share that already has one is given a *different* mountpoint and sails
+    # past the test below. Reported from a Pi on 20 September 2026: a connection
+    # whose credentials were refused was added again, and the result was two
+    # connections to one share, racing for the same remote files with one of
+    # them holding a password that had already been refused.
+    #
+    # Compared case-insensitively, which is what SMB itself does with both.
+    # Only strings can be compared, so `nas.local` and its address still read as
+    # two machines; catching the ordinary repeat is worth more than pretending
+    # to resolve names here.
+    for existing in connections:
+        if (
+            str(existing.get("host", "")).lower() == host.lower()
+            and str(existing.get("share", "")).lower() == share.lower()
+        ):
+            raise AlreadyExists(
+                f"{share} on {host} is already connection "
+                f"{existing.get('id')!r}, at {existing.get('mountpoint')}",
+                detail="Remove that one, or give it the credentials it needs, "
+                "rather than adding a second connection to the same share.",
+            )
+
     for existing in connections:
         if existing.get("mountpoint") == mountpoint:
             raise AlreadyExists(
