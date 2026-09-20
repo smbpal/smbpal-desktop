@@ -192,6 +192,74 @@ jobs:
       - name: Install, share, remove, purge
         run: sh packaging/check-distro.sh dist/smbpal_*_all.deb
 
+  # The RPM half. Fedora is not on the site's list yet and this is what would
+  # put it there: the same tree, built with `packaging/rpm/smbpal.spec`, then
+  # installed, used to share a folder and erased in Fedora's own container.
+  #
+  # Build and check in one job rather than two. The .deb is split because four
+  # distributions install the one artifact; here the artifact is built against
+  # the distribution that installs it, so a matrix would rebuild it each time
+  # anyway.
+  rpm:
+    name: rpm on ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # `latest` and nothing else until this job has run once and said what
+        # `latest` is. A guessed release number is a job that fails because the
+        # container tag does not exist, which says nothing about the package.
+        # The second row, and CentOS Stream after it, get added from that
+        # answer.
+        image: ['fedora:latest']
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the build chain
+        run: |
+          dnf install -y rpm-build rpmdevtools python3-devel systemd-rpm-macros \
+            git-core tar findutils
+
+      # `git archive` and not `tar`: the tarball has to hold what the tag holds
+      # and nothing else, and a tree that has been built in has `.pytest_cache`
+      # and `__pycache__` in it. `--prefix` is what `%autosetup -n` expects.
+      #
+      # The version comes out of the spec, so the tarball cannot be named for a
+      # version the spec is not building. tests/test_hygiene.py keeps the spec,
+      # pyproject and smbpal/__init__.py agreeing.
+      - name: Build the source tarball and the RPM
+        run: |
+          set -eux
+          git config --global --add safe.directory "$PWD"
+          cat /etc/os-release | head -3
+          version=$(awk '/^Version:/ {print $2; exit}' packaging/rpm/smbpal.spec)
+          rpmdev-setuptree
+          git archive --format=tar.gz --prefix="smbpal-${version}/" \
+            -o ~/rpmbuild/SOURCES/smbpal-${version}.tar.gz HEAD
+          rpmbuild -ba packaging/rpm/smbpal.spec
+          mkdir -p dist
+          cp ~/rpmbuild/RPMS/noarch/*.rpm dist/
+
+      # rpmlint is the RPM world's lintian, and is treated the same way: its
+      # opinions about a package that is not going to Fedora's archive are not
+      # failures. Errors only, and only if it is installable here.
+      - name: rpmlint
+        continue-on-error: true
+        run: |
+          dnf install -y rpmlint
+          rpmlint dist/smbpal-*.rpm
+
+      - name: Install, share, erase
+        run: sh packaging/check-rpm.sh dist/smbpal-*.noarch.rpm
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: rpm
+          path: dist/*.rpm
+          if-no-files-found: error
+
   # Only on a tag. §11.3 needs every release tagged and matching the exact
   # build, because under GPL the obligation attaches to the Corresponding
   # Source for *that* binary rather than to whatever `main` holds. Attaching
