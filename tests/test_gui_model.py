@@ -576,6 +576,25 @@ class TestTheNoTrayNotice(unittest.TestCase):
             with self.subTest(desktop=desktop):
                 self.assertIn("Nothing is missing", self.notice(desktop).text)
 
+    def test_the_log_out_comes_between_installing_and_enabling(self) -> None:
+        """GNOME Shell scans the system extensions directory at startup and
+        not afterwards, so enabling before the log-out fails with *Extension
+        "..." does not exist* for something plainly on disk. Found on Fedora
+        44, 20 September 2026. Nothing needs to follow the enable: the Shell
+        is running by then and the icon appears at once."""
+        for installer in ("apt", "dnf"):
+            with self.subTest(installer=installer):
+                text = self.notice("GNOME", installer).text
+                install = text.index(" install ")
+                log_out = text.index("log out")
+                enable = text.index("gnome-extensions enable")
+                self.assertLess(install, log_out, "install must come first")
+                self.assertLess(log_out, enable, "the log out must come before the enable")
+
+    def test_the_unknown_installer_wording_has_the_same_order(self) -> None:
+        text = self.notice("GNOME", None).text
+        self.assertLess(text.index("log out"), text.index("enable it"))
+
     def test_the_key_is_stable_across_the_wording(self) -> None:
         # What `prefs` writes down. It must not move when the prose does.
         for desktop in ("GNOME", "LXDE"):

@@ -315,6 +315,15 @@ def tray_notice(*, desktop: str, installer: str | None) -> Notice:
     **The last sentence is the important one.** The icon is a convenience; the
     window is the product. Somebody who reads this and does nothing has lost
     nothing, and saying so is what keeps this a notice rather than a warning.
+
+    **The order of the three steps is not arbitrary.** GNOME Shell scans
+    `/usr/share/gnome-shell/extensions/` when it starts and not afterwards, so
+    an extension installed into a running session does not exist as far as the
+    Shell is concerned: `gnome-extensions enable` answers *Extension
+    "..." does not exist* for a directory plainly on disk. Found on Fedora 44
+    on 20 September 2026. Logging out has to come between installing and
+    enabling, and nothing has to follow enabling — the Shell is running by
+    then and the icon appears at once.
     """
     if not is_gnome(desktop):
         return Notice(
@@ -325,14 +334,14 @@ def tray_notice(*, desktop: str, installer: str | None) -> Notice:
     known = _INSTALL.get(installer or "")
     if known is None:
         how = (
-            f"install {EXTENSION}, enable it in the Extensions app, and log "
-            "out and back in"
+            f"install {EXTENSION}, log out and back in, then enable it in the "
+            "Extensions app"
         )
     else:
         install, extension_id = known
         how = (
-            f"{install}, then gnome-extensions enable {extension_id}, then "
-            "log out and back in"
+            f"{install}, then log out and back in, then gnome-extensions "
+            f"enable {extension_id}"
         )
     return Notice(
         NO_TRAY,
