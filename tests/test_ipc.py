@@ -11,6 +11,8 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from typing import Any
+from unittest import mock
 
 from smbpal import PROTOCOL_VERSION
 from smbpal.config import ConfigStore, empty_config
@@ -578,6 +580,71 @@ class TestClientWithoutDaemon(unittest.TestCase):
                 client.connect()
             self.assertIn("no SMBPal daemon", caught.exception.message)
             self.assertIn("systemctl start smbpald", caught.exception.detail or "")
+
+
+class TestWhyTheSocketRefusedUs(unittest.TestCase):
+    """Three situations produce EACCES, and they need three answers.
+
+    The sentence they all used to get — *membership of the smbpal group is
+    required* — described the rarest of them. Somebody who had just run
+    `usermod -aG` and not yet logged out read it as the command having
+    failed, on a Debian 13 desktop on 20 September 2026, which is the same
+    misreading the Pi's directory bug caused on 29 August.
+    """
+
+    def group(self, gid: int = 9999, members: tuple[str, ...] = ()) -> Any:
+        return grp.struct_group(("smbpal", "x", gid, list(members)))
+
+    def answer(
+        self, group: Any, held: tuple[int, ...] = (), user: str = "someone"
+    ) -> str:
+        with mock.patch.object(client_module.grp, "getgrnam", return_value=group), \
+             mock.patch.object(client_module.os, "getgroups", return_value=list(held)), \
+             mock.patch.object(client_module.os, "getgid", return_value=1000), \
+             mock.patch.object(client_module.getpass, "getuser", return_value=user):
+            return client_module.why_refused()
+
+    def test_a_member_whose_session_predates_it_is_told_to_log_out(self) -> None:
+        said = self.answer(self.group(members=("someone",)), held=())
+        self.assertIn("log out", said.lower())
+        self.assertIn("session started before", said)
+        # And it must not tell them to run the command they already ran.
+        self.assertNotIn("usermod", said)
+
+    def test_ssh_is_named_because_logging_out_of_the_desktop_is_not_enough(self) -> None:
+        """The case that wastes the most time: a desktop log-out leaves an
+        existing ssh session with the groups it was created with."""
+        self.assertIn("ssh", self.answer(self.group(members=("someone",)), held=()))
+
+    def test_somebody_who_is_not_a_member_gets_the_command(self) -> None:
+        said = self.answer(self.group(members=("otherperson",)))
+        self.assertIn("sudo usermod -aG smbpal someone", said)
+        self.assertIn("log out", said.lower())
+
+    def test_a_session_that_already_holds_the_group_is_sent_to_the_socket(self) -> None:
+        """The Pi's directory bug. Saying "membership is required" to somebody
+        who has it sends them round a loop they cannot get out of."""
+        said = self.answer(self.group(gid=4242, members=("someone",)), held=(4242,))
+        self.assertIn("already", said)
+        self.assertIn("ls -ld", said)
+
+    def test_a_primary_group_counts_as_holding_it(self) -> None:
+        said = self.answer(self.group(gid=1000, members=()), held=())
+        self.assertIn("already", said)
+
+    def test_no_group_at_all_says_the_install_is_incomplete(self) -> None:
+        with mock.patch.object(client_module.grp, "getgrnam", side_effect=KeyError):
+            said = client_module.why_refused()
+        self.assertIn("no 'smbpal' group", said)
+        self.assertIn("reinstalling", said)
+
+    def test_a_broken_name_service_does_not_replace_the_real_error(self) -> None:
+        """This runs while reporting a failure. It may not raise a new one."""
+        with mock.patch.object(client_module.grp, "getgrnam", side_effect=OSError("nss")):
+            self.assertIsInstance(client_module.why_refused(), str)
+        with mock.patch.object(client_module.grp, "getgrnam", return_value=self.group()), \
+             mock.patch.object(client_module.getpass, "getuser", side_effect=KeyError):
+            self.assertIn("is required", client_module.why_refused())
 
 
 if __name__ == "__main__":

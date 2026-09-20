@@ -7,7 +7,10 @@ between the two halves of a protocol.
 from __future__ import annotations
 
 import errno
+import getpass
+import grp
 import json
+import os
 import socket
 import threading
 from pathlib import Path
@@ -27,6 +30,63 @@ from smbpal.errors import (
 )
 from smbpal.ipc.protocol import MAX_FRAME_BYTES
 from smbpal.ipc.server import DEFAULT_SOCKET_PATH
+
+GROUP = "smbpal"
+
+
+def why_refused(group_name: str = GROUP) -> str:
+    """What to do about `EACCES` on the socket, for this machine, right now.
+
+    **One sentence used to cover three different situations**, and the one it
+    described was the rarest. A person who had just run `usermod -aG` and not
+    yet logged out was told that membership *is required*, which reads as the
+    command having failed — reported from a Debian 13 desktop on 20 September
+    2026. A person who genuinely was not in the group got the same sentence
+    with no command to fix it. And on a Pi on 29 August 2026 the group was
+    right and the socket's *directory* was the problem, which this sentence
+    would also have hidden (`smbpal.ipc.server._apply_directory_ownership`).
+
+    They are distinguishable without guessing. The group file says who is a
+    member; `os.getgroups()` says what this process actually holds, and the
+    two disagreeing is precisely the log-out-and-back-in case, because
+    supplementary groups are fixed when a session is created.
+
+    Nothing here may raise. It runs while reporting an error, and an NSS
+    lookup that fails must not replace the real problem with a new one.
+    """
+    try:
+        group = grp.getgrnam(group_name)
+    except (KeyError, OSError):
+        return (
+            f"There is no '{group_name}' group on this machine. The package "
+            f"creates it, so this looks like a part-installed system: try "
+            f"reinstalling smbpal."
+        )
+    try:
+        held = group.gr_gid in (os.getgid(), *os.getgroups())
+        user = getpass.getuser()
+        member = user in group.gr_mem
+    except (OSError, KeyError):  # pragma: no cover - a broken passwd database
+        return f"Membership of the '{group_name}' group is required."
+    if held:
+        # The group is not the problem, so saying it is would send somebody
+        # to re-run a command that already worked.
+        return (
+            f"This session is in the '{group_name}' group already, so the "
+            f"refusal is about the socket rather than about you. Check what "
+            f"guards it: ls -ld {DEFAULT_SOCKET_PATH.parent} {DEFAULT_SOCKET_PATH}"
+        )
+    if member:
+        return (
+            f"You are in the '{group_name}' group, but this session started "
+            f"before you were added, and a session's groups are fixed when it "
+            f"begins. Log out and back in — over ssh, open a new connection."
+        )
+    return (
+        f"Membership of the '{group_name}' group is required. Add yourself "
+        f"with: sudo usermod -aG {group_name} {user} — then log out and back in."
+    )
+
 
 _ERROR_CLASSES: dict[str, type[SmbpalError]] = {
     cls.code: cls
@@ -103,8 +163,7 @@ class Client:
             if exc.errno == errno.EACCES:
                 raise DaemonUnreachable(
                     f"not allowed to connect to {self.path}",
-                    detail="The socket is group-guarded; membership of the "
-                    "'smbpal' group is required.",
+                    detail=why_refused(),
                 ) from exc
             raise DaemonUnreachable(
                 f"cannot connect to {self.path}", detail=str(exc)
