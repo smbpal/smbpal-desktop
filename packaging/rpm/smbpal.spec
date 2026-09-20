@@ -102,11 +102,30 @@ done
 
 # The Debian build skips its test suite deliberately (`rules`: pulling GTK into
 # the build chroot would make the package build-depend on the toolkit it only
-# recommends). Here the suite runs, because it costs nothing to: the 30 GUI
-# tests skip themselves when python3-gobject is absent, and the other 580 are
-# the daemon, the CLI and the config against this distribution's Python.
+# recommends). Here it runs, with one condition, and the condition is the
+# interesting part.
+#
+# **The suite asserts what a non-root caller is refused.** `handlers.py` gives
+# uid 0 the short-circuit past polkit, and a dozen tests exist to prove that
+# everyone else is stopped; run as root they assert a refusal that correctly
+# never comes, and 13 of them fail. That is the tests being right about the
+# product, not the product being wrong.
+#
+# `mock` builds as an unprivileged user, so on the path Fedora actually uses to
+# build a package this runs the whole suite and means something. `rpmbuild` in
+# a container runs as root, so there it says why it did not. It prints the
+# reason either way rather than passing quietly, because a %%check that silently
+# does nothing is worse than no %%check at all.
 %check
-%{python3} -m unittest discover -s tests -t . -q
+if [ "$(id -u)" -eq 0 ]; then
+    echo "%%check: skipped. The suite asserts what a non-root peer is refused"
+    echo "  and uid 0 takes the short-circuit past polkit, so it must be run"
+    echo "  unprivileged. mock does; this build is root. CI runs the whole"
+    echo "  suite on every commit, and check-rpm.sh imports every entry point"
+    echo "  against the installed package."
+else
+    %{python3} -m unittest discover -s tests -t . -q
+fi
 
 %pre
 # The socket's group guard (D4). The sysusers file below is the modern route
