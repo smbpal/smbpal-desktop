@@ -291,6 +291,44 @@ class TestRollback(ApplyTestCase):
             )
         self.assertEqual(store.load()["shares"], [])
 
+    def test_an_error_nobody_anticipated_rolls_it_back_too(self) -> None:
+        """The case that shipped broken, reported from a Pi on 20 September 2026.
+
+        A connection added with the wrong password failed with "the daemon hit
+        an internal error", and adding it again with the right one left **two**
+        connections, one of which had never worked. The rollback caught
+        `SmbpalError` and nothing else, so an unanticipated failure kept the
+        record that `_commit` had already saved. An apply that fails in a way
+        we did not predict is precisely the one where the config has least
+        business claiming the change was made.
+        """
+        store = ConfigStore(self.root / "config.json")
+        dispatcher = Dispatcher(store, applier=self.applier)
+
+        def explode(_config):
+            raise RuntimeError("something nobody wrote a SmbpalError for")
+
+        self.applier.apply = explode  # type: ignore[method-assign]
+
+        from smbpal.ipc.peer import PeerCredentials
+        from smbpal.ipc.protocol import Request
+
+        with self.assertRaises(RuntimeError):
+            dispatcher._share_add(
+                Request(
+                    id="1",
+                    method="share.add",
+                    params={
+                        "name": "Media",
+                        "path": str(self.root / "srv"),
+                        "credential_ref": _username(),
+                    },
+                ),
+                PeerCredentials(uid=os.getuid(), gid=os.getgid()),
+            )
+        # The record must not survive, or the next attempt adds a second one.
+        self.assertEqual(store.load()["shares"], [])
+
 
 def _username() -> str:
     import getpass
