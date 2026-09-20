@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import os
 import stat
 import tempfile
@@ -9,6 +11,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from smbpal.config import empty_config
 from smbpal.config import operations as ops
@@ -16,6 +19,7 @@ from smbpal.errors import InvalidParams
 from smbpal.mounts import inventory
 from smbpal.mounts import probe as probe_module
 from smbpal.mounts import units
+from smbpal.mounts import apply as apply_module
 from smbpal.mounts.apply import MARKER, OCCUPIED, Mounter, foreign_mount
 from smbpal.mounts.credentials import CredentialsStore
 from tests.fakes import FakeSamba
@@ -372,6 +376,49 @@ class TestMounter(unittest.TestCase):
             **kw,
         )
         return doc
+
+    def test_a_mountpoint_that_will_not_stat_is_not_a_crash(self) -> None:
+        """The Pi's ENODEV, 20 September 2026, from one wrong password.
+
+        An automount that is armed and whose last mount failed answers ENODEV
+        to `stat`, and `Path.is_dir()` swallows only ENOENT, ENOTDIR, EBADF and
+        ELOOP. So correcting the password wrote the credentials, re-applied,
+        and died on the mountpoint with "OSError: [Errno 19] No such device" -
+        crashing on precisely the state the rejected password had created.
+        """
+        config = self.config()
+        with self.stat_fails_on(config, errno.ENODEV, "No such device"):
+            self.mounter.apply(config)
+        # It got past the mountpoint and did the work that fixes it.
+        self.assertEqual(len({p.name for p in self.unit_dir.iterdir()}), 2)
+
+    def test_a_mountpoint_that_is_genuinely_wrong_still_says_so(self) -> None:
+        # Not every stat failure is a busy mount. A path nobody may read is a
+        # real problem, and it has to reach the caller as a sentence rather
+        # than as the dispatcher's "the daemon hit an internal error".
+        config = self.config()
+        with self.stat_fails_on(config, errno.EACCES, "Permission denied"):
+            with self.assertRaises(apply_module.MountError) as caught:
+                self.mounter.apply(config)
+        self.assertIn("cannot inspect", str(caught.exception))
+
+    @contextlib.contextmanager
+    def stat_fails_on(self, config: dict, code: int, message: str):
+        """Fail `is_dir()` for the mountpoint alone, as the kernel would.
+
+        Patching `Path.is_dir` outright breaks the unit writer, which uses it
+        for its own directory — and would prove nothing about the mountpoint.
+        """
+        mountpoint = config["connections"][0]["mountpoint"]
+        real = Path.is_dir
+
+        def fake(self, *args, **kwargs):
+            if str(self) == mountpoint:
+                raise OSError(code, message)
+            return real(self, *args, **kwargs)
+
+        with mock.patch("pathlib.Path.is_dir", new=fake):
+            yield
 
     def test_apply_writes_both_units_and_reloads(self) -> None:
         config = self.config()

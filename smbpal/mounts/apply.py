@@ -11,6 +11,7 @@ share a name is never removed by us.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import pwd
@@ -29,6 +30,26 @@ from smbpal.system import atomic
 from smbpal.system.run import CommandRunner
 
 log = logging.getLogger(__name__)
+
+# Stat errors that mean "a filesystem is mounted here and is not answering",
+# as opposed to "this path is wrong". Built by name because EREMOTEIO is
+# Linux-only and the tests run on macOS too.
+_MOUNTPOINT_BUSY = frozenset(
+    code
+    for code in (
+        getattr(errno, name, None)
+        for name in (
+            "ENODEV",
+            "ENOTCONN",
+            "EHOSTDOWN",
+            "ETIMEDOUT",
+            "ESTALE",
+            "EIO",
+            "EREMOTEIO",
+        )
+    )
+    if code is not None
+)
 
 MARKER = inventory.MARKER
 
@@ -317,7 +338,38 @@ class Mounter:
 
     def _ensure_mountpoint(self, mountpoint: str) -> None:
         path = Path(mountpoint)
-        if path.is_dir():
+        try:
+            present = path.is_dir()
+        except OSError as exc:
+            # **A mountpoint can exist and still refuse to be stat()ed**, and
+            # the state that does it is the one this method meets most: an
+            # automount that is armed and whose last mount failed answers
+            # ENODEV. `Path.is_dir()` swallows only ENOENT, ENOTDIR, EBADF and
+            # ELOOP, so anything else comes back out here.
+            #
+            # Found on a Pi on 20 September 2026, from one wrong password.
+            # Correcting it wrote the credentials, re-applied, and died on
+            # `/media/pi/Code` with "OSError: [Errno 19] No such device" —
+            # crashing on exactly the state the rejected password had created,
+            # which made a typo look like a broken daemon. The monitor had the
+            # right words for it five seconds later.
+            #
+            # Every errno below means *something is mounted here, or trying to
+            # be*. The directory exists by definition, there is nothing to
+            # create and nothing to warn about, and the unit about to be
+            # written is what puts it right. Anything else is a real problem
+            # with the path and becomes a MountError, so it reaches the caller
+            # as a sentence rather than as the catch-all's "internal error".
+            if exc.errno in _MOUNTPOINT_BUSY:
+                log.debug(
+                    "%s is a mountpoint that will not stat (%s); leaving it to "
+                    "the unit",
+                    mountpoint,
+                    exc,
+                )
+                return
+            raise MountError(f"cannot inspect {mountpoint}", detail=str(exc)) from exc
+        if present:
             # Mounting over a directory with content in it hides that content
             # until the unmount, which looks exactly like data loss.
             #
