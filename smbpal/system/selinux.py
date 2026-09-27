@@ -7,10 +7,11 @@ true is not a step a file-sharing tool gets to take on its own.
 
 Found on Fedora, 27 September 2026: a share under `/home` mounted and
 authenticated from a Pi and then refused every write. The directory was
-`drwxr-xr-x luke luke` — nothing wrong in Unix terms — and
-`unconfined_u:object_r:user_home_t:s0` in SELinux terms, and Samba's policy only
-lets `smbd` write `samba_share_t`. Nothing in the failure named SELinux, which
-is the part worth fixing: the user sees a share that works until it doesn't.
+`drwxr-xr-x` and owned by the person sharing it — nothing wrong in Unix terms —
+and `unconfined_u:object_r:user_home_t:s0` in SELinux terms, and Samba's policy
+only lets `smbd` write `samba_share_t`. Nothing in the failure named SELinux,
+which is the part worth fixing: the user sees a share that works until it
+doesn't.
 
 Everything here is stdlib. `/sys/fs/selinux` is a filesystem and a context is an
 extended attribute, so no `libselinux` binding and no `policycoreutils` are
