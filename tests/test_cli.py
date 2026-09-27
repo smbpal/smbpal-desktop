@@ -532,3 +532,49 @@ class TestSambaNotRunningNotes(unittest.TestCase):
             ),
             "",
         )
+
+
+class TestSelinuxNotes(unittest.TestCase):
+    """Fedora, 27 September 2026, §6b of the runbook.
+
+    `/home/luke/Testshare` was `drwxr-xr-x luke luke` and
+    `unconfined_u:object_r:user_home_t:s0`. The share mounted from a Pi,
+    authenticated, and refused every write; nothing in that failure said
+    SELinux. Relabelling it `samba_share_t` fixed it.
+    """
+
+    def note(self, **overrides: str) -> str:
+        from smbpal.cli.main import selinux_notes
+
+        problem = {
+            "path": "/home/luke/Testshare",
+            "type": "user_home_t",
+            "wanted": "samba_share_t",
+            "label": 'sudo semanage fcontext -a -t samba_share_t '
+            '"/home/luke/Testshare(/.*)?"',
+            "restore": "sudo restorecon -Rv /home/luke/Testshare",
+            **overrides,
+        }
+        return "\n".join(selinux_notes([problem]))
+
+    def test_it_names_the_label_the_path_has_and_the_one_it_needs(self) -> None:
+        note = self.note()
+        self.assertIn("user_home_t", note)
+        self.assertIn("samba_share_t", note)
+        self.assertIn("/home/luke/Testshare", note)
+
+    def test_it_describes_the_symptom_somebody_will_actually_see(self) -> None:
+        # The point of the note: connecting works, so nobody looks at the
+        # share's configuration when writes fail.
+        self.assertIn("refuse writes", self.note())
+
+    def test_it_gives_both_commands_and_semanage_before_restorecon(self) -> None:
+        note = self.note()
+        self.assertIn("semanage fcontext", note)
+        self.assertIn("restorecon -Rv", note)
+        self.assertLess(note.index("semanage"), note.index("restorecon"))
+
+    def test_nothing_is_said_when_there_is_nothing_to_say(self) -> None:
+        from smbpal.cli.main import selinux_notes
+
+        self.assertEqual(selinux_notes([]), [])
