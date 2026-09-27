@@ -715,6 +715,15 @@ class Dispatcher:
         # a rejected password, and new credentials are worthless against a unit
         # systemd has stopped starting. Covered by a test so that stays true.
         self._commit(previous, updated)
+        if self.monitor is not None:
+            # Credentials are new information about a connection the monitor
+            # may already have given up on. `connection add --user` prompts for
+            # the password *after* the connection exists, so a poll in between
+            # primes it without credentials, the mount is refused, and priming
+            # stops — correctly, since a refused credential must not be retried.
+            # This is the thing that makes the refusal out of date. Fedora,
+            # 27 September 2026.
+            self.monitor.forget(connection["id"])
         _audit(peer, "connection.set_credentials", connection["id"])
         return {"id": connection["id"], "username": username}
 

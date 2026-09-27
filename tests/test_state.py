@@ -1031,6 +1031,32 @@ class TestAddingAConnectionClearsWhatPrimingRemembers(MonitorTestCase):
     def eject_it(self) -> None:
         self.mountinfo.write_text(self.armed_line(), encoding="utf-8")
 
+    def test_storing_credentials_makes_it_try_the_mount_again(self) -> None:
+        """The race `connection add --user` creates, Fedora 27 September 2026.
+
+        The connection exists before the password does: the CLI prompts after
+        the add, and the monitor polls every five seconds. So it primes a
+        connection with no credentials, the server refuses the mount, and
+        priming stops — correctly, because a refused credential must not be
+        retried. Storing credentials is what makes that refusal out of date.
+        """
+        self.samba.journals[self.unit] = M0_AUTH_FAILURE
+        self.monitor.poll()
+        self.monitor.poll()
+        self.assertEqual(len(self.starts()), 1)
+
+        self.dispatcher()._connection_set_credentials(
+            *self.request(
+                "connection.set_credentials",
+                ref=self.connection["id"],
+                username="pi",
+                password="not the one that was refused",
+            )
+        )
+        self.samba.journals[self.unit] = ""
+        self.monitor.poll()
+        self.assertEqual(len(self.starts()), 2)
+
     def test_it_primes_again_after_a_remove_and_an_add(self) -> None:
         self.monitor.poll()
         # Mounted, so the latch is set for real — without this the connection
