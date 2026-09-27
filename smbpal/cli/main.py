@@ -288,12 +288,40 @@ def _cmd_status(client: Client, args: argparse.Namespace) -> int:
             ),
         ]
         blocks.extend(samba_notes(status.get("samba"), status["shares"]))
+        blocks.extend(selinux_notes(status.get("selinux") or []))
         blocks.extend(share_notes(status["shares"]))
         blocks.extend(connection_notes(status["connections"]))
         blocks.extend(unaccounted_notes(status.get("unaccounted", [])))
         return "\n".join(blocks)
 
     return _emit(args, status, human)
+
+
+def selinux_notes(problems: list[dict[str, Any]]) -> list[str]:
+    """A shared folder SELinux will not let Samba serve, said with the fix.
+
+    Fedora, 27 September 2026. The share mounted from a Pi and authenticated,
+    and then refused every write: `/home/<user>/Testshare` was
+    `drwxr-xr-x` and `user_home_t`, and Samba's policy only lets `smbd` write
+    `samba_share_t`. Nothing in that failure mentions SELinux, and a share that
+    works until it doesn't is worse than one that never worked.
+
+    **SMBPal does not relabel anything.** It says what the policy says and hands
+    over the commands, because rewriting system security policy on somebody's
+    behalf is not a step a file-sharing tool takes by itself.
+    """
+    lines: list[str] = []
+    for problem in problems:
+        lines += [
+            "",
+            f"! SELinux will not let Samba serve {problem['path']}: it is "
+            f"labelled {problem['type']}, and the policy only allows "
+            f"{problem.get('wanted', 'samba_share_t')}.\n"
+            "  The share will mount and authenticate and then refuse writes.\n"
+            f"  {problem['label']}\n"
+            f"  {problem['restore']}",
+        ]
+    return lines
 
 
 def samba_notes(
@@ -598,6 +626,8 @@ def _cmd_share_add(client: Client, args: argparse.Namespace) -> int:
             lines.append(f"  {share['note']}")
         lines.extend(_read_only_notes([share]))
         lines.extend(samba_notes(share.get("samba"), [share]))
+        if share.get("selinux"):
+            lines.extend(selinux_notes([share["selinux"]]))
         return "\n".join(lines)
 
     return _emit(args, share, human)

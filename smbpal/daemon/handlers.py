@@ -31,6 +31,7 @@ from smbpal.mounts.apply import Mounter
 from smbpal.samba import control, passwd
 from smbpal.samba.apply import Applier
 from smbpal.shares import ownership
+from smbpal.system import selinux as selinux_module
 from smbpal.state.monitor import StateMonitor, fallback_hint
 from smbpal.ipc.peer import PeerCredentials
 from smbpal.ipc.protocol import Request, encode_failure, encode_success, parse_request
@@ -348,6 +349,17 @@ class Dispatcher:
             # stopped, and every earlier row hid that by running a distribution
             # whose package starts it (see control.service_state).
             "samba": self._samba_state(),
+            # Per share, because the answer is about a path rather than about
+            # the machine: one share can be serveable and the next not.
+            "selinux": [
+                problem
+                for problem in (
+                    selinux_module.unserveable(s["path"])
+                    for s in config.get("shares", [])
+                    if s.get("path")
+                )
+                if problem is not None
+            ],
             "connections": self._connection_states(config),
             # Reported without being asked for. The case this exists for is one
             # nobody would think to ask about: a connection removed from the
@@ -499,11 +511,14 @@ class Dispatcher:
         report = self._commit(previous, updated)
         _audit(peer, "share.add", share["id"])
         described = self._describe(share, report)
+        # SELinux, asked at the one moment the path is in front of somebody.
+        # None on every machine without it, which is most of them.
+        selinux = selinux_module.unserveable(share["path"])
         # Carried on the response so the CLI and the window can say it at the
         # one moment somebody is watching the share being made. A share that
         # nothing is serving is not an error — Samba may be started next — but
         # it is not the success the caller would otherwise read.
-        return {**described, "samba": self._samba_state()}
+        return {**described, "samba": self._samba_state(), "selinux": selinux}
 
     def _refuse_to_shadow(self, name: str, config: dict[str, Any]) -> None:
         """Do not write a section that shadows one somebody else wrote.
