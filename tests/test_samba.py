@@ -290,3 +290,49 @@ class TestUnmanagedShares(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWhetherSambaIsRunning(unittest.TestCase):
+    """Fedora, 27 September 2026: installed and stopped, and nothing said so.
+
+    `verify_present` reads the effective configuration, which is true whether or
+    not anything is serving it. On Debian the package starts `smbd`, so four
+    rows passed without this question ever being asked.
+    """
+
+    def setUp(self) -> None:
+        self.samba = FakeSamba(Path("/nonexistent/smb.conf"))
+
+    def state(self) -> dict[str, object]:
+        return control.service_state(runner=self.samba)
+
+    def test_fedoras_unit_name_is_found(self) -> None:
+        self.samba.unit_state["smb.service"] = {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+        }
+        self.assertEqual(self.state(), {"unit": "smb.service", "active": True})
+
+    def test_debians_unit_name_is_found(self) -> None:
+        self.samba.unit_state["smbd.service"] = {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+        }
+        self.assertEqual(self.state(), {"unit": "smbd.service", "active": True})
+
+    def test_installed_and_stopped_names_the_unit_to_start(self) -> None:
+        self.samba.unit_state["smb.service"] = {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+        }
+        self.assertEqual(
+            self.state(),
+            {"unit": "smb.service", "active": False, "installed": True},
+        )
+
+    def test_not_installed_is_not_the_same_as_stopped(self) -> None:
+        # Neither unit is loaded: Samba is not here at all, which needs a
+        # different sentence from "start it".
+        self.assertEqual(
+            self.state(), {"unit": None, "active": False, "installed": False}
+        )

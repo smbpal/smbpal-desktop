@@ -147,6 +147,16 @@ if [ $1 -eq 1 ]; then
     echo "    sudo usermod -aG smbpal <user>"
     echo "  They will need to log out and back in for it to take effect."
     echo "  Then start the daemon: sudo systemctl enable --now smbpald"
+    # Samba arrives installed and stopped, because a Fedora package never
+    # starts a service. Without this line a share can be added, verified and
+    # listed as served while nothing is listening on port 445 — which is how a
+    # Fedora run lost an evening on 27 September 2026. Only worth saying if it
+    # is not already running: an upgrade on a serving machine should not be
+    # told to start what is started.
+    if ! systemctl is-active --quiet smb.service 2>/dev/null; then
+        echo "  To serve shares from this machine, Samba has to be running:"
+        echo "    sudo systemctl enable --now smb"
+    fi
 fi
 
 %preun

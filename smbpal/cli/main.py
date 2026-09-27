@@ -287,12 +287,44 @@ def _cmd_status(client: Client, args: argparse.Namespace) -> int:
                 "no connections configured",
             ),
         ]
+        blocks.extend(samba_notes(status.get("samba"), status["shares"]))
         blocks.extend(share_notes(status["shares"]))
         blocks.extend(connection_notes(status["connections"]))
         blocks.extend(unaccounted_notes(status.get("unaccounted", [])))
         return "\n".join(blocks)
 
     return _emit(args, status, human)
+
+
+def samba_notes(
+    samba: dict[str, Any] | None, shares: list[dict[str, Any]]
+) -> list[str]:
+    """Samba stopped, said where it matters: next to the shares it is not serving.
+
+    Fedora, 27 September 2026. A package there never starts its service, so
+    `samba` was installed and stopped: `share add` succeeded, `smbpal status`
+    showed the share served, and nothing on the network could reach it. The
+    share rows are right — the share *is* configured — so the sentence has to
+    come from somewhere else.
+    """
+    if not samba or samba.get("active"):
+        return []
+    if not shares:
+        # Nothing is being served, so nothing is being missed. Mentioning it
+        # here would be noise on every machine that only mounts.
+        return []
+    if not samba.get("installed"):
+        return [
+            "",
+            "! Samba is not installed, so these shares are configured and nothing "
+            "is serving them.",
+        ]
+    unit = samba.get("unit") or "smbd"
+    return [
+        "",
+        f"! Samba is not running, so these shares are configured and nothing is "
+        f"serving them.\n  Start it with: sudo systemctl enable --now {unit}",
+    ]
 
 
 def share_notes(shares: list[dict[str, Any]]) -> list[str]:
@@ -565,6 +597,7 @@ def _cmd_share_add(client: Client, args: argparse.Namespace) -> int:
         if share.get("note"):
             lines.append(f"  {share['note']}")
         lines.extend(_read_only_notes([share]))
+        lines.extend(samba_notes(share.get("samba"), [share]))
         return "\n".join(lines)
 
     return _emit(args, share, human)

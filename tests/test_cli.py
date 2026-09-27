@@ -486,3 +486,49 @@ class TestShareNotes(unittest.TestCase):
 
         self.assertEqual(share_notes([{"name": "Fine", "can_sign_in": True}]), [])
 
+
+
+class TestSambaNotRunningNotes(unittest.TestCase):
+    """Fedora, 27 September 2026.
+
+    A Fedora package never starts its service, so `samba` arrived installed and
+    stopped: the share was added, `smbpal status` showed it served, and the Pi
+    could not reach it. The share rows were not wrong — the share *is*
+    configured — so the sentence has to come from beside them.
+    """
+
+    def notes(self, samba, shares=({"name": "Media"},)):
+        from smbpal.cli.main import samba_notes
+
+        return "\n".join(samba_notes(samba, list(shares)))
+
+    def test_a_stopped_samba_is_named_with_the_command_that_starts_it(self) -> None:
+        note = self.notes({"unit": "smb.service", "active": False, "installed": True})
+        self.assertIn("Samba is not running", note)
+        self.assertIn("sudo systemctl enable --now smb.service", note)
+
+    def test_the_unit_name_is_the_one_this_machine_has(self) -> None:
+        # Debian calls it smbd.service and Fedora smb.service; advice that
+        # names the wrong one is worse than none.
+        note = self.notes({"unit": "smbd.service", "active": False, "installed": True})
+        self.assertIn("smbd.service", note)
+        self.assertNotIn("--now smb.service", note)
+
+    def test_samba_missing_is_a_different_sentence(self) -> None:
+        note = self.notes({"unit": None, "active": False, "installed": False})
+        self.assertIn("not installed", note)
+        self.assertNotIn("systemctl", note)
+
+    def test_a_running_samba_says_nothing(self) -> None:
+        self.assertEqual(
+            self.notes({"unit": "smb.service", "active": True}), ""
+        )
+
+    def test_nothing_is_said_on_a_machine_that_only_mounts(self) -> None:
+        # No shares, so nothing is going unserved and the line would be noise.
+        self.assertEqual(
+            self.notes(
+                {"unit": "smb.service", "active": False, "installed": True}, shares=()
+            ),
+            "",
+        )
