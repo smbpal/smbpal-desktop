@@ -303,7 +303,9 @@ jobs:
     # its tests and drafted a release anyway, because this did not wait for
     # them. The failure was a race in the tests' own server shutdown, but the
     # rule cannot depend on which failures turn out to be harmless.
-    needs: [tests, package, distros]
+    # `rpm` joins them now that the .rpm is published: a tag whose .rpm fails
+    # to build or install must no more become a download than a .deb that does.
+    needs: [tests, package, distros, rpm]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -321,22 +323,46 @@ jobs:
           name: deb
           path: dist
 
+      # One artifact per Fedora the matrix builds, into the same directory:
+      # the release carries every one, and `%{?dist}` keeps their names apart.
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: rpm-*
+          merge-multiple: true
+          path: dist
+
       # The failure this prevents is unfixable after the fact: a file named for
       # one version containing another is already on somebody's disk by the
       # time anyone notices. `tests` checks that the three files in the tree
       # agree; this is the only moment the tag exists to be checked against.
-      - name: The tag and the package must be the same version
+      - name: The tag and the packages must be the same version
         run: |
+          set -eu
+          tagged=${GITHUB_REF_NAME#v}
+          fail() {
+            echo "the tag says $tagged and $1 says $2" >&2
+            echo "fix debian/changelog, packaging/rpm/smbpal.spec," >&2
+            echo "pyproject.toml and smbpal/__init__.py, then move the tag." >&2
+            echo "Do not publish this build." >&2
+            exit 1
+          }
+
           deb=$(ls dist/smbpal_*_all.deb)
           built=$(dpkg-deb --field "$deb" Version)
-          tagged=${GITHUB_REF_NAME#v}
-          echo "tag $GITHUB_REF_NAME -> $tagged, package $built ($(basename "$deb"))"
-          if [ "$built" != "$tagged" ]; then
-            echo "the tag says $tagged and the package says $built" >&2
-            echo "fix debian/changelog, pyproject.toml and smbpal/__init__.py," >&2
-            echo "then move the tag. Do not publish this build." >&2
-            exit 1
-          fi
+          echo "tag $tagged, package $built ($(basename "$deb"))"
+          [ "$built" = "$tagged" ] || fail "$(basename "$deb")" "$built"
+
+          # Read out of each package rather than off its name, for the reason
+          # above. Only %{VERSION} is compared: %{RELEASE} carries the `.fc44`
+          # dist tag, which is what tells two otherwise identical builds apart.
+          command -v rpm >/dev/null 2>&1 || {
+            sudo apt-get update -qq && sudo apt-get install -y -qq rpm
+          }
+          for package in dist/smbpal-*.rpm; do
+            built=$(rpm -qp --queryformat '%{VERSION}' "$package")
+            echo "tag $tagged, package $built ($(basename "$package"))"
+            [ "$built" = "$tagged" ] || fail "$(basename "$package")" "$built"
+          done
 
       # Generated in `dist` so the names inside are bare, which is what lets
       # someone who downloaded both into one directory run `sha256sum -c`
@@ -351,7 +377,7 @@ jobs:
       - name: Checksum
         working-directory: dist
         run: |
-          sha256sum smbpal_*_all.deb > SHA256SUMS
+          sha256sum smbpal_*_all.deb smbpal-*.rpm > SHA256SUMS
           cat SHA256SUMS
 
       # What the checksum above cannot do. A hash published beside the file
@@ -367,7 +393,12 @@ jobs:
       - name: Attest the build
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: dist/smbpal_*_all.deb
+          # Every file the release offers. An unattested .rpm beside an
+          # attested .deb would be worse than attesting neither: it reads as
+          # provenance covering the page rather than the file.
+          subject-path: |
+            dist/smbpal_*_all.deb
+            dist/smbpal-*.rpm
 
       # A draft, so a person publishes it. Tagging is a routine act; putting a
       # binary in front of the public is not, and the two should not be the
@@ -406,6 +437,31 @@ jobs:
           One file for every machine: the package is \`Architecture: all\`, so
           the same download installs on arm64, armhf and amd64.
 
+          ## Install on Fedora
+
+          \`\`\`sh
+          sudo dnf install ./smbpal-${version}-1.fc44.noarch.rpm
+          sudo usermod -aG smbpal \$USER
+          sudo systemctl enable --now smbpald
+          sudo systemctl enable --now smb
+          \`\`\`
+
+          Then log out and back in, for the same reason as above.
+
+          **Two more steps than Debian, and neither is ours to skip.** A Fedora
+          package does not start a service, so the daemon has to be started by
+          hand — and so does Samba itself, which is installed as a dependency
+          and left stopped. A share added before Samba is running is configured
+          correctly and reachable by nobody; SMBPal says so when that is the
+          case, rather than leaving you to find out from another machine.
+
+          There is a build for each Fedora the workflow builds; take the one
+          matching your release. The package is \`noarch\`.
+
+          If you share a folder from your home directory, SELinux will not let
+          Samba serve it: the share will mount and authenticate and then refuse
+          writes. \`smbpal share add\` prints the two commands that fix it.
+
           ## Verify the download
 
           \`\`\`sh
@@ -428,15 +484,18 @@ jobs:
 
           ## Tested on
 
-          By hand: Raspberry Pi OS Trixie, on a Pi 4. Nothing else has been
-          run in anger on a desktop.
+          By hand, on real machines: Raspberry Pi OS Trixie on a Pi 4,
+          Raspberry Pi OS Bookworm 32-bit, Ubuntu 26.04, Debian 12, Debian 13
+          and Fedora 44 — install, the tray, the window, a connection to
+          another machine, a share served to a second machine, and removal.
+          The desktop rows were run in virtual machines.
 
-          Automatically, on every build: installed, used to share a folder,
-          removed and purged on Debian 12, Debian 13, Ubuntu 24.04 and Ubuntu
-          26.04, with \`smb.conf\` compared byte for byte before and after.
-          This release was not published unless all four passed. That proves
-          the package installs and uninstalls cleanly there; it says nothing
-          about the window or the tray on those desktops.
+          Automatically, on every build: the .deb installed, used to share a
+          folder, removed and purged on Debian 12, Debian 13, Ubuntu 24.04 and
+          Ubuntu 26.04, and the .rpm built, installed, used and erased on two
+          Fedora releases, with \`smb.conf\` compared byte for byte before and
+          after in every case. This release was not published unless all of
+          them passed.
 
           ## Source
 
@@ -449,7 +508,7 @@ jobs:
           There is no warranty, to the extent permitted by law.
           NOTES
           gh release create "$GITHUB_REF_NAME" \
-            dist/smbpal_*_all.deb dist/SHA256SUMS \
+            dist/smbpal_*_all.deb dist/smbpal-*.rpm dist/SHA256SUMS \
             --draft \
             --title "SMBPal $version" \
             --notes-file notes.md
