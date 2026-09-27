@@ -30,7 +30,16 @@ it sees it armed and idle:
   that boots before its network and a laptop that comes home. `always` is
   primed at once, and a server that is not there is then reported, which is
   what "always" asked for. `never` is never primed.
-- **Once per connection per daemon run.** After that, an unmounted connection
+- **Once per connection per daemon run, counted from when the mount is seen.**
+  `--no-block` returns before `mount.cifs` has run, so the start being accepted
+  says nothing about whether anything mounted; recording that as a prime made a
+  refused mount indistinguishable from a successful one, and the connection was
+  never retried and never explained (Fedora, 27 September 2026). A start that
+  has not produced a mount is asked about in the journal, and answered by §4's
+  own rule: a refused credential is not retried, because retrying one is how
+  accounts get locked out, while anything temporary is tried again. Three
+  unexplained starts and the monitor stops and says so.
+  After a mount is seen, an unmounted connection
   is one somebody chose to unmount, with the file manager's eject button or
   `umount`, and mounting it straight back would be arguing with them. The
   automount stays armed, so the next access mounts it as it always did.
@@ -60,8 +69,16 @@ from smbpal.system.run import CommandRunner, run
 
 log = logging.getLogger(__name__)
 
+_WAS_MOUNTED = (
+    "it was mounted, so an idle connection now is one somebody disconnected"
+)
+
 JOURNALCTL = "journalctl"
 DEFAULT_INTERVAL = 5.0
+# Starts queued for one connection before the monitor stops and says so. A
+# mount that has not appeared after three is not going to appear because of a
+# fourth.
+_PRIME_ATTEMPTS = 3
 _JOURNAL_LINES = "50"
 
 Broadcast = Callable[[str, dict[str, Any]], None]
@@ -95,6 +112,11 @@ class StateMonitor:
         # Connection id -> the reason it was last not primed, so the reason is
         # logged when it changes rather than on every tick.
         self._declined: dict[str, str] = {}
+        # Connection id -> the target a start was queued for but that has not
+        # been seen mounted yet, with how many starts have been queued for it,
+        # and why the latch was set when it was set.
+        self._attempted: dict[str, tuple[tuple[str, str, str], int]] = {}
+        self._latched_because: dict[str, str] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -126,6 +148,8 @@ class StateMonitor:
         with self._lock:
             self._primed.pop(connection_id, None)
             self._declined.pop(connection_id, None)
+            self._attempted.pop(connection_id, None)
+            self._latched_because.pop(connection_id, None)
 
     def stop(self) -> None:
         self._stop.set()
@@ -230,28 +254,40 @@ class StateMonitor:
         )
 
     def _maybe_prime(self, connection: dict[str, Any], state: ConnectionState) -> None:
-        """Mount an armed, idle connection once, so the file manager shows it."""
+        """Mount an armed, idle connection once, so the file manager shows it.
+
+        The latch is set when the mount is **seen**, not when the start is
+        accepted. `--no-block` means `systemctl start` returns before
+        `mount.cifs` has run, so a start that is queued and then refused used to
+        be recorded exactly like one that worked: the connection never appeared,
+        was never retried, and the monitor said somebody had disconnected it.
+        Found on Fedora, 27 September 2026, against a NAS that refused the
+        credentials — `mount error(13)`.
+        """
         connection_id = connection["id"]
         target = (
             connection.get("host", ""),
             connection.get("share", ""),
             connection["mountpoint"],
         )
+        mount_name, _ = units.unit_names(connection["mountpoint"])
+
+        if state.state == CONNECTED:
+            # Mounted: by the start queued last tick, by an earlier run, or by
+            # somebody opening the path. Whichever it was, there is nothing to
+            # prime and an eject after this is a choice to respect.
+            attempt = self._attempt_for(connection_id)
+            just_primed = attempt is not None and attempt[0] == target
+            self._latch(connection_id, target, _WAS_MOUNTED)
+            if not just_primed:
+                self._declining(connection_id, "it is already mounted")
+            return
         if self._primed_target(connection_id) == target:
             if state.state == IDLE:
-                # The branch that looks most like a bug from outside: set up,
-                # healthy, and deliberately left alone. Say so once.
                 self._declining(
                     connection_id,
-                    "it was primed earlier in this run, so an idle connection "
-                    "now is one somebody disconnected",
+                    self._latched_because.get(connection_id, _WAS_MOUNTED),
                 )
-            return
-        if state.state == CONNECTED:
-            # Already mounted, by us earlier or by somebody opening it. Counts:
-            # an eject after this is a choice to respect.
-            self._remember(connection_id, target)
-            self._declining(connection_id, "it is already mounted")
             return
         if state.state != IDLE:
             # Disabled, failed, occupied by somebody else's filesystem, already
@@ -270,7 +306,33 @@ class StateMonitor:
                 "not on this network",
             )
             return
-        mount_name, _ = units.unit_names(connection["mountpoint"])
+
+        attempt = self._attempt_for(connection_id)
+        queued = attempt[1] if attempt is not None and attempt[0] == target else 0
+        if queued:
+            # A start was queued and the connection is still not mounted. Ask
+            # the journal why, once, and let §4's own rule decide what follows:
+            # a refused credential is not retried, because retrying one is how
+            # accounts get locked out, and anything the kernel called temporary
+            # is tried again on a later tick.
+            cause = self._journal_cause(mount_name)
+            if cause is not None and not cause.retryable:
+                because = f"the mount was refused: {cause.message}"
+                self._latch(connection_id, target, because)
+                self._declining(connection_id, because, warn=True)
+                return
+            if queued >= _PRIME_ATTEMPTS:
+                # Nothing in the journal and still not mounted. Something is
+                # wrong that this code cannot name, and queueing a start every
+                # five seconds for ever is not a diagnosis.
+                because = (
+                    f"{queued} starts were queued for {mount_name} and it never "
+                    "mounted, and the journal does not say why"
+                )
+                self._latch(connection_id, target, because)
+                self._declining(connection_id, because, warn=True)
+                return
+
         try:
             systemd.start(mount_name, block=False, runner=self.runner)
         except SmbpalError as exc:
@@ -278,7 +340,9 @@ class StateMonitor:
                 connection_id, f"starting {mount_name} failed: {exc.message}", warn=True
             )
             return
-        self._remember(connection_id, target)
+        with self._lock:
+            self._attempted[connection_id] = (target, queued + 1)
+            self._declined.pop(connection_id, None)
         log.info(
             "%s: primed %s so it shows in the file manager",
             connection_id,
@@ -291,10 +355,19 @@ class StateMonitor:
         with self._lock:
             return self._primed.get(connection_id)
 
-    def _remember(self, connection_id: str, target: tuple[str, str, str]) -> None:
+    def _latch(
+        self, connection_id: str, target: tuple[str, str, str], because: str
+    ) -> None:
+        """Stop priming this connection, and remember what to say about it."""
         with self._lock:
             self._primed[connection_id] = target
+            self._attempted.pop(connection_id, None)
+            self._latched_because[connection_id] = because
             self._declined.pop(connection_id, None)
+
+    def _attempt_for(self, connection_id: str) -> tuple[tuple[str, str, str], int] | None:
+        with self._lock:
+            return self._attempted.get(connection_id)
 
     def _declining(self, connection_id: str, reason: str, *, warn: bool = False) -> None:
         """Say once why a connection is not being primed.

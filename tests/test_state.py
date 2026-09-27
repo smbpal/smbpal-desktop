@@ -417,9 +417,49 @@ class TestPriming(MonitorTestCase):
 
     def test_it_is_primed_once_not_on_every_poll(self) -> None:
         self.monitor.poll()
+        # The start is queued; the mount lands a moment later, as `--no-block`
+        # means it does on a real machine.
+        self.mount_it()
         self.monitor.poll()
         self.monitor.poll()
         self.assertEqual(len(self.starts()), 1)
+
+    def test_a_start_that_never_mounts_is_tried_again_and_then_given_up_on(
+        self,
+    ) -> None:
+        """Nothing in the journal, and the mount never appears.
+
+        Queueing a start every five seconds for ever is not a diagnosis, so the
+        monitor stops after three and says exactly that.
+        """
+        with self.assertLogs("smbpal.state.monitor", level="INFO") as logs:
+            for _ in range(6):
+                self.monitor.poll()
+        self.assertEqual(len(self.starts()), 3)
+        self.assertTrue(
+            any("never mounted" in line for line in logs.output), logs.output
+        )
+
+    def test_a_refused_mount_is_not_tried_again(self) -> None:
+        """Fedora, 27 September 2026: `mount error(13): Permission denied`.
+
+        The start is accepted because `--no-block` accepts everything; the mount
+        is then refused. Retrying a rejected credential is how accounts get
+        locked out (§4), so the monitor stops — but it says why, where it used
+        to record the queued start as a prime and blame a disconnect.
+        """
+        self.samba.journals[self.unit] = M0_AUTH_FAILURE
+        with self.assertLogs("smbpal.state.monitor", level="INFO") as logs:
+            self.monitor.poll()
+            self.monitor.poll()
+            self.monitor.poll()
+        self.assertEqual(len(self.starts()), 1)
+        refused = [line for line in logs.output if "refused" in line]
+        self.assertEqual(len(refused), 1, logs.output)
+        self.assertIn("the username or password was refused", refused[0])
+        self.assertNotIn(
+            "somebody disconnected", "".join(logs.output)
+        )
 
     def test_on_this_network_waits_for_the_server_and_then_primes(self) -> None:
         """A Pi that boots before its network, or a laptop that comes home."""
@@ -442,13 +482,17 @@ class TestPriming(MonitorTestCase):
         the daemon. The daemon says `forget` when it adds or removes one.
         """
         self.monitor.poll()
+        self.mount_it()
+        self.monitor.poll()
         self.assertEqual(len(self.starts()), 1)
+        self.eject_it()
         self.monitor.forget(self.connection["id"])
         self.monitor.poll()
         self.assertEqual(len(self.starts()), 2)
 
     def test_forgetting_one_connection_does_not_forget_another(self) -> None:
         self.monitor.poll()
+        self.mount_it()
         self.monitor.forget("some-other-connection")
         self.monitor.poll()
         self.assertEqual(len(self.starts()), 1)
@@ -970,7 +1014,57 @@ class TestAddingAConnectionClearsWhatPrimingRemembers(MonitorTestCase):
             PeerCredentials(uid=0, gid=0),
         )
 
+    def armed_line(self) -> str:
+        return (
+            "36 25 0:31 / %s rw,relatime shared:22 - autofs systemd-1 "
+            "rw,fd=39,pgrp=1,timeout=0,direct\n" % self.mountpoint
+        )
+
+    def mount_it(self) -> None:
+        self.mountinfo.write_text(
+            self.armed_line()
+            + "37 25 0:32 / %s rw,relatime shared:23 - cifs //nas.local/Media "
+            "rw,vers=3.1.1\n" % self.mountpoint,
+            encoding="utf-8",
+        )
+
+    def eject_it(self) -> None:
+        self.mountinfo.write_text(self.armed_line(), encoding="utf-8")
+
+    def test_storing_credentials_makes_it_try_the_mount_again(self) -> None:
+        """The race `connection add --user` creates, Fedora 27 September 2026.
+
+        The connection exists before the password does: the CLI prompts after
+        the add, and the monitor polls every five seconds. So it primes a
+        connection with no credentials, the server refuses the mount, and
+        priming stops — correctly, because a refused credential must not be
+        retried. Storing credentials is what makes that refusal out of date.
+        """
+        self.samba.journals[self.unit] = M0_AUTH_FAILURE
+        self.monitor.poll()
+        self.monitor.poll()
+        self.assertEqual(len(self.starts()), 1)
+
+        self.dispatcher()._connection_set_credentials(
+            *self.request(
+                "connection.set_credentials",
+                ref=self.connection["id"],
+                username="pi",
+                password="not the one that was refused",
+            )
+        )
+        self.samba.journals[self.unit] = ""
+        self.monitor.poll()
+        self.assertEqual(len(self.starts()), 2)
+
     def test_it_primes_again_after_a_remove_and_an_add(self) -> None:
+        self.monitor.poll()
+        # Mounted, so the latch is set for real — without this the connection
+        # is only mid-attempt and would be retried anyway, which would make
+        # this test pass with or without `forget`.
+        self.mount_it()
+        self.monitor.poll()
+        self.eject_it()
         self.monitor.poll()
         self.assertEqual(len(self.starts()), 1)
 
