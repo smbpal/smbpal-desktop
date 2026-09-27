@@ -20,6 +20,8 @@ needed to *ask* — only to act, which is the user's half.
 from __future__ import annotations
 
 import os
+import re
+import shlex
 from pathlib import Path
 
 SELINUX_ROOT = Path("/sys/fs/selinux")
@@ -92,10 +94,20 @@ def unserveable(path: str, *, root: Path = SELINUX_ROOT) -> dict[str, str] | Non
         # The boolean that exists for exactly this directory. On, and the
         # policy already allows it.
         return None
+    # **The commands are built, not written.** `semanage fcontext` takes a
+    # regular expression and `restorecon` takes a path, and a share path is
+    # neither of those things until it is made into them: `/srv/media (old)`
+    # would break the shell, and `/srv/c++` would be a pattern matching
+    # something else entirely. Escaped for the regex first, quoted for the
+    # shell second, and in that order — quoting an unescaped pattern would give
+    # a command that runs and does the wrong thing, which is worse than one
+    # that fails.
+    pattern = re.escape(path) + "(/.*)?"
     return {
         "path": path,
         "type": kind,
         "wanted": "samba_share_t",
-        "label": f'sudo semanage fcontext -a -t samba_share_t "{path}(/.*)?"',
-        "restore": f"sudo restorecon -Rv {path}",
+        "label": "sudo semanage fcontext -a -t samba_share_t "
+        + shlex.quote(pattern),
+        "restore": "sudo restorecon -Rv " + shlex.quote(path),
     }

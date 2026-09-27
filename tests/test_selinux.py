@@ -82,7 +82,7 @@ class TestTheFedoraCase(SelinuxTestCase):
         assert problem is not None
         self.assertEqual(problem["type"], "user_home_t")
         self.assertEqual(problem["wanted"], "samba_share_t")
-        self.assertIn('-t samba_share_t "/home/luke/Testshare(/.*)?"', problem["label"])
+        self.assertIn("-t samba_share_t '/home/luke/Testshare(/.*)?'", problem["label"])
         self.assertIn("restorecon -Rv /home/luke/Testshare", problem["restore"])
 
     def test_home_dirs_off_still_reports_it(self) -> None:
@@ -93,6 +93,41 @@ class TestTheFedoraCase(SelinuxTestCase):
         # /srv and /opt are the other places people share from, and neither is
         # labelled for Samba by default.
         self.assertIsNotNone(self.unserveable("var_t", path="/srv/media"))
+
+
+class TestPathsThatAreNotPlainWords(SelinuxTestCase):
+    """The commands are built from a path somebody chose, not from a fixture.
+
+    `semanage fcontext` takes a regular expression and `restorecon` takes a
+    shell argument, and an ordinary folder name can be neither.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.enforce("1")
+
+    def test_a_space_does_not_break_the_shell(self) -> None:
+        problem = self.unserveable("user_home_t", path="/srv/media (old)")
+        assert problem is not None
+        self.assertEqual(
+            problem["restore"], "sudo restorecon -Rv '/srv/media (old)'"
+        )
+
+    def test_regex_characters_are_escaped_not_just_quoted(self) -> None:
+        # A quoted but unescaped pattern gives a command that runs and labels
+        # something else, which is worse than one that fails.
+        problem = self.unserveable("user_home_t", path="/srv/c++ backups")
+        assert problem is not None
+        self.assertIn(r"c\+\+", problem["label"])
+        self.assertTrue(problem["label"].endswith("(/.*)?'"), problem["label"])
+
+    def test_a_plain_path_is_left_readable(self) -> None:
+        # Escaping must not make the ordinary case ugly: this is a line
+        # somebody reads and types.
+        problem = self.unserveable("user_home_t", path="/srv/media")
+        assert problem is not None
+        self.assertIn("'/srv/media(/.*)?'", problem["label"])
+        self.assertEqual(problem["restore"], "sudo restorecon -Rv /srv/media")
 
 
 if __name__ == "__main__":
