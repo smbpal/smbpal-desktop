@@ -654,6 +654,11 @@ class Dispatcher:
             ),
         )
         self._commit(previous, updated)
+        if self.monitor is not None:
+            # An id is derived from host and share, so this one may be the id of
+            # a connection that was removed a moment ago and primed before that.
+            # See StateMonitor.forget.
+            self.monitor.forget(connection["id"])
         _audit(peer, "connection.add", connection["id"])
         return connection
 
@@ -666,6 +671,8 @@ class Dispatcher:
         self._commit(previous, updated)
         if self.mounter is not None and connection.get("credential_ref"):
             self.mounter.forget_credentials(connection["credential_ref"])
+        if self.monitor is not None:
+            self.monitor.forget(connection["id"])
         _audit(peer, "connection.remove", connection["id"])
         return connection
 

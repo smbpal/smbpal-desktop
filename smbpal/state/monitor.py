@@ -34,7 +34,13 @@ it sees it armed and idle:
   is one somebody chose to unmount, with the file manager's eject button or
   `umount`, and mounting it straight back would be arguing with them. The
   automount stays armed, so the next access mounts it as it always did.
-  Changing where a connection points counts as a new connection.
+  Changing where a connection points counts as a new connection, and so does
+  removing one and adding it back — see `forget`.
+- **A decision not to prime is logged**, once, with the reason, and again when
+  the reason changes. Every branch below used to return in silence, which reads
+  from outside as the monitor never having run: two OS runs were spent
+  reconstructing which branch had been taken, on Debian 13 on 20 September 2026
+  and on Fedora on 27 September 2026. One INFO line ends that.
 """
 
 from __future__ import annotations
@@ -86,6 +92,9 @@ class StateMonitor:
         # Connection id -> what it pointed at when it was primed, or was first
         # seen already mounted. See the module docstring for why this is once.
         self._primed: dict[str, tuple[str, str, str]] = {}
+        # Connection id -> the reason it was last not primed, so the reason is
+        # logged when it changes rather than on every tick.
+        self._declined: dict[str, str] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -100,6 +109,23 @@ class StateMonitor:
         )
         self._thread.start()
         log.info("watching connection state every %gs", self.interval)
+
+    def forget(self, connection_id: str) -> None:
+        """Drop what priming remembers about a connection.
+
+        The daemon calls this when a connection is added or removed, and that is
+        not the same as noticing it left. Ids are derived from host and share,
+        and the default mountpoint from those, so removing a connection and
+        adding it straight back yields an identical id and an identical target.
+        Within one poll interval the monitor never sees it go: `gone` stays
+        empty, the latch in `_maybe_prime` still matches, and the connection is
+        never primed for the life of the daemon — idle in the file manager, with
+        nothing in the journal to say why. Found on Fedora, 27 September 2026,
+        after an evening of removing and re-adding the same share.
+        """
+        with self._lock:
+            self._primed.pop(connection_id, None)
+            self._declined.pop(connection_id, None)
 
     def stop(self) -> None:
         self._stop.set()
@@ -152,6 +178,9 @@ class StateMonitor:
         for previous, state in changes:
             self._emit(previous, state, connection_lookup(config, state.id))
         for connection_id in sorted(gone):
+            # Belt and braces with `forget`: this catches a config edited by
+            # hand or by anything that does not go through the handlers.
+            self.forget(connection_id)
             self._push("connection.removed", {"id": connection_id})
         return list(current.values())
 
@@ -202,38 +231,86 @@ class StateMonitor:
 
     def _maybe_prime(self, connection: dict[str, Any], state: ConnectionState) -> None:
         """Mount an armed, idle connection once, so the file manager shows it."""
+        connection_id = connection["id"]
         target = (
             connection.get("host", ""),
             connection.get("share", ""),
             connection["mountpoint"],
         )
-        if self._primed.get(connection["id"]) == target:
+        if self._primed_target(connection_id) == target:
+            if state.state == IDLE:
+                # The branch that looks most like a bug from outside: set up,
+                # healthy, and deliberately left alone. Say so once.
+                self._declining(
+                    connection_id,
+                    "it was primed earlier in this run, so an idle connection "
+                    "now is one somebody disconnected",
+                )
             return
         if state.state == CONNECTED:
             # Already mounted, by us earlier or by somebody opening it. Counts:
             # an eject after this is a choice to respect.
-            self._primed[connection["id"]] = target
+            self._remember(connection_id, target)
+            self._declining(connection_id, "it is already mounted")
             return
         if state.state != IDLE:
             # Disabled, failed, occupied by somebody else's filesystem, already
             # mounting: none of these is "armed and waiting".
+            self._declining(connection_id, f"its state is {state.state}")
             return
         auto = connection.get("auto_connect") or "on_this_network"
         if auto == "never":
+            self._declining(connection_id, "auto_connect is never")
             return
-        if auto == "on_this_network" and not self.reachable(connection.get("host", "")):
+        host = connection.get("host", "")
+        if auto == "on_this_network" and not self.reachable(host):
+            self._declining(
+                connection_id,
+                f"nothing answers on port 445 at {host or '(no host)'}, so it is "
+                "not on this network",
+            )
             return
         mount_name, _ = units.unit_names(connection["mountpoint"])
         try:
             systemd.start(mount_name, block=False, runner=self.runner)
         except SmbpalError as exc:
-            log.warning("could not prime %s: %s", connection["id"], exc.message)
+            self._declining(
+                connection_id, f"starting {mount_name} failed: {exc.message}", warn=True
+            )
             return
-        self._primed[connection["id"]] = target
+        self._remember(connection_id, target)
         log.info(
             "%s: primed %s so it shows in the file manager",
-            connection["id"],
+            connection_id,
             mount_name,
+        )
+
+    # --- what priming remembers -------------------------------------------
+
+    def _primed_target(self, connection_id: str) -> tuple[str, str, str] | None:
+        with self._lock:
+            return self._primed.get(connection_id)
+
+    def _remember(self, connection_id: str, target: tuple[str, str, str]) -> None:
+        with self._lock:
+            self._primed[connection_id] = target
+            self._declined.pop(connection_id, None)
+
+    def _declining(self, connection_id: str, reason: str, *, warn: bool = False) -> None:
+        """Say once why a connection is not being primed.
+
+        Once, not every tick: at five seconds a repeated line would bury the
+        journal, and the reason does not change while the situation does not.
+        """
+        with self._lock:
+            if self._declined.get(connection_id) == reason:
+                return
+            self._declined[connection_id] = reason
+        log.log(
+            logging.WARNING if warn else logging.INFO,
+            "not priming %s: %s",
+            connection_id,
+            reason,
         )
 
     def _journal_cause(self, unit_name: str) -> Cause | None:

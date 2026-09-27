@@ -26,6 +26,7 @@ from smbpal.cli.agent import TtyAgent
 from smbpal.cli.format import render_json, render_table
 from smbpal.discovery import identity
 from smbpal.errors import DaemonUnreachable, NotFound, SmbpalError
+from smbpal.mounts.probe import server_reachable
 from smbpal.ipc.client import Client
 from smbpal.ipc.server import DEFAULT_SOCKET_PATH
 from smbpal.samba.passwd import posix_user_exists
@@ -626,7 +627,20 @@ def _cmd_connection_add(client: Client, args: argparse.Namespace) -> int:
         lines.append(f"  credentials stored for {args.user}")
     else:
         lines.append("  no credentials: it will mount as a guest")
-    lines.append("  it will mount on first access")
+    if server_reachable(connection["host"]):
+        lines.append("  it will mount on first access")
+    else:
+        # Asked here because this is where somebody is still watching. A name
+        # nothing answers for is saved happily and then declined by the monitor
+        # every five seconds, which is what a Fedora run spent an evening on, on
+        # 27 September 2026: `rivendell.local` had stopped being the NAS's
+        # hostname and nothing said so. Advisory, never a refusal — configuring
+        # a server that is switched off is an ordinary thing to do.
+        lines.append(
+            f"  nothing answers on port 445 at {connection['host']} right now, so it "
+            "will not appear in the file manager yet"
+        )
+        lines.append("  it will mount when something does")
     return _emit(args, connection, lambda: "\n".join(lines))
 
 

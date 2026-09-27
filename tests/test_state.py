@@ -432,6 +432,60 @@ class TestPriming(MonitorTestCase):
         self.monitor.poll()
         self.assertEqual(len(self.starts()), 1)
 
+    def test_a_connection_removed_and_added_again_is_primed_again(self) -> None:
+        """Fedora, 27 September 2026.
+
+        Ids come from host and share and the default mountpoint from those, so a
+        remove and a re-add produce the same id and the same target. Inside one
+        poll interval the monitor never sees the connection leave, so the latch
+        still matched and the share sat idle in the file manager for the life of
+        the daemon. The daemon says `forget` when it adds or removes one.
+        """
+        self.monitor.poll()
+        self.assertEqual(len(self.starts()), 1)
+        self.monitor.forget(self.connection["id"])
+        self.monitor.poll()
+        self.assertEqual(len(self.starts()), 2)
+
+    def test_forgetting_one_connection_does_not_forget_another(self) -> None:
+        self.monitor.poll()
+        self.monitor.forget("some-other-connection")
+        self.monitor.poll()
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_a_declined_prime_says_why_once(self) -> None:
+        self.up = False
+        with self.assertLogs("smbpal.state.monitor", level="INFO") as logs:
+            self.monitor.poll()
+            self.monitor.poll()
+            self.monitor.poll()
+        said = [line for line in logs.output if "not priming" in line]
+        self.assertEqual(len(said), 1, said)
+        self.assertIn("nothing answers on port 445 at nas.local", said[0])
+
+    def test_the_reason_is_said_again_when_it_changes(self) -> None:
+        self.up = False
+        with self.assertLogs("smbpal.state.monitor", level="INFO") as logs:
+            self.monitor.poll()
+            self.set_connection(auto_connect="never")
+            self.monitor.poll()
+        said = [line for line in logs.output if "not priming" in line]
+        self.assertEqual(len(said), 2, said)
+        # `disabled` rather than "auto_connect is never": `derive` turns
+        # `never` into that state, so the earlier gate answers first and the
+        # `auto == never` branch of `_maybe_prime` is defensive only.
+        self.assertIn("its state is disabled", said[1])
+
+    def test_a_connection_that_was_already_mounted_says_so(self) -> None:
+        """The branch that used to be silent, and cost two runs an evening."""
+        self.mount_it()
+        with self.assertLogs("smbpal.state.monitor", level="INFO") as logs:
+            self.monitor.poll()
+        self.assertEqual(self.starts(), [])
+        self.assertTrue(
+            any("already mounted" in line for line in logs.output), logs.output
+        )
+
     def test_always_does_not_wait_for_the_server(self) -> None:
         self.set_connection(auto_connect="always")
         self.up = False
@@ -856,3 +910,83 @@ class TestTheMonitorAsksTheKernel(MonitorTestCase):
         pushed = [data for event, data in self.events if event == "state.changed"]
         self.assertEqual(pushed[0]["state"], machine.UNREACHABLE)
         self.assertTrue(pushed[0]["is_problem"])
+
+
+class TestAddingAConnectionClearsWhatPrimingRemembers(MonitorTestCase):
+    """The handler side of the Fedora finding of 27 September 2026.
+
+    Removing a connection and adding it back gives the same id and the same
+    target, so the latch in `_maybe_prime` matched and the share was never
+    primed again. The monitor cannot notice it left, either: inside one poll
+    interval it never disappears from the config. So the handlers say so.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        from smbpal.mounts import units
+
+        # Under the temporary root: a commit applies, and applying creates the
+        # mountpoint, which /mnt/nas is not ours to do on a test machine.
+        self.mountpoint = str(self.root / "mnt" / "nas")
+        doc, self.connection = ops.add_connection(
+            empty_config(),
+            host="nas.local",
+            share="Media",
+            mountpoint=self.mountpoint,
+        )
+        self.store.save(doc)
+        self.unit, _ = units.unit_names(self.mountpoint)
+        self.mountinfo.write_text(
+            "36 25 0:31 / %s rw,relatime shared:22 - autofs systemd-1 "
+            "rw,fd=39,pgrp=1,timeout=0,direct\n" % self.mountpoint,
+            encoding="utf-8",
+        )
+        self.monitor = StateMonitor(
+            self.store,
+            self.mounter,
+            runner=self.samba,
+            prime=True,
+            reachable=lambda host: True,
+        )
+
+    def starts(self) -> list[tuple[str, ...]]:
+        return [
+            c
+            for c in self.samba.calls
+            if c[:2] == ("systemctl", "start") and self.unit in c
+        ]
+
+    def dispatcher(self):
+        from smbpal.daemon.handlers import Dispatcher
+
+        return Dispatcher(self.store, mounter=self.mounter, monitor=self.monitor)
+
+    def request(self, method: str, **params):
+        from smbpal.ipc.peer import PeerCredentials
+        from smbpal.ipc.protocol import Request
+
+        return (
+            Request(id="1", method=method, params=params),
+            PeerCredentials(uid=0, gid=0),
+        )
+
+    def test_it_primes_again_after_a_remove_and_an_add(self) -> None:
+        self.monitor.poll()
+        self.assertEqual(len(self.starts()), 1)
+
+        dispatcher = self.dispatcher()
+        dispatcher._connection_remove(
+            *self.request("connection.remove", ref=self.connection["id"])
+        )
+        dispatcher._connection_add(
+            *self.request(
+                "connection.add",
+                host="nas.local",
+                share="Media",
+                mountpoint=self.mountpoint,
+            )
+        )
+        # No poll in between: the config never showed the connection missing,
+        # which is exactly the case `gone` cannot catch.
+        self.monitor.poll()
+        self.assertEqual(len(self.starts()), 2)
