@@ -12,6 +12,7 @@ import io
 import tempfile
 import threading
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from smbpal.cli.main import (
@@ -58,6 +59,16 @@ class CliTestCase(unittest.TestCase):
         )
         self.thread.start()
         self.addCleanup(self._stop)
+        # `connection add` asks whether anything answers on 445 before it says
+        # the connection will mount. No test opens a socket to find out: the
+        # ones about that note say what the answer is, and every other one
+        # wants a plain yes.
+        self.reachable = True
+        patch = unittest.mock.patch(
+            "smbpal.cli.main.server_reachable", lambda host: self.reachable
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def _stop(self) -> None:
         self.transport.shutdown()
@@ -213,6 +224,28 @@ class TestConnections(CliTestCase):
         self.assertEqual(
             self.store.load()["connections"][0]["mountpoint"], "/srv/backups"
         )
+
+    def test_it_says_the_share_will_mount_when_the_server_answers(self) -> None:
+        _, out, _ = self.run_cli("connection", "add", "nas.local", "Media", "/mnt/nas")
+        self.assertIn("it will mount on first access", out)
+
+    def test_it_says_so_when_nothing_answers_at_that_name(self) -> None:
+        """Fedora, 27 September 2026.
+
+        `rivendell.local` had stopped being the NAS's hostname. The connection
+        was saved, the monitor declined to prime it every five seconds because
+        nothing answered there, and nothing anywhere said so. It is still saved
+        — a server that is switched off is an ordinary thing to configure — but
+        the person who typed the name is told while they are still looking.
+        """
+        self.reachable = False
+        code, out, _ = self.run_cli(
+            "connection", "add", "gone.local", "Media", "/mnt/nas"
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("nothing answers on port 445 at gone.local", out)
+        self.assertIn("it will mount when something does", out)
+        self.assertEqual(len(self.store.load()["connections"]), 1)
 
     def test_auto_connect_defaults_to_on_this_network(self) -> None:
         self.run_cli("connection", "add", "h", "S", "/mnt/x")
