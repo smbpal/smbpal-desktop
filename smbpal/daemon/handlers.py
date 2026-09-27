@@ -343,12 +343,27 @@ class Dispatcher:
             # lease or an Avahi rename can change the answer at any time.
             "host": self.identity().to_wire(),
             "shares": self._share_states(config),
+            # Whether anything is actually serving those shares. A share can be
+            # in Samba's effective configuration on a machine where Samba is
+            # stopped, and every earlier row hid that by running a distribution
+            # whose package starts it (see control.service_state).
+            "samba": self._samba_state(),
             "connections": self._connection_states(config),
             # Reported without being asked for. The case this exists for is one
             # nobody would think to ask about: a connection removed from the
             # config whose automount is still enabled and still mounting.
             "unaccounted": self._unaccounted(config),
         }
+
+    def _samba_state(self) -> dict[str, object]:
+        if self.applier is None:
+            return {"unit": None, "active": False, "installed": False}
+        try:
+            return control.service_state(runner=self.applier.runner)
+        except SmbpalError:
+            # Asking failed, which is not the same as stopped. Saying nothing is
+            # better than saying something untrue about somebody's server.
+            return {"unit": None, "active": True, "installed": True}
 
     def _smb_accounts(self) -> set[str] | None:
         """Who has an SMB password here, or None when Samba cannot be asked.
@@ -483,7 +498,12 @@ class Dispatcher:
         )
         report = self._commit(previous, updated)
         _audit(peer, "share.add", share["id"])
-        return self._describe(share, report)
+        described = self._describe(share, report)
+        # Carried on the response so the CLI and the window can say it at the
+        # one moment somebody is watching the share being made. A share that
+        # nothing is serving is not an error — Samba may be started next — but
+        # it is not the success the caller would otherwise read.
+        return {**described, "samba": self._samba_state()}
 
     def _refuse_to_shadow(self, name: str, config: dict[str, Any]) -> None:
         """Do not write a section that shadows one somebody else wrote.

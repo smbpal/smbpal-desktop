@@ -20,6 +20,9 @@ from typing import Iterable
 
 from smbpal.config.schema import RESERVED_SHARE_NAMES
 from smbpal.errors import SmbpalError
+# `mounts.systemd` by name only: it is a thin `systemctl` wrapper rather than
+# anything about mounting, and asking systemd twice in two ways would be worse.
+from smbpal.mounts import systemd
 from smbpal.system.run import CommandRunner, run
 
 log = logging.getLogger(__name__)
@@ -97,6 +100,42 @@ def unmanaged_shares(
         for name, path in effective_shares(runner=runner).items()
         if name.lower() not in mine and name.lower() not in RESERVED_SHARE_NAMES
     }
+
+
+# `smbd.service` on Debian and Ubuntu, `smb.service` on Fedora and its family.
+# Both are asked rather than one being derived from the distribution, because a
+# wrong guess would report Samba as stopped on a machine happily serving.
+SERVICE_UNITS = ("smbd.service", "smb.service")
+
+
+def service_state(*, runner: CommandRunner | None = None) -> dict[str, object]:
+    """Whether Samba itself is running, and the unit name it runs under.
+
+    **Not a detail SMBPal can leave out.** `verify_present` below reads the
+    *effective configuration*, which is true whether or not anything is serving
+    it, so a share could be reported as served on a machine where nothing is
+    listening on port 445. Fedora found that on 27 September 2026: packages
+    there never start a service, so `samba` arrives installed and stopped, a
+    share was added and verified, and the Pi could not reach it. Debian's
+    package starts `smbd` on install, which is why four rows passed first.
+
+    `systemd` rather than a pid file or a process name: the unit is what a person
+    would start, and its name is what the answer has to include for the advice
+    to be typeable.
+    """
+    execute = runner or run
+    loaded: str | None = None
+    for unit in SERVICE_UNITS:
+        properties = systemd.show(unit, "LoadState", "ActiveState", runner=execute)
+        if properties.get("LoadState") != "loaded":
+            continue
+        if loaded is None:
+            loaded = unit
+        if properties.get("ActiveState") == "active":
+            return {"unit": unit, "active": True}
+    # No unit at all means Samba is not installed here, which is a different
+    # sentence from "installed and stopped" and must not be given the same one.
+    return {"unit": loaded, "active": False, "installed": loaded is not None}
 
 
 def reload_config(*, runner: CommandRunner | None = None) -> None:
