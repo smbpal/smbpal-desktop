@@ -10,7 +10,7 @@
 # no second removal step.
 
 Name:           smbpal
-Version:        0.2.3
+Version:        0.2.4
 Release:        1%{?dist}
 Summary:        Share folders over SMB, and connect to shares on other machines
 
@@ -251,6 +251,18 @@ fi
 %{_datadir}/icons/hicolor/scalable/status/smbpal-attention.svg
 
 %changelog
+* Sun Sep 27 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.4-1
+- Says when Samba is not running, which on Fedora it is not until somebody
+  starts it: a share was reported as served and reachable by nobody.
+- Says when SELinux will not let Samba serve a folder, with the commands
+  that fix it, rather than leaving a share that mounts and then refuses
+  writes.
+- Explains the missing tray icon on GNOME, once and dismissably.
+- Two fixes to priming, so a connection that is removed and added again
+  shows up in the file manager, and a mount the server refused is reported
+  rather than recorded as done.
+- Says which of three things made the socket refuse a connection.
+
 * Sun Sep 20 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.3-1
 - Fixes for a connection whose password was refused: the corrected
   password now applies, the connection is not added twice, and a change

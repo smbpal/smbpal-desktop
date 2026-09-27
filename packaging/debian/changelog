@@ -1,3 +1,37 @@
+smbpal (0.2.4) trixie; urgency=medium
+
+  * The window says why there is no tray icon. On GNOME nothing shows tray
+    icons without an extension, so SMBPal simply had none and said nothing
+    about it. The window now explains that once, with the command for your
+    system and the log out that has to come between installing the
+    extension and enabling it, and it can be dismissed for good. Nothing is
+    missing without a tray icon: the window is the whole of SMBPal.
+  * A share you add is reported as served only if something is serving it.
+    On Fedora and its family a package never starts a service, so Samba
+    arrives installed and stopped: a share was configured correctly,
+    reported as served, and reachable by nobody. SMBPal now says when Samba
+    is not running, and gives the command that starts it.
+  * A folder shared from your home directory on a system with SELinux is
+    flagged before you find out the hard way. The share mounts and
+    authenticates and then refuses every write, which looks like a broken
+    server rather than a security policy. SMBPal now says what the policy
+    says and gives the two commands that fix it. It does not change the
+    policy itself.
+  * A connection you remove and add again appears in the file manager
+    again. It was being remembered as already done, so it stayed configured
+    but invisible until the daemon was restarted.
+  * A connection whose mount is refused no longer looks like one you
+    disconnected. SMBPal recorded a mount as made as soon as it asked for
+    it, so a mount the server refused was indistinguishable from one that
+    worked, and it was never tried again. It now waits to see the mount,
+    reports a refusal with the reason, and tries again as soon as you store
+    the credentials that would fix it.
+  * "membership of the 'smbpal' group is required" now says which of three
+    things is wrong: SMBPal is not fully installed, you are not in the
+    group, or you are but this session began before you were added.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Sun, 27 Sep 2026 23:30:35 +0100
+
 smbpal (0.2.3) trixie; urgency=medium
 
   * Connecting to a share with the wrong password no longer breaks the
