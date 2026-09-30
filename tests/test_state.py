@@ -83,6 +83,23 @@ class TestTranslate(unittest.TestCase):
         )
         self.assertEqual(cause.errno, 112)
 
+    def test_a_refused_connection_names_both_causes_and_how_to_tell(self) -> None:
+        """D14: a message may not name a symptom when several causes share it.
+
+        `ECONNREFUSED` is the case that proves the rule, because it cannot be
+        narrowed from the client: a refusal carries no reason, so a stopped
+        Samba and a blocked port are the same packet. The daemon therefore
+        cannot distinguish them, and the rule's second clause applies -- say
+        what would. Anything less sends half of all readers to the opposite
+        of the fix.
+        """
+        cause = translate.translate_journal("mount error(111): Connection refused")
+        self.assertEqual(cause.state, "unreachable")
+        self.assertIn("stopped", cause.message)      # one cause
+        self.assertIn("firewall", cause.message)     # the other
+        self.assertIn("smbpal status", cause.message)  # what tells them apart
+        self.assertTrue(cause.retryable)
+
     def test_the_table_is_linuxs_numbering_and_not_the_running_platforms(self) -> None:
         """The guard on a fix that looks right and is not.
 
@@ -819,6 +836,26 @@ class TestClearingALatchedUnit(MonitorTestCase):
 
         self.assertEqual(result["unit"], self.unit)
         self.assertIn(self.unit, self.samba.started_units)
+
+    def test_disconnect_says_that_the_automount_will_undo_it(self) -> None:
+        """D14: a control whose effect cannot be observed looks broken.
+
+        The unmount is real and the `.automount` stays armed, so anything
+        touching the path puts it back. On COSMIC, whose file manager watches
+        the mountpoint, that is immediate -- press Disconnect, see nothing
+        change. The CLI has always said so; the window said nothing, because
+        nothing told it to. `share.make_writable` already carries a `note`
+        for exactly this, so disconnect carries one too.
+        """
+        dispatcher = self.dispatcher()
+
+        result = dispatcher._connection_disconnect(
+            *self.request("connection.disconnect", ref=self.connection["id"])
+        )
+
+        self.assertEqual(result["unit"], self.unit)
+        self.assertIn("note", result)
+        self.assertIn("mount again", result["note"])
 
     def test_new_credentials_clear_the_latch(self) -> None:
         # The commonest sequence there is: a rejected password, five retries,

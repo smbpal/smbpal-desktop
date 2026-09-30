@@ -3,14 +3,26 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 
-def render_table(rows: Sequence[dict[str, Any]], columns: Sequence[str]) -> str:
-    """Left-aligned, space-separated columns — no borders, so `awk` still works."""
+def render_table(
+    rows: Sequence[dict[str, Any]],
+    columns: Sequence[str],
+    headers: Mapping[str, str] | None = None,
+) -> str:
+    """Left-aligned, space-separated columns — no borders, so `awk` still works.
+
+    A header defaults to the key, which is right until a key is a worse
+    description of the data than a person deserves. `headers` overrides one
+    without renaming the wire field JSON consumers read (D14).
+    """
     if not rows:
         return ""
-    headers = [column.upper().replace("_", " ") for column in columns]
+    headers = headers or {}
+    headers = [
+        headers.get(column, column.upper().replace("_", " ")) for column in columns
+    ]
     cells = [[_cell(row.get(column)) for column in columns] for row in rows]
     widths = [
         max(len(header), *(len(row[i]) for row in cells))

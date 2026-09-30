@@ -442,7 +442,18 @@ def _cmd_browse(client: Client, args: argparse.Namespace) -> int:
         # Name is a name, not an address: `RASPBERRYPI` is Samba's NetBIOS name
         # and NetBIOS resolution is not available here (§3e). The columns keep
         # that distinction visible.
-        return render_table(machines, ("name", "hostname", "addresses", "running_smbpal"))
+        # D14. The header used to read RUNNING SMBPAL, which is not what the
+        # column measures: the flag comes from an `_smbpal._tcp`
+        # advertisement, and §3f publishes that only while a share is active.
+        # So a machine running SMBPal with nothing shared answered "no" --
+        # including this one, while its daemon was answering. The wire field
+        # keeps its name for JSON consumers; the header now says what is
+        # actually being reported.
+        return render_table(
+            machines,
+            ("name", "hostname", "addresses", "running_smbpal"),
+            headers={"running_smbpal": "SHARING NOW"},
+        )
 
     return _emit(args, machines, human)
 
