@@ -828,7 +828,20 @@ class Dispatcher:
         connection, mount_name = self._unit_for(request)
         systemd.stop(mount_name, runner=self._runner())
         _audit(peer, "connection.disconnect", connection["id"])
-        return {"id": connection["id"], "unit": mount_name}
+        # D14. The unmount is real and the automount stays armed, so anything
+        # that touches the path puts it straight back -- on a desktop whose
+        # file manager watches the mountpoint that is immediate, and the
+        # button looks broken. Found on COSMIC, 30 September 2026; M0 §4 saw
+        # the same re-trigger 80 seconds after boot and it read as a
+        # curiosity. The CLI has always said this. The window said nothing,
+        # and a control whose effect cannot be observed is indistinguishable
+        # from one that does not work.
+        return {
+            "id": connection["id"],
+            "unit": mount_name,
+            "note": "Unmounted. It will mount again as soon as anything opens "
+            "the folder, which on some desktops is immediately.",
+        }
 
     def _unit_for(self, request: Request) -> tuple[dict[str, Any], str]:
         if self.mounter is None:

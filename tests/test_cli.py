@@ -329,6 +329,42 @@ class TestBrowse(CliTestCase):
         self.assertEqual(out.count("RASPBERRYPI"), 1)
 
 
+class TestBrowseHeadingSaysWhatItMeasures(CliTestCase):
+    """D14, and the reason it is a test rather than a tidier word.
+
+    The column is fed by an `_smbpal._tcp` advertisement, which §3f publishes
+    only while a share is active. `RUNNING SMBPAL` therefore answered "no" for
+    a machine running SMBPal with nothing shared -- including, on the 64-bit Pi
+    on 30 September 2026, the machine the command was typed on, while its
+    daemon was answering. The one row a reader can check independently is
+    their own, which is the worst place to be wrong.
+    """
+
+    def test_the_header_is_not_the_field_name(self) -> None:
+        from smbpal.cli.format import render_table
+
+        rows = [{"name": "PI", "running_smbpal": False}]
+        out = render_table(
+            rows, ("name", "running_smbpal"), headers={"running_smbpal": "SHARING NOW"}
+        )
+        self.assertIn("SHARING NOW", out)
+        self.assertNotIn("RUNNING SMBPAL", out)
+
+    def test_the_wire_field_is_unchanged_for_json_consumers(self) -> None:
+        # The header is a presentation fix. Renaming the field would break
+        # anything reading `smbpal browse --json`, and the field name is not
+        # what misled anybody.
+        from smbpal.discovery.browse import Machine
+
+        self.assertIn("running_smbpal", Machine("PI", "pi.local").to_wire())
+
+    def test_a_header_defaults_to_the_key_when_none_is_given(self) -> None:
+        from smbpal.cli.format import render_table
+
+        out = render_table([{"host_name": "pi"}], ("host_name",))
+        self.assertIn("HOST NAME", out)
+
+
 class TestTeardownConfirmation(CliTestCase):
     """A destructive verb asks first, and takes silence for no."""
 

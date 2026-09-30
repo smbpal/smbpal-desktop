@@ -94,7 +94,19 @@ _LINUX_MOUNT_ERRNO: dict[int, tuple[str, str, bool]] = {
     6: ("failed", "the server has no share by that name", False),
     101: ("unreachable", "the network is unreachable", True),
     110: ("unreachable", "the server did not answer in time", True),
-    111: ("unreachable", "the server refused the connection", True),
+    # D14. `ECONNREFUSED` is the symptom of two opposite causes -- Samba
+    # stopped, or its port blocked -- and nothing in the refusal says which,
+    # which is why fedora.md §6a closed with a finding rather than a fix. The
+    # rule's second clause applies: where the daemon cannot distinguish, it
+    # says what would. `smbpal status` on the server answers it in one line,
+    # and SMBPal is running there too.
+    111: (
+        "unreachable",
+        "the server refused the connection: either SMBPal's sharing is "
+        "stopped there, or a firewall is blocking it. `smbpal status` on that "
+        "machine says which",
+        True,
+    ),
     112: ("unreachable", "the server is switched off or unreachable", True),
     113: ("unreachable", "there is no route to the server", True),
     115: ("connecting", "still connecting", True),
