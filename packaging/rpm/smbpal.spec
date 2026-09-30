@@ -241,6 +241,11 @@ fi
 %{_bindir}/smbpald
 %{_bindir}/smbpal-gui
 %{_bindir}/smbpal-tray
+# macOS only, and shipped here anyway. It is one generated script that says
+# what it is when run on Linux (D14), and excluding it would mean the .deb,
+# the .rpm and the wheel each carrying a different list of entry points --
+# which is the divergence TestTheVersionIsOneNumber exists because of.
+%{_bindir}/smbpal-agent
 %{_unitdir}/smbpald.service
 %{_sysusersdir}/smbpal.conf
 %{_datadir}/polkit-1/actions/org.smbpal.policy
@@ -251,7 +256,7 @@ fi
 %{_datadir}/icons/hicolor/scalable/status/smbpal-attention.svg
 
 %changelog
-* Tue Sep 30 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.5-1
+* Wed Sep 30 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.5-1
 - A refused connection names both causes -- a stopped share and a blocked
   port look identical from here, and they are fixed in opposite ways -- and
   points at `smbpal status` on the server, which can tell them apart.

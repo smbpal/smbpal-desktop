@@ -605,6 +605,37 @@ class TestTheLicence(unittest.TestCase):
         )
 
 
+class TestTheRpmChangelogDatesAreRealDays(unittest.TestCase):
+    """rpmbuild warns "bogus date" and builds anyway, so nobody notices.
+
+    0.2.5's entry said Tue for 30 September 2026, which is a Wednesday. It
+    reached a published release, because a warning in four hundred lines of
+    build output is not a signal. The weekday is derivable from the date, so
+    nothing here is a matter of opinion.
+    """
+
+    def test_every_changelog_entry_names_the_right_weekday(self) -> None:
+        import datetime
+        import re
+        from pathlib import Path
+
+        spec = Path(__file__).resolve().parent.parent / "packaging/rpm/smbpal.spec"
+        entries = re.findall(
+            r"^\* (\w{3}) (\w{3}) (\d{1,2}) (\d{4}) ", spec.read_text(), re.M
+        )
+        self.assertTrue(entries, "no changelog entries found; the regex has rotted")
+        for weekday, month, day, year in entries:
+            with self.subTest(entry=f"{weekday} {month} {day} {year}"):
+                real = datetime.datetime.strptime(
+                    f"{month} {day} {year}", "%b %d %Y"
+                ).date()
+                self.assertEqual(
+                    weekday,
+                    real.strftime("%a"),
+                    f"{month} {day} {year} is a {real.strftime('%a')}",
+                )
+
+
 class TestTheVersionIsOneNumber(unittest.TestCase):
     """The version is written in four files, and a release tag makes a fifth.
 
