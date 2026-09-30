@@ -31,6 +31,7 @@ needs them says so when it is not macOS.
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 import errno as _errno
 import sys
 from typing import Any
@@ -180,6 +181,15 @@ def _frameworks() -> dict[str, Any]:
     netfs.NetFSCopyURLForRemountingVolume.restype = ref
     netfs.NetFSCopyURLForRemountingVolume.argtypes = [ref]
 
+    # unmount(2), not `umount` the command. There is no credential involved in
+    # taking a mount away, so shelling out would be allowed -- but it would
+    # mean parsing somebody's error text to find out what happened, and libc
+    # hands back an errno that `describe` already knows how to read.
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    libc.unmount.restype = ctypes.c_int
+    libc.unmount.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    _loaded["libc"] = libc
+
     _loaded.update(
         cf=cf,
         netfs=netfs,
@@ -302,6 +312,34 @@ def mount(
         where = _text(cf, cf.CFArrayGetValueAtIndex(out, 0))
         cf.CFRelease(out)
         return where
+
+
+# `MNT_FORCE` from sys/mount.h. Not the default: forcing an unmount while
+# something is writing is how a half-written file happens, and a mount that
+# will not go away is information rather than an obstacle.
+MNT_FORCE = 0x00080000
+
+
+def unmount(mountpoint: str, *, force: bool = False) -> None:
+    """Take a mount away. The automount, if any, may put it straight back.
+
+    That is not this function's business and it is the finding pop-os.md §5
+    recorded: on a desktop whose file manager watches the mountpoint, an
+    unmount is undone before the screen redraws. Saying so is the caller's job
+    -- `connection.disconnect` does it -- because only the caller knows whether
+    a person is watching.
+    """
+    loaded = _frameworks()
+    libc = loaded["libc"]
+    ctypes.set_errno(0)
+    if libc.unmount(mountpoint.encode(), MNT_FORCE if force else 0) == 0:
+        return
+    code = ctypes.get_errno()
+    _state, message, _retryable = describe(code)
+    raise NetFSError(
+        message if code in _STATUS else f"could not unmount {mountpoint}",
+        detail=f"unmount(2) failed with errno {code}",
+    )
 
 
 def remount_url(mountpoint: str) -> str | None:
