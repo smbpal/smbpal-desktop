@@ -83,6 +83,41 @@ class TestTranslate(unittest.TestCase):
         )
         self.assertEqual(cause.errno, 112)
 
+    def test_the_table_is_linuxs_numbering_and_not_the_running_platforms(self) -> None:
+        """The guard on a fix that looks right and is not.
+
+        `translate_journal` parses a number `mount.cifs` printed into a Linux
+        journal. Keying the table on `errno.ECONNREFUSED` instead would read as
+        a portability improvement and would quietly break: above the POSIX-fixed
+        range of 1 to 34 the numbers differ per platform, and the log can be
+        read somewhere other than where it was written.
+
+        So this asserts the literal Linux values, on whatever platform the
+        suite runs. On macOS `errno.ECONNREFUSED` is 61, and a symbolic rewrite
+        would fail here rather than in front of somebody whose mount broke.
+        """
+        for number, fragment in (
+            (111, "refused the connection"),   # Linux ECONNREFUSED; macOS 61
+            (113, "no route"),                 # Linux EHOSTUNREACH; macOS 65
+            (110, "did not answer in time"),   # Linux ETIMEDOUT;    macOS 60
+            (112, "switched off"),             # Linux EHOSTDOWN;    macOS 64
+        ):
+            with self.subTest(errno=number):
+                cause = translate.translate_journal(f"mount error({number}): x")
+                self.assertIn(fragment, cause.message)
+                self.assertEqual(cause.state, "unreachable")
+
+    def test_the_posix_fixed_range_is_the_part_that_is_portable(self) -> None:
+        # 1 to 34 are fixed by POSIX and identical on Linux and macOS, which is
+        # why these entries would survive a symbolic rewrite and the ones above
+        # would not. Recorded so the distinction is visible rather than lucky.
+        import errno as _errno
+
+        self.assertEqual(_errno.EACCES, 13)
+        self.assertEqual(_errno.ENOENT, 2)
+        cause = translate.translate_journal("mount error(13): Permission denied")
+        self.assertEqual(cause.state, "auth_failed")
+
     def test_an_unrecognised_errno_still_says_something(self) -> None:
         cause = translate.translate_journal("mount error(999): what")
         self.assertEqual(cause.state, "failed")

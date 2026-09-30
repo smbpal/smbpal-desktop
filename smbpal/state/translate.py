@@ -19,6 +19,11 @@ helps and one that misdirects.
 `systemctl show` gives that the unit failed and with what exit status; only the
 journal gives the errno. So both are read, and the journal only on a transition
 into failure — never on every poll.
+
+**Everything here reads Linux.** The input is a systemd journal and the errno in
+it is `mount.cifs`'s, so the table below is Linux's numbering and says so. A
+second platform does not reuse it: it has a different source for the failure and
+a different numbering, and it will want its own. See the comment on the table.
 """
 
 from __future__ import annotations
@@ -51,9 +56,29 @@ class Cause:
     retryable: bool = False
 
 
+# **These are Linux's numbers, and they must stay literal.** They are not local
+# `errno` values: they are the number `mount.cifs` printed into a systemd
+# journal on the machine that failed, parsed back out of text. The only caller
+# is `translate_journal`, and its only input is `journalctl` output.
+#
+# **Do not "fix" this by keying on `errno.ECONNREFUSED` and friends.** It reads
+# like an improvement and it is a defect. errno numbering is not portable above
+# the POSIX-fixed range of 1 to 34: `ECONNREFUSED` is 111 on Linux and 61 on
+# macOS, `EHOSTUNREACH` 113 against 65, `ETIMEDOUT` 110 against 60. Substituting
+# symbols would leave this table correct only while the interpreter happens to
+# run on the same kind of system that wrote the log — and the whole point of the
+# journal path is that the text can be read anywhere, including from a Mac over
+# SSH. The numbers below describe the *sender*, not the reader.
+#
+# Measured 30 September 2026 while proving D13's mount path, which is also where
+# the macOS side of this is written up: `phase-2-porting-surface.md` §6.9. macOS
+# has auth errnos Linux has no name for at all — `EAUTH` 80 and `ENEEDAUTH` 81 —
+# so that platform needs its own table, fed by its own source, not this one
+# rearranged.
+#
 # errno -> (state, message, retryable). The messages are what a person sees, so
 # they say what to do rather than what the kernel called it.
-_ERRNO: dict[int, tuple[str, str, bool]] = {
+_LINUX_MOUNT_ERRNO: dict[int, tuple[str, str, bool]] = {
     1: ("auth_failed", "the server refused the credentials", False),
     13: (
         "auth_failed",
@@ -92,7 +117,7 @@ def translate_journal(text: str) -> Cause | None:
         errno = int(match.group(1))
 
     if errno is not None:
-        state, message, retryable = _ERRNO.get(
+        state, message, retryable = _LINUX_MOUNT_ERRNO.get(
             errno, ("failed", f"the mount failed with error {errno}", True)
         )
         return Cause(state=state, message=message, errno=errno, retryable=retryable)
