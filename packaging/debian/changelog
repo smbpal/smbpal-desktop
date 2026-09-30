@@ -1,3 +1,25 @@
+smbpal (0.2.5) trixie; urgency=medium
+
+  * Three messages say what they mean. Each was accurate and each named a
+    symptom that several different causes share, so it read as though one
+    cause had been identified and sent people to the wrong fix.
+  * A refused connection now names both of the things that cause one. A
+    server refusing a connection gives no reason, so SMBPal could not tell
+    a stopped share from a blocked port -- and the two are fixed in
+    opposite ways. It now says so, and points at `smbpal status` on the
+    other machine, which can tell.
+  * Disconnect says what it did. Disconnecting unmounts the share and
+    leaves it ready to mount again the moment anything opens the folder,
+    which on some desktops happens immediately -- so the button appeared to
+    do nothing at all. The window now says what happened.
+  * `smbpal browse` no longer says a machine is not running SMBPal when it
+    is. The column reported whether a machine was sharing something at that
+    moment, under a heading that promised something else, and answered "no"
+    for the computer you typed the command on. It is now headed SHARING
+    NOW.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Tue, 30 Sep 2026 20:00:00 +0100
+
 smbpal (0.2.4) trixie; urgency=medium
 
   * The window says why there is no tray icon. On GNOME nothing shows tray

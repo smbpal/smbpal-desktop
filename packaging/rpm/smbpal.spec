@@ -10,7 +10,7 @@
 # no second removal step.
 
 Name:           smbpal
-Version:        0.2.4
+Version:        0.2.5
 Release:        1%{?dist}
 Summary:        Share folders over SMB, and connect to shares on other machines
 
@@ -251,6 +251,15 @@ fi
 %{_datadir}/icons/hicolor/scalable/status/smbpal-attention.svg
 
 %changelog
+* Tue Sep 30 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.5-1
+- A refused connection names both causes -- a stopped share and a blocked
+  port look identical from here, and they are fixed in opposite ways -- and
+  points at `smbpal status` on the server, which can tell them apart.
+- Disconnect says what it did, because the share is ready to mount again
+  at once and on some desktops does, which made the button look broken.
+- `smbpal browse` stops reporting that a machine is not running SMBPal
+  when it is. The column is headed SHARING NOW, which is what it measures.
+
 * Sun Sep 27 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.4-1
 - Says when Samba is not running, which on Fedora it is not until somebody
   starts it: a share was reported as served and reachable by nobody.
