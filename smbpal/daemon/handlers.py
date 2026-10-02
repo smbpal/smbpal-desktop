@@ -713,6 +713,18 @@ class Dispatcher:
         self._commit(previous, updated)
         if self.mounter is not None and connection.get("credential_ref"):
             self.mounter.forget_credentials(connection["credential_ref"])
+        # **Only an item SMBPal created.** `replaced` means the person had
+        # already stored that password themselves — through Finder, most
+        # likely — and removing a connection must not remove their credential
+        # for the same server (§10.6, and §6.6's reason for owning our own).
+        if (
+            self.agents is not None
+            and connection.get("keychain_credential") == "created"
+            and connection.get("credential_account")
+        ):
+            self.agents.for_uid(peer.uid).credential_forget(
+                str(connection["host"]), str(connection["credential_account"])
+            )
         if self.monitor is not None:
             self.monitor.forget(connection["id"])
         _audit(peer, "connection.remove", connection["id"])
@@ -728,13 +740,15 @@ class Dispatcher:
         logged, echoed back, or placed in an argv — cifs takes the file's *path*
         (§10.6, M0 §9).
         """
-        if self.mounter is None:
-            raise SmbpalError("this daemon was started with --no-apply")
         ref = _require_str(request.params, "ref")
         username = _require_str(request.params, "username")
         password = request.params.get("password")
         if not isinstance(password, str) or not password:
             raise InvalidParams("'password' is required and must be a non-empty string")
+        if self.agents is not None:
+            return self._set_credentials_in_keychain(ref, username, password, peer)
+        if self.mounter is None:
+            raise SmbpalError("this daemon was started with --no-apply")
 
         previous = self.store.load()
         connection = _find_connection(previous, ref)
@@ -768,6 +782,67 @@ class Dispatcher:
             self.monitor.forget(connection["id"])
         _audit(peer, "connection.set_credentials", connection["id"])
         return {"id": connection["id"], "username": username}
+
+    def _set_credentials_in_keychain(
+        self, ref: str, username: str, password: str, peer: PeerCredentials
+    ) -> dict[str, Any]:
+        """The macOS half of `connection.set_credentials` (D13).
+
+        **There is no file.** On Linux the password goes into a 0600 root-owned
+        file because `mount.cifs` reads it from there. On macOS the reader is
+        NetAuthAgent, inside the session, and the store is the login Keychain —
+        which root cannot read, which is half of why the agent exists. So this
+        hands the password to the agent and keeps nothing.
+
+        **The outcome is recorded because it is a promise about uninstall.**
+        One Keychain item per server and account, so storing a password for a
+        share the person has already connected to in Finder *replaces their
+        item*. §10.6 says SMBPal removes what it created; the item carries no
+        mark of ours, so `keychain_credential` is the only place that can know.
+        """
+        previous = self.store.load()
+        connection = _find_connection(previous, ref)
+        agent = self.agents.for_uid(peer.uid)
+        outcome = agent.credential_set(str(connection["host"]), username, password)
+
+        # **`credential_ref` is not set here, and the first version of this set
+        # it to the connection id.** That reference names a file in
+        # `/etc/smbpal/credentials`, and on macOS there is no file: the item is
+        # found by server *and account*. So the account is what gets recorded —
+        # under its own key, because `credential_ref`'s charset is a filename's
+        # and a remote account is whatever the server calls it. The bug was not
+        # subtle once it ran: `connection remove` asked the Keychain to forget
+        # an account called `nas-example-media`, which does not exist, and the
+        # real item survived a removal that reported success.
+        updated = {
+            **previous,
+            "connections": [
+                {
+                    **candidate,
+                    "credential_account": username,
+                    "keychain_credential": outcome,
+                }
+                if candidate["id"] == connection["id"]
+                else candidate
+                for candidate in previous["connections"]
+            ],
+        }
+        self.store.save(updated)
+        if self.monitor is not None:
+            self.monitor.forget(connection["id"])
+        _audit(peer, "connection.set_credentials", connection["id"])
+        return {
+            "id": connection["id"],
+            "username": username,
+            "keychain": outcome,
+            "note": (
+                "Stored in your login Keychain."
+                if outcome == "created"
+                else "Replaced the login Keychain item that was already there "
+                "for that server and account, which SMBPal will leave behind "
+                "if you uninstall it."
+            ),
+        }
 
     def _connection_use_fallback(
         self, request: Request, peer: PeerCredentials
@@ -921,6 +996,13 @@ class Dispatcher:
         session, in the login Keychain the agent can read and root cannot
         (D13). So this hands over a name and lets the session supply the rest.
         """
+        if self.agents is not None:
+            # No file to read it out of, so it is in the record. Returning None
+            # here instead -- which the first version did, because it went
+            # looking for a credentials file that cannot exist -- means mounting
+            # as a guest with a credential sitting in the Keychain unused.
+            account = connection.get("credential_account")
+            return str(account) if account else None
         ref = connection.get("credential_ref")
         if not ref or self.mounter is None:
             return None

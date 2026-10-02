@@ -7,7 +7,11 @@ So the root daemon is the client here, and it connects into the session of
 whoever asked it — `connection.peer.uid`, which every mutating method already
 receives.
 
-**It passes a username and never a password.** Not an oversight:
+**One call carries a password, and only one.** `credential_set` does, because
+something has to put it in the Keychain and only the session can. `mount` does
+not, which is the point of having done so: once the credential is in the
+Keychain, NetAuthAgent supplies it and the daemon never holds it again. The
+rest of this paragraph is why `mount` was built that way:
 `CredentialsStore.username_for` exists and there is deliberately no
 `password_for`, because that file is written for `mount.cifs` to read and the
 daemon has no business reading it back. On macOS the credential belongs to the
@@ -113,6 +117,48 @@ class AgentClient:
         )
         url = result.get("url")
         return str(url) if url else None
+
+    # --- the credential ----------------------------------------------------
+
+    def credential_set(self, host: str, account: str, password: str) -> str:
+        """Store it in that user's login Keychain. "created" or "replaced".
+
+        **The one call on this link that carries a secret**, and the only one
+        that ever will: a mount does not, because the Keychain is where the
+        credential comes from once this has run. The daemon holds the password
+        for the length of the request that brought it and writes it nowhere —
+        on Linux it would have gone into a 0600 file for `mount.cifs`; here it
+        goes into a session root cannot read, which is the better place and the
+        reason D13 put mounting there.
+        """
+        result = self._call(
+            "agent.credential_set",
+            {"host": host, "account": account, "password": password},
+            timeout=DEFAULT_TIMEOUT,
+        )
+        return str(result["outcome"])
+
+    def credential_present(self, host: str, account: str) -> bool:
+        result = self._call(
+            "agent.credential_present",
+            {"host": host, "account": account},
+            timeout=DEFAULT_TIMEOUT,
+        )
+        return bool(result["present"])
+
+    def credential_forget(self, host: str, account: str) -> bool:
+        """Remove it. False if there was nothing to remove.
+
+        Whether SMBPal *may* is not asked here: the Keychain item carries no
+        mark of ours, so the answer lives in the config's
+        `keychain_credential`, and the daemon checks it before calling this.
+        """
+        result = self._call(
+            "agent.credential_forget",
+            {"host": host, "account": account},
+            timeout=DEFAULT_TIMEOUT,
+        )
+        return bool(result["removed"])
 
     # --- the wire ----------------------------------------------------------
 

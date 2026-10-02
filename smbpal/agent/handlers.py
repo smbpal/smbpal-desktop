@@ -1,9 +1,12 @@
 """What the agent will answer, and what it refuses to become.
 
-**Four methods.** Mount, unmount, the URL that would remount something, and a
-ping. It holds no configuration, writes no files and makes no decisions: the
-daemon decides what should be mounted and this does the mounting, because on
-macOS the mounting is the part that cannot be done from root.
+**Seven methods, in two groups.** Mount, unmount, the URL that would remount
+something, and a ping; then the three that put a credential in the login
+Keychain, look for one, and take one away. It holds no configuration, writes no
+files and makes no decisions: the daemon decides what should be mounted and
+this does the mounting, because on macOS the mounting is the part that cannot
+be done from root — and the credential is the other half of the same fact,
+since the Keychain it has to come from is unreadable there.
 
 **Authorisation is one line, and it is not a simplification.** The daemon has
 polkit, a group-guarded socket and an `Authoriser`, because it acts for
@@ -35,6 +38,7 @@ from typing import Any, Callable
 from smbpal.errors import SmbpalError
 from smbpal.ipc.protocol import Request, encode_failure, encode_success, parse_request
 from smbpal.ipc.transport import Connection
+from smbpal.agent import keychain as keychain_module
 from smbpal.mounts import netfs
 
 log = logging.getLogger(__name__)
@@ -58,11 +62,18 @@ def _require_str(params: dict[str, Any], name: str) -> str:
 class AgentDispatcher:
     """One user's mounting, behind the same protocol the daemon speaks."""
 
-    def __init__(self, *, uid: int | None = None, mounter: Any = netfs) -> None:
-        # Injected so the suite can run on Linux, where NetFS does not exist
-        # and where CI runs. The default is the real thing.
+    def __init__(
+        self,
+        *,
+        uid: int | None = None,
+        mounter: Any = netfs,
+        keychain: Any = keychain_module,
+    ) -> None:
+        # Injected so the suite can run on Linux, where neither NetFS nor the
+        # Keychain exists and where CI runs. The defaults are the real things.
         self.uid = os.getuid() if uid is None else uid
         self.mounter = mounter
+        self.keychain = keychain
 
     # --- the methods -------------------------------------------------------
 
@@ -95,6 +106,50 @@ class AgentDispatcher:
         return {
             "mountpoint": mountpoint,
             "url": self.mounter.remount_url(mountpoint),
+        }
+
+    # --- the credential, which is the reason this process exists -----------
+
+    def _credential_set(self, request: Request) -> dict[str, Any]:
+        """Put the password where NetFS will find it, and nowhere else.
+
+        **The password is in this process for the length of one call.** It
+        arrives on the socket, goes into a `CFData`, and is released with the
+        rest of the CoreFoundation objects. It is not written to a file, not
+        kept in an attribute, and not logged — `handle` logs a method name and
+        an error code, and these params are the reason that rule exists.
+
+        The reply says *created* or *replaced*, because the daemon has to
+        record which: one Keychain item per server and account, so a password
+        for a share Finder already knows about overwrites the person's own
+        item, and §10.6 must not then delete it on uninstall.
+        """
+        host = _require_str(request.params, "host")
+        account = _require_str(request.params, "account")
+        password = _require_str(request.params, "password")
+        return {
+            "host": host,
+            "account": account,
+            "outcome": self.keychain.set_password(host, account, password),
+        }
+
+    def _credential_present(self, request: Request) -> dict[str, Any]:
+        host = _require_str(request.params, "host")
+        account = _require_str(request.params, "account")
+        return {
+            "host": host,
+            "account": account,
+            "present": self.keychain.present(host, account),
+        }
+
+    def _credential_forget(self, request: Request) -> dict[str, Any]:
+        """Remove it. Whether SMBPal may is the caller's question, not ours."""
+        host = _require_str(request.params, "host")
+        account = _require_str(request.params, "account")
+        return {
+            "host": host,
+            "account": account,
+            "removed": self.keychain.forget(host, account),
         }
 
     # --- who may ask -------------------------------------------------------
@@ -156,4 +211,7 @@ class AgentDispatcher:
             "agent.mount": self._mount,
             "agent.unmount": self._unmount,
             "agent.remount_url": self._remount_url,
+            "agent.credential_set": self._credential_set,
+            "agent.credential_present": self._credential_present,
+            "agent.credential_forget": self._credential_forget,
         }
