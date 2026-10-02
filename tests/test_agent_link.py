@@ -202,11 +202,18 @@ class TestTheDaemonRoutesToTheAgent(AgentLinkTestCase):
         the same one polkit was asked about a moment earlier.
         """
         other = PeerCredentials(uid=self.uid + 1, gid=20)
+        # The socket it will look for, which is not this agent's. Asserted on
+        # the path rather than on the failure message, because the message is
+        # platform-dependent -- on Linux the client says "you asked for an
+        # agent on a platform that has none" instead, which is true there and
+        # was the first draft of this test failing in CI.
+        theirs = self.clients.for_uid(other.uid).path
+        self.assertNotEqual(theirs, self.agent.path)
+        self.assertFalse(theirs.exists(), "nothing is listening there, which is why it fails")
+
         request = Request(id="1", method="connection.connect", params={"ref": "nas-media"})
-        with self.assertRaises(AgentUnreachable) as caught:
+        with self.assertRaises(AgentUnreachable):
             Dispatcher._connection_connect(self.dispatcher, request, other)
-        # It looked for a *different* socket, which is the whole point.
-        self.assertIn(f"agent-{self.uid + 1}.sock", caught.exception.detail or "")
         self.assertEqual(self.agent.mounter.mounted, [], "nothing mounted for them")
 
     def test_disconnect_does_not_promise_a_remount_that_will_not_happen(self) -> None:
