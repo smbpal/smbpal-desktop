@@ -40,13 +40,41 @@ from smbpal.ipc.server import UnixSocketTransport
 from tests.test_agent import FakeMounter
 
 
+class FakeKeychain:
+    """The login Keychain as the one thing that matters about it: a dict.
+
+    Keyed by (server, account), because that is what `SecItemAdd` proved the
+    real key to be -- a second item for the same pair comes back as
+    `errSecDuplicateItem`. A fake keyed any other way would let a test pass
+    that the real Keychain refuses.
+    """
+
+    def __init__(self) -> None:
+        self.items: dict[tuple[str, str], str] = {}
+
+    def set_password(self, host: str, account: str, password: str) -> str:
+        key = (host, account)
+        existed = key in self.items
+        self.items[key] = password
+        return "replaced" if existed else "created"
+
+    def present(self, host: str, account: str) -> bool:
+        return (host, account) in self.items
+
+    def forget(self, host: str, account: str) -> bool:
+        return self.items.pop((host, account), None) is not None
+
+
 class LiveAgent:
     """A real agent, on a real socket, in a thread. Faked only at NetFS."""
 
     def __init__(self, directory: Path, uid: int) -> None:
         self.mounter = FakeMounter()
+        self.keychain = FakeKeychain()
         self.path = directory / f"agent-{uid}.sock"
-        self.dispatcher = AgentDispatcher(uid=uid, mounter=self.mounter)
+        self.dispatcher = AgentDispatcher(
+            uid=uid, mounter=self.mounter, keychain=self.keychain
+        )
         self.transport = UnixSocketTransport(self.path, group=None, mode=0o600)
         self.transport.bind()
         self.thread = threading.Thread(
@@ -239,6 +267,139 @@ class TestTheDaemonRoutesToTheAgent(AgentLinkTestCase):
         # The systemd path is untouched when `agents` is None, which is every
         # platform but macOS. The guard is the first line of both handlers.
         self.assertIsNone(Dispatcher(self.store).agents)
+
+
+class TestTheCredentialGoesIntoTheKeychain(AgentLinkTestCase):
+    def test_set_says_whether_it_created_or_replaced(self) -> None:
+        client = self.client()
+        self.assertEqual(
+            client.credential_set("nas.example", "pi", "throwaway"), "created"
+        )
+        self.assertEqual(
+            client.credential_set("nas.example", "pi", "throwaway-2"), "replaced"
+        )
+
+    def test_present_and_forget(self) -> None:
+        client = self.client()
+        self.assertFalse(client.credential_present("nas.example", "pi"))
+        client.credential_set("nas.example", "pi", "throwaway")
+        self.assertTrue(client.credential_present("nas.example", "pi"))
+        self.assertTrue(client.credential_forget("nas.example", "pi"))
+        self.assertFalse(client.credential_forget("nas.example", "pi"))
+
+    def test_this_is_the_only_call_that_carries_a_password(self) -> None:
+        # And it is why the others do not have to: once the credential is in
+        # the session's Keychain, NetAuthAgent supplies it to the mount and the
+        # daemon never holds it again.
+        carries = {
+            name
+            for name in ("mount", "unmount", "remount_url", "credential_set",
+                         "credential_present", "credential_forget")
+            if "password" in getattr(AgentClient, name).__code__.co_varnames
+        }
+        self.assertEqual(carries, {"credential_set"})
+
+
+class TestTheDaemonStoresCredentialsThroughTheAgent(AgentLinkTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.store = ConfigStore(self.root / "config.json")
+        self.store.save(
+            {
+                "version": 1,
+                "shares": [],
+                "connections": [
+                    {
+                        "type": "os",
+                        "id": "nas-media",
+                        "host": "nas.example",
+                        "share": "Media",
+                        "mountpoint": "/Volumes/Media",
+                    }
+                ],
+            }
+        )
+        self.dispatcher = Dispatcher(self.store, agents=self.clients)
+        self.peer = PeerCredentials(uid=self.uid, gid=20)
+
+    def set_credentials(self, account: str = "pi") -> dict:
+        request = Request(
+            id="1",
+            method="connection.set_credentials",
+            params={"ref": "nas-media", "username": account, "password": "throwaway"},
+        )
+        return Dispatcher._connection_set_credentials(self.dispatcher, request, self.peer)
+
+    def connection(self) -> dict:
+        return self.store.load()["connections"][0]
+
+    def test_it_records_the_account_and_not_a_filename(self) -> None:
+        """The bug this exists because of.
+
+        The first version recorded the connection id in `credential_ref`,
+        which names a file in `/etc/smbpal/credentials` and is a filename's
+        charset. There is no file on macOS: the Keychain is keyed by server and
+        account. `connection remove` then asked the Keychain to forget an
+        account called `nas-example-media`, found nothing, and reported
+        success while the real item survived.
+        """
+        self.set_credentials("Luke.Hynek")
+        self.assertEqual(self.connection()["credential_account"], "Luke.Hynek")
+        self.assertIsNone(self.connection().get("credential_ref"))
+
+    def test_the_account_is_not_held_to_a_posix_name(self) -> None:
+        # A remote account is whatever the server calls it. `owner` is a local
+        # account and is strict; this must not be.
+        for account in ("Luke.Hynek", "DOMAIN\\luke", "luke@example"):
+            with self.subTest(account=account):
+                self.set_credentials(account)
+                self.assertEqual(self.connection()["credential_account"], account)
+
+    def test_it_records_whether_the_item_was_ours(self) -> None:
+        self.assertEqual(self.set_credentials()["keychain"], "created")
+        self.assertEqual(self.connection()["keychain_credential"], "created")
+        # Something else already had one for that server and account.
+        self.agent.keychain.items[("nas.example", "other")] = "theirs"
+        request = Request(
+            id="2",
+            method="connection.set_credentials",
+            params={"ref": "nas-media", "username": "other", "password": "throwaway"},
+        )
+        result = Dispatcher._connection_set_credentials(self.dispatcher, request, self.peer)
+        self.assertEqual(result["keychain"], "replaced")
+        self.assertIn("leave behind", result["note"])
+
+    def test_the_mount_then_sends_that_account(self) -> None:
+        # And the first version sent None, because it looked for the username
+        # in a credentials file that cannot exist here -- so a connection with
+        # a stored credential mounted as a guest.
+        self.set_credentials("pi")
+        request = Request(id="3", method="connection.connect", params={"ref": "nas-media"})
+        Dispatcher._connection_connect(self.dispatcher, request, self.peer)
+        self.assertEqual(self.agent.mounter.mounted[0][1], "pi")
+
+    def test_removing_the_connection_removes_an_item_we_created(self) -> None:
+        self.set_credentials("pi")
+        request = Request(id="4", method="connection.remove", params={"ref": "nas-media"})
+        Dispatcher._connection_remove(self.dispatcher, request, self.peer)
+        self.assertFalse(self.agent.keychain.present("nas.example", "pi"))
+
+    def test_and_leaves_one_it_only_replaced(self) -> None:
+        """§10.6 promises to remove what SMBPal created. Not what it found.
+
+        The item carries no mark of ours -- it has to be the item the system
+        looks for -- so this is the only check there can be, and it is the
+        reason the outcome is written into the config at all.
+        """
+        self.agent.keychain.items[("nas.example", "pi")] = "theirs"
+        self.set_credentials("pi")
+        self.assertEqual(self.connection()["keychain_credential"], "replaced")
+        request = Request(id="5", method="connection.remove", params={"ref": "nas-media"})
+        Dispatcher._connection_remove(self.dispatcher, request, self.peer)
+        self.assertTrue(
+            self.agent.keychain.present("nas.example", "pi"),
+            "the person's own credential for that server must survive",
+        )
 
 
 class TestTheUrlCarriesNothingItNeedNot(unittest.TestCase):

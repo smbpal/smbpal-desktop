@@ -44,6 +44,13 @@ _RESERVED_SHARE_NAMES = RESERVED_SHARE_NAMES
 _HOST_FORBIDDEN = set('\n\r\t /\\[]"\'`$%\x00')
 _HOST_MAX = 253
 
+# What `keychain_credential` may say, and both are observations: "created"
+# means SMBPal put the item in the login Keychain and uninstall may take it
+# away; "replaced" means something else had already stored one for that server
+# and account -- Finder, most likely -- and removing it would break a
+# connection the person made themselves.
+KEYCHAIN_CREDENTIAL_VALUES = frozenset({"created", "replaced"})
+
 AUTO_CONNECT_VALUES = ("always", "on_this_network", "never")
 
 _SHARE_KEYS = {
@@ -65,6 +72,21 @@ _CONNECTION_KEYS = {
     "auto_connect",
     "owner",
     "fallback_host",
+    # macOS only. The remote account whose credential is in the login Keychain.
+    # Linux has nowhere to put this and no need to: the username lives inside
+    # the 0600 credentials file that `credential_ref` names, and `mount.cifs`
+    # reads it from there. On macOS there is no file -- the Keychain is keyed by
+    # server *and account*, so the account is how the item is found again, to
+    # mount with and to remove on uninstall.
+    "credential_account",
+    # macOS only, and it records an observation rather than a setting: whether
+    # SMBPal *created* the login-Keychain item for this connection or replaced
+    # one that was already there. §10.6 promises to remove what SMBPal created,
+    # and the Keychain item carries no mark of ours — it has to be the item the
+    # system looks for — so this is the only place that knowledge can live.
+    # Absent on every Linux connection and on every macOS one made before the
+    # credential was set.
+    "keychain_credential",
 }
 _TOP_KEYS = {"version", "shares", "connections"}
 
@@ -208,6 +230,19 @@ def _validate_connection(
     # `.local` name survives a DHCP change and an address does not. Offered on
     # a resolution failure, never used automatically — the lease may have moved.
     _check_host(problems, f"{where}.fallback_host", connection.get("fallback_host"))
+    _check_remote_account(
+        problems, f"{where}.credential_account", connection.get("credential_account")
+    )
+    keychain = connection.get("keychain_credential")
+    if keychain is not None and keychain not in KEYCHAIN_CREDENTIAL_VALUES:
+        problems.append(
+            Problem(
+                f"{where}.keychain_credential",
+                "expected one of "
+                + ", ".join(sorted(KEYCHAIN_CREDENTIAL_VALUES))
+                + f", got {keychain!r}",
+            )
+        )
     auto = connection.get("auto_connect")
     if auto is not None and auto not in AUTO_CONNECT_VALUES:
         problems.append(
@@ -364,6 +399,25 @@ def _check_owner(problems: list[Problem], where: str, value: Any) -> None:
         problems.append(
             Problem(where, "must be null or a POSIX user name")
         )
+
+
+def _check_remote_account(problems: list[Problem], where: str, value: Any) -> None:
+    """A remote SMB account, which is not a POSIX name and must not be checked as one.
+
+    `_check_owner` can be strict because a local account really is
+    `[a-z_][a-z0-9_-]*`. A remote one is whatever the server calls it: mixed
+    case, a dot, an `@`, a `DOMAIN\\user` form. So this refuses only what
+    cannot work -- empty, a control character, or something that is not a
+    string -- and leaves the server to reject the rest, which it is the only
+    thing qualified to do.
+    """
+    if value is None:
+        return
+    if not isinstance(value, str) or not value:
+        problems.append(Problem(where, "must be null or a non-empty account name"))
+        return
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        problems.append(Problem(where, "must not contain a control character"))
 
 
 def _check_optional_bool(problems: list[Problem], where: str, value: Any) -> None:

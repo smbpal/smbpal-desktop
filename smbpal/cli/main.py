@@ -692,7 +692,7 @@ def _cmd_connection_add(client: Client, args: argparse.Namespace) -> int:
         password = _read_password(args, f"Password for {args.user}@{args.host}: ")
         if password is None:
             return EXIT_ERROR
-        client.call(
+        stored = client.call(
             "connection.set_credentials",
             {
                 "ref": connection["id"],
@@ -702,6 +702,12 @@ def _cmd_connection_add(client: Client, args: argparse.Namespace) -> int:
             },
         )
         lines.append(f"  credentials stored for {args.user}")
+        # The daemon says where it put them when that is not obvious — on
+        # macOS it is the login Keychain, and if an item was already there for
+        # that server and account it has just been replaced. Somebody should
+        # hear that at the moment it happens rather than on uninstall.
+        if isinstance(stored, dict) and stored.get("note"):
+            lines.append(f"  {stored['note']}")
     else:
         lines.append("  no credentials: it will mount as a guest")
     if server_reachable(connection["host"]):
