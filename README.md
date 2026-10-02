@@ -28,7 +28,9 @@ smbpal/
   system/       running commands, atomic file writes
   cli/          smbpal
   daemon/       smbpald: method dispatch and the entry point
-  mounts/       systemd units, cifs credentials, the non-blocking mountpoint probe
+  mounts/       systemd units, cifs credentials, the non-blocking mountpoint probe,
+                and netfs.py — the macOS mount mechanism (D13)
+  agent/        macOS only: the per-user mount agent, and the LaunchAgent that starts it
   state/        the connection state machine and the errno translation
 packaging/debian/
 tests/
@@ -198,6 +200,41 @@ Before it, mutating methods accepted any peer that got through the socket's
 `0660 root:smbpal` guard — *may talk* and *may act* were the same answer, which
 is not what D4 says. `--authorisation group` still selects that behaviour for
 development on a machine with no polkit, and the daemon warns when it is on.
+
+## macOS, in two parts — Phase 2, in progress
+
+**Mounting on macOS cannot happen in the root daemon, and that was measured rather than
+argued.** An unprivileged `mount_smbfs` reached the network — it timed out, which is a network
+answer where a permission problem would have failed sooner — so mounting there needs no
+elevation at all. And the login Keychain, where D13 puts the password, is unreadable from root.
+Either one would be enough. So macOS has **two components where Linux has one**: a privileged
+helper for sharepoints and accounts, still to come, and `smbpal-agent`, which owns mounting and
+nothing else.
+
+It is not a second daemon. It holds no configuration, makes no policy, and serves exactly one
+person — so where `smbpald` has polkit, a group-guarded socket and an `Authoriser`, the agent has
+one line comparing the peer's uid to its own. `ipc/peer.py` answers that from the kernel.
+
+```sh
+smbpal-agent --install      # write the LaunchAgent, load it, start mounting at every login
+smbpal-agent --status       # installed? loaded? running? still pointing at this program?
+smbpal-agent --uninstall    # unload it and remove the plist
+```
+
+**The plist is generated rather than shipped**, because `/opt/homebrew` on Apple silicon and
+`/usr/local` on Intel are different paths and a static file would be wrong on one of them. It
+records the symlink, not the Cellar target, so `brew upgrade` does not leave launchd aimed at a
+directory that no longer exists. Homebrew's own `service` block cannot do this job: it holds one
+service per formula and macOS needs two, so that block is reserved for the root daemon.
+
+`--status` exists because of what `launchctl print` does not tell you. Three different failures
+all report `state = spawn scheduled`, and a job killed by a signal is distinguishable from one
+that exited non-zero only by `last exit code` being **absent**. The first version of `--status`
+reported an agent that had never once started as healthy, and said so with exit code 0.
+
+On Linux every one of those flags refuses and names `sudo systemctl enable --now smbpald`
+instead, which is the same rule the rest of the project follows: say what is wrong *and* what
+this platform uses instead.
 
 ## Licence
 
