@@ -408,7 +408,40 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version=${GITHUB_REF_NAME#v}
+
+          # **What changed, from the one place that already says it.** 0.2.6's
+          # release page explained how to install it and nothing about what it
+          # was, while both package changelogs carried the whole list — one
+          # fact in two places, where the copy nobody reads is the maintained
+          # one. So the notes take the top entry of `debian/changelog`, written
+          # at version-bump time and shipped inside the .deb regardless.
+          #
+          # Nothing here re-checks that its version is the tag's. *The tag and
+          # the packages must be the same version*, earlier in this job, has
+          # already compared the tag to `dpkg-deb --field Version` — which is
+          # this same entry, by way of the built package. A second check of one
+          # fact is the duplication this section exists to remove.
+
+          # The entry runs from the line after the header to the signature. The
+          # three substitutions turn Debian's conventions into markdown's: `  * `
+          # becomes a list item, its continuation lines keep one space so they
+          # stay inside it, and ` -- ` becomes an em dash. That last pattern is
+          # spaced on both sides deliberately — `--install` must survive.
+          changes=$(
+            awk 'NR>1 && /^smbpal \(/{exit} /^ -- /{exit} {print}' packaging/debian/changelog |
+              sed '1d' | sed '/./,$!d' |
+              sed -e 's/^  \* /- /' -e 's/^    / /' -e 's/ -- / — /g'
+          )
+          if [ -z "$changes" ]; then
+            echo "::error::no changelog entry for $version; the notes would have nothing to say"
+            exit 1
+          fi
+
           cat > notes.md <<NOTES
+          ## What changed
+
+          ${changes}
+
           ## Install
 
           Raspberry Pi OS, or any Debian-based system. **Three steps, and the
@@ -484,18 +517,18 @@ jobs:
 
           ## Tested on
 
-          By hand, on real machines: Raspberry Pi OS Trixie on a Pi 4,
-          Raspberry Pi OS Bookworm 32-bit, Ubuntu 26.04, Debian 12, Debian 13
-          and Fedora 44 — install, the tray, the window, a connection to
-          another machine, a share served to a second machine, and removal.
-          The desktop rows were run in virtual machines.
-
-          Automatically, on every build: the .deb installed, used to share a
+          **This release**, automatically: the .deb installed, used to share a
           folder, removed and purged on Debian 12, Debian 13, Ubuntu 24.04 and
           Ubuntu 26.04, and the .rpm built, installed, used and erased on two
           Fedora releases, with \`smb.conf\` compared byte for byte before and
           after in every case. This release was not published unless all of
           them passed.
+
+          **Across releases**, by hand on real machines: every distribution
+          marked *Tested* at https://smbpal.app, each named with the desktop it
+          actually ran. Those runs cover what a container cannot — the tray,
+          the window, the polkit prompt, a share served to a second machine,
+          and removal.
 
           ## Source
 
