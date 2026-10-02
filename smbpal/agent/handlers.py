@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from smbpal.errors import SmbpalError
 from smbpal.ipc.protocol import Request, encode_failure, encode_success, parse_request
@@ -81,17 +82,41 @@ class AgentDispatcher:
         return {"ok": True, "uid": self.uid, "platform_supported": netfs.available()}
 
     def _mount(self, request: Request) -> dict[str, Any]:
+        """Mount, with the password fetched from the Keychain if none was sent.
+
+        **The daemon never sends one.** It fetches it here because NetFS will
+        not: under `kNAUIOptionNoUI` the Keychain is not consulted, measured
+        against a real server on 2 October 2026, and there is no option to turn
+        the lookup on without permitting a dialog this process must not raise.
+        So the credential is read inside the session, by the one process that
+        can, and handed straight to `netfs.mount`.
+
+        `host` comes from the daemon rather than from the URL, because the
+        daemon is what stored the item and the lookup key has to be the string
+        it stored under. Falling back to the URL's hostname keeps a direct
+        caller working, at the cost of its lowercasing.
+        """
         url = _require_str(request.params, "url")
-        where = self.mounter.mount(
-            url,
-            user=request.params.get("user") or None,
-            password=request.params.get("password") or None,
-        )
+        user = request.params.get("user") or None
+        password = request.params.get("password") or None
+        looked_up = False
+        if password is None and user:
+            host = request.params.get("host") or urlsplit(url).hostname
+            if host:
+                password = self.keychain.get_password(str(host), user)
+                looked_up = password is not None
+        where = self.mounter.mount(url, user=user, password=password)
         # The URL is safe to log and the password was never in the message we
         # keep: `request.params` is not logged anywhere, and this line names
-        # only what a mount table would show anyway.
-        log.info("mounted %s at %s", url, where)
-        return {"url": url, "mountpoint": where}
+        # only what a mount table would show anyway. Whether a credential was
+        # found is worth saying; what it was is not.
+        log.info(
+            "mounted %s at %s%s",
+            url,
+            where,
+            " (credential from the Keychain)" if looked_up else "",
+        )
+        return {"url": url, "mountpoint": where, "used_keychain": looked_up}
 
     def _unmount(self, request: Request) -> dict[str, Any]:
         mountpoint = _require_str(request.params, "mountpoint")

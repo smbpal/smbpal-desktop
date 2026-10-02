@@ -12,14 +12,24 @@ what consults the Keychain when `NetFSMountURLSync` is given no password, and it
 looks for the item the system's own Finder would have written. An item of our
 own shape, under our own service name, would be ours and invisible.
 
-**Nothing here reads a password back.** `set` and `forget` and `present`, and no
-`get`. Deliberately, and for the same reason `CredentialsStore` has
-`username_for` and no `password_for`: the store exists so that something else
-can read it — there, `mount.cifs`; here, NetAuthAgent — and a process that
-reads a secret it does not need is a process that can leak one. It also avoids
-the ACL: an attributes-only lookup needs no access to the data, which was
-measured on 2 October 2026 to answer with no prompt from a process that did not
-create the item.
+**There is a `get`, and there was deliberately not one until a measurement
+forced it.** The original rule was `set`, `present`, `forget` and no read — the
+same shape that gives `CredentialsStore` a `username_for` and no
+`password_for`, on the grounds that the store exists so something *else* can
+read it: `mount.cifs` there, NetAuthAgent here.
+
+**NetAuthAgent turned out not to read it when asked not to show UI.** Measured
+on 2 October 2026 against a real server: with the correct item in the Keychain,
+`NetFSMountURLSync` under `kNAUIOptionNoUI` was refused with `EAUTH`, and the
+same password passed as an argument mounted the share. The NetFS header has no
+"use the Keychain" option to turn on — the lookup belongs to NetAuthAgent's UI
+path, and a launchd agent must not raise a dialog. So the agent reads the
+password itself and passes it.
+
+**D13's property is unchanged, and that is the test of whether this is a
+retreat.** The credential still never leaves the session and root still cannot
+see it; what changed is which process inside the session reads it. The daemon
+has no `get` and no way to ask for one.
 
 **The item's key is the item, and that bounds what uninstall may do.**
 `SecItemAdd` of a second item with the same server, account and protocol returns
@@ -86,6 +96,15 @@ def _frameworks() -> dict[str, Any]:
     cf.CFStringGetCString.argtypes = [ref, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
     cf.CFDataCreate.restype = ref
     cf.CFDataCreate.argtypes = [ref, ctypes.c_char_p, ctypes.c_long]
+    # **Both of these, or `get_password` segfaults.** Without a declared
+    # `restype`, ctypes assumes `int` and truncates the returned pointer to 32
+    # bits, so `string_at` reads from an address that was never allocated. The
+    # first run of the new test exited 139 rather than failing an assertion,
+    # which is the whole reason this module declares every signature it uses.
+    cf.CFDataGetLength.restype = ctypes.c_long
+    cf.CFDataGetLength.argtypes = [ref]
+    cf.CFDataGetBytePtr.restype = ctypes.POINTER(ctypes.c_char)
+    cf.CFDataGetBytePtr.argtypes = [ref]
     cf.CFDictionaryCreateMutable.restype = ref
     cf.CFDictionaryCreateMutable.argtypes = [ref, ctypes.c_long, ref, ref]
     cf.CFDictionarySetValue.restype = None
@@ -278,6 +297,49 @@ def present(host: str, account: str) -> bool:
         f"could not look for a credential for {account} on {host}",
         detail=_message(status),
     )
+
+
+def get_password(host: str, account: str) -> str | None:
+    """The password, or None if there is no item. **Session-only, by design.**
+
+    The one function here that handles a secret, and the one that can raise a
+    Keychain dialog: reading the *data* needs the item's ACL, where `present`
+    asks only for attributes and needs nothing. Measured on 2 October 2026 —
+    a process that did not create the item read it back with no prompt, because
+    the ACL trusts the interpreter rather than the process. **A `brew upgrade
+    python@3.14` changes that interpreter's code identity**, so the first read
+    afterwards may prompt. In the agent that dialog appears in the person's own
+    session, which is survivable, and `smbpal-agent --status` is where somebody
+    would go looking.
+
+    The returned string is held for the length of one `netfs.mount` call and is
+    never logged, stored, or returned over the daemon's socket.
+    """
+    loaded = _frameworks()
+    found = ctypes.c_void_p()
+    with _Refs(loaded["cf"]) as refs:
+        query = _query(
+            refs,
+            host,
+            account,
+            kSecReturnData=loaded["true"],
+            kSecMatchLimit=_constant("kSecMatchLimitOne"),
+        )
+        status = loaded["sec"].SecItemCopyMatching(query, ctypes.byref(found))
+    if status == ERR_ITEM_NOT_FOUND:
+        return None
+    if status != ERR_SUCCESS:
+        raise KeychainError(
+            f"could not read the credential for {account} on {host}",
+            detail=_message(status),
+        )
+    cf = loaded["cf"]
+    try:
+        length = cf.CFDataGetLength(found)
+        pointer = cf.CFDataGetBytePtr(found)
+        return ctypes.string_at(pointer, length).decode("utf-8")
+    finally:
+        cf.CFRelease(found)
 
 
 def forget(host: str, account: str) -> bool:

@@ -96,12 +96,22 @@ class AgentClient:
     def ping(self) -> dict[str, Any]:
         return self._call("agent.ping", timeout=DEFAULT_TIMEOUT)
 
-    def mount(self, url: str, *, user: str | None = None) -> str:
-        result = self._call(
-            "agent.mount",
-            {"url": url, "user": user} if user else {"url": url},
-            timeout=MOUNT_TIMEOUT,
-        )
+    def mount(
+        self, url: str, *, user: str | None = None, host: str | None = None
+    ) -> str:
+        """Mount in that user's session. Still no password on this call.
+
+        The agent fetches it from the Keychain itself, because NetFS will not
+        under `NoUI` — so this stays the call that carries no secret, and
+        `credential_set` stays the only one that does. `host` is the key the
+        credential was stored under, which the agent cannot safely infer.
+        """
+        params: dict[str, Any] = {"url": url}
+        if user:
+            params["user"] = user
+        if host:
+            params["host"] = host
+        result = self._call("agent.mount", params, timeout=MOUNT_TIMEOUT)
         return str(result["mountpoint"])
 
     def unmount(self, mountpoint: str) -> bool:

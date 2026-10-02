@@ -52,6 +52,8 @@ _UTF8 = 0x08000100
 # dialog, which is the behaviour the reconnect design rests on.
 UI_OPTION_KEY = "UIOption"
 UI_OPTION_NO_UI = "NoUI"
+# `kNetFSForceNewSessionKey`, an open-session option beside `UIOption`.
+FORCE_NEW_SESSION_KEY = "ForceNewSession"
 
 
 class NetFSError(SmbpalError):
@@ -201,6 +203,11 @@ def _frameworks() -> dict[str, Any]:
         # produces a dictionary that silently holds nothing.
         key_cb=ctypes.addressof(ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryKeyCallBacks")),
         val_cb=ctypes.addressof(ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryValueCallBacks")),
+        # `ForceNewSession` takes a boolean, not the string "true" -- these are
+        # CFTypeRefs, so their *value* is the ref, where the callback structs
+        # above want their address. The same confusion, one line apart.
+        true=ctypes.c_void_p.in_dll(cf, "kCFBooleanTrue").value,
+        false=ctypes.c_void_p.in_dll(cf, "kCFBooleanFalse").value,
     )
     return _loaded
 
@@ -244,15 +251,24 @@ def _text(cf: Any, ref: Any) -> str:
     return buffer.value.decode()
 
 
-def _options(cf: Any, refs: _Refs, pairs: dict[str, str]) -> Any:
+def _options(cf: Any, refs: _Refs, pairs: dict[str, str | bool]) -> Any:
+    """A CFDictionary of NetFS options. A `bool` becomes a CFBoolean.
+
+    `UIOption` is a string and `ForceNewSession` is a boolean, so this cannot
+    be a string-to-string helper. Passing the string "true" for a boolean key
+    is accepted by the dictionary and ignored by NetFS, which is the silent
+    failure this signature exists to prevent.
+    """
     loaded = _frameworks()
     table = refs.keep(
         cf.CFDictionaryCreateMutable(None, 0, loaded["key_cb"], loaded["val_cb"])
     )
     for key, value in pairs.items():
-        cf.CFDictionarySetValue(
-            table, refs.keep(_string(cf, key)), refs.keep(_string(cf, value))
-        )
+        if isinstance(value, bool):
+            cell = loaded["true"] if value else loaded["false"]
+        else:
+            cell = refs.keep(_string(cf, value))
+        cf.CFDictionarySetValue(table, refs.keep(_string(cf, key)), cell)
     return table
 
 
@@ -264,6 +280,7 @@ def mount(
     user: str | None = None,
     password: str | None = None,
     allow_ui: bool = False,
+    force_new_session: bool = True,
 ) -> str:
     """Mount `smb://host/share` and return where it landed.
 
@@ -287,9 +304,21 @@ def mount(
                 detail=f"{url!r} could not be parsed as one",
             )
 
-        opens = _options(
-            cf, refs, {} if allow_ui else {UI_OPTION_KEY: UI_OPTION_NO_UI}
-        )
+        options: dict[str, str | bool] = {}
+        if not allow_ui:
+            options[UI_OPTION_KEY] = UI_OPTION_NO_UI
+        if force_new_session:
+            # **Default on, and it cost an evening to learn why.** macOS keeps
+            # the credential for a server after the last unmount, below
+            # NetAuthAgent -- which is SIP-protected and cannot be restarted --
+            # so a second mount succeeds on the strength of the first. On
+            # 2 October 2026 that produced a mount with the Keychain item
+            # deleted, with a deliberately wrong item, and addressed by IP, and
+            # it took a reboot to get an honest answer. A stale session also
+            # masks a credential that has since changed, which is the case a
+            # person meets after fixing a password.
+            options[FORCE_NEW_SESSION_KEY] = True
+        opens = _options(cf, refs, options)
         mounts = _options(cf, refs, {})
 
         out = ctypes.c_void_p()

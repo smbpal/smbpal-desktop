@@ -36,6 +36,7 @@ import logging
 import os
 import re
 import socket
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -383,8 +384,41 @@ class MountProbe:
 SMB_PORT = 445
 
 
-def server_reachable(host: str, *, port: int = SMB_PORT, timeout: float = 1.5) -> bool:
+# Loopback is exempt from the gate below, measured on 2 October 2026: a
+# connection to 127.0.0.1 from the same binary that could not reach a LAN
+# address succeeded in 0.001 s. So the question is per host, not per platform.
+_LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
+
+
+def can_probe(host: str) -> bool:
+    """Whether a TCP probe from this process means anything at all.
+
+    **False on macOS, measured on 2 October 2026 and not a guess.** macOS's
+    Local Network privacy gate refuses an unapproved binary *instantly* —
+    `EHOSTUNREACH` in 0.00 s to a LAN address, and `EAI_NONAME` for any
+    `.local` name. Same code, same instant, Apple's `/usr/bin/python3`
+    connected and Homebrew's did not; the grant is per binary identity and
+    SMBPal has no way to ask for one without an application bundle carrying
+    `NSLocalNetworkUsageDescription`, which §11.1 defers along with the `.app`.
+
+    The mount is unaffected, because NetFS does its networking in a process
+    that has the grant — which is exactly why this has to be a separate
+    question. A `False` from `server_reachable` there would mean "we were not
+    allowed to ask", and showing that as "nothing is listening" is the D14
+    defect in its purest form: it was telling people a serving Pi was off.
+    """
+    if sys.platform != "darwin":
+        return True
+    return host in _LOOPBACK or host.endswith(".localhost")
+
+
+def server_reachable(
+    host: str, *, port: int = SMB_PORT, timeout: float = 1.5
+) -> bool | None:
     """Whether something answers on the SMB port at `host`, right now.
+
+    **None means the question could not be asked** — see `can_probe`. A caller
+    must not render it as a no.
 
     A plain TCP connect and nothing more: no SMB, no credentials. It answers
     "is that machine on the network I am on", which is the question
@@ -392,6 +426,8 @@ def server_reachable(host: str, *, port: int = SMB_PORT, timeout: float = 1.5) -
     that does not resolve is simply not reachable here; the monitor asks again
     on its next tick.
     """
+    if not can_probe(host):
+        return None
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True

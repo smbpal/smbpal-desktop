@@ -8,6 +8,7 @@ and no new security thinking.
 from __future__ import annotations
 
 import logging
+import sys
 import os
 import pwd
 from typing import Any, Callable
@@ -694,6 +695,14 @@ class Dispatcher:
             in_use=(
                 self.mounter.occupied_mountpoints() if self.mounter is not None else None
             ),
+            # **The daemon's platform, not the pure function's default.**
+            # `platform_style` falls back to Linux for anything it is not told,
+            # which was right when a Mac could only ever be a development
+            # machine editing a Pi's config. A macOS daemon manages its own
+            # machine (D4 is local-only), and on 2 October 2026 this derived
+            # `/media/luke/Testshare` on a Mac -- a path macOS ignores and the
+            # agent could not create either, since `/Volumes` is root:wheel.
+            style=ops.platform_style(sys.platform),
         )
         self._commit(previous, updated)
         if self.monitor is not None:
@@ -945,7 +954,15 @@ class Dispatcher:
         connection = self._connection_for(request)
         agent = self.agents.for_uid(peer.uid)
         url = _smb_url(connection)
-        landed = agent.mount(url, user=self._username_for(connection))
+        landed = agent.mount(
+            url,
+            user=self._username_for(connection),
+            # The Keychain is keyed by server *and* account, and this is the
+            # string the credential was stored under. The agent could take it
+            # from the URL, but `urlsplit` lowercases a hostname and the
+            # stored key is this record's `host` verbatim.
+            host=str(connection["host"]),
+        )
         _audit(peer, "connection.connect", connection["id"])
         return {
             "id": connection["id"],
@@ -1026,7 +1043,9 @@ class Dispatcher:
             "mountpoint": connection["mountpoint"],
             "unmounted": unmounted,
             "note": (
-                "Unmounted. macOS will not mount it again by itself — "
+                # No leading "Unmounted.": the CLI's line already starts with
+                # the verb, and the two together read "unmounted X; unmounted."
+                "macOS will not mount it again by itself — "
                 "`smbpal connection connect` does."
                 if unmounted
                 else "Nothing was mounted there, so nothing changed."
