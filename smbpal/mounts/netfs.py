@@ -33,10 +33,13 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import errno as _errno
+import logging
 import sys
 from typing import Any
 
 from smbpal.errors import SmbpalError
+
+log = logging.getLogger(__name__)
 
 CF_PATH = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
 NETFS_PATH = "/System/Library/Frameworks/NetFS.framework/NetFS"
@@ -320,21 +323,37 @@ def mount(
 MNT_FORCE = 0x00080000
 
 
-def unmount(mountpoint: str, *, force: bool = False) -> None:
-    """Take a mount away. The automount, if any, may put it straight back.
+# `unmount(2)` returns these when the path is not a mount point, which is the
+# state a caller asking for an unmount wanted to reach. Found on 2 October 2026
+# by disconnecting a connection that had never mounted: `ENOENT` went through
+# the mount table and came back as *the server has no share by that name*, which
+# is what that number means for a **mount** and has nothing to do with this one.
+# Two operations, one errno, two causes -- D14, and the message named the wrong
+# one. Taking them as success also makes disconnect idempotent, which is what
+# `systemd.stop` on a stopped unit already does on Linux.
+_ALREADY_UNMOUNTED = frozenset(
+    code for code in (_status("ENOENT"), _status("EINVAL")) if code is not None
+)
 
-    That is not this function's business and it is the finding pop-os.md §5
-    recorded: on a desktop whose file manager watches the mountpoint, an
-    unmount is undone before the screen redraws. Saying so is the caller's job
-    -- `connection.disconnect` does it -- because only the caller knows whether
-    a person is watching.
+
+def unmount(mountpoint: str, *, force: bool = False) -> bool:
+    """Take a mount away. False if there was nothing there to take.
+
+    The automount, if any, may put it straight back. That is not this
+    function's business and it is the finding pop-os.md §5 recorded: on a
+    desktop whose file manager watches the mountpoint, an unmount is undone
+    before the screen redraws. Saying so is the caller's job -- macOS has no
+    automount at all, so the two platforms owe a person different sentences.
     """
     loaded = _frameworks()
     libc = loaded["libc"]
     ctypes.set_errno(0)
     if libc.unmount(mountpoint.encode(), MNT_FORCE if force else 0) == 0:
-        return
+        return True
     code = ctypes.get_errno()
+    if code in _ALREADY_UNMOUNTED:
+        log.info("nothing was mounted at %s", mountpoint)
+        return False
     _state, message, _retryable = describe(code)
     raise NetFSError(
         message if code in _STATUS else f"could not unmount {mountpoint}",

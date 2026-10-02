@@ -175,7 +175,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     connection_connect.add_argument("ref", help="connection id or mountpoint")
     connection_disconnect = connection_cmds.add_parser(
-        "disconnect", help="unmount now (the automount will remount on next access)"
+        # No promise about what happens next: that depends on the platform,
+        # and the daemon says it in its reply.
+        "disconnect",
+        help="unmount now",
     )
     connection_disconnect.add_argument("ref", help="connection id or mountpoint")
 
@@ -763,11 +766,31 @@ def _cmd_connection_connect(client: Client, args: argparse.Namespace) -> int:
 
 def _cmd_connection_disconnect(client: Client, args: argparse.Namespace) -> int:
     result = client.call("connection.disconnect", {"ref": args.ref})
-    return _emit(
-        args,
-        result,
-        lambda: f"unmounted {result['id']}; it will remount on next access",
-    )
+    # **The daemon's sentence, not ours.** This used to say "it will remount on
+    # next access" unconditionally, which is a Linux automount talking: on
+    # macOS nothing remounts it, and when nothing was mounted in the first
+    # place nothing happened at all. The daemon knows which of the three it
+    # was and sends a `note`; repeating a guess over the top of it is the
+    # defect D14 names, and it survived here because the daemon's note was
+    # added for the window and the CLI was never looked at again.
+    return _emit(args, result, lambda: _disconnect_line(result))
+
+
+def _disconnect_line(result: dict[str, Any]) -> str:
+    """One line, and the verb has to match what happened.
+
+    `unmounted X; nothing was mounted there` was the first attempt, and it
+    claims an unmount in its first word and denies it in its last. `unmounted`
+    missing means a daemon that does not report it -- the systemd path, where
+    stopping the unit is the whole operation -- so it defaults to true and
+    Linux reads exactly as it did.
+    """
+    if not result.get("unmounted", True):
+        return f"{result['id']} was not mounted, so nothing changed"
+    note = result.get("note")
+    if not note:
+        return f"unmounted {result['id']}"
+    return f"unmounted {result['id']}; {note[0].lower()}{note[1:]}"
 
 
 def _read_password(args: argparse.Namespace, prompt: str) -> str | None:

@@ -103,6 +103,38 @@ class TestOneCauseSaysOneThing(unittest.TestCase):
         self.assert_same_sentence(2, "ENOENT")
 
 
+class TestUnmountingSomethingThatIsNotMounted(unittest.TestCase):
+    """One errno, two operations, two causes -- and the message named one.
+
+    `unmount(2)` returns `ENOENT` when the path is not a mount point. The mount
+    table gives `ENOENT` *the server has no share by that name*, which is what
+    it means for a mount and is nothing to do with this. Found on 2 October 2026
+    by disconnecting a connection that had never mounted, through the daemon and
+    the agent, and getting an error about a share.
+    """
+
+    def test_the_numbers_that_mean_there_was_nothing_there(self) -> None:
+        self.assertEqual(netfs._ALREADY_UNMOUNTED, frozenset({errno.ENOENT, errno.EINVAL}))
+
+    def test_those_two_are_not_treated_as_mount_failures(self) -> None:
+        # Both have a mount meaning in the table, which is exactly the trap.
+        for code in netfs._ALREADY_UNMOUNTED:
+            with self.subTest(code=code):
+                if code in netfs._STATUS:
+                    state, _message, _retryable = netfs.describe(code)
+                    self.assertNotEqual(
+                        state,
+                        "mounted",
+                        "the mount meaning of this number must not be the unmount meaning",
+                    )
+
+    @unittest.skipIf(sys.platform == "darwin", "this is the not-macOS case")
+    def test_the_rule_is_readable_without_the_frameworks(self) -> None:
+        # The constant is built from `errno`, so it is correct on Linux too and
+        # a reader of this test does not need a Mac to check it.
+        self.assertIn(2, netfs._ALREADY_UNMOUNTED)
+
+
 @darwin_only
 class TestAgainstTheRealFrameworks(unittest.TestCase):
     """No network, no credential, no mount. Only that the glue holds.

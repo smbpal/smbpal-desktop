@@ -19,6 +19,7 @@ from smbpal.cli.main import (
     EXIT_ERROR,
     EXIT_NO_DAEMON,
     EXIT_OK,
+    _disconnect_line,
     connection_notes,
     main,
 )
@@ -494,6 +495,40 @@ class TestUnaccounted(CliTestCase):
         )
         _, out, _ = self.run_cli("status")
         self.assertNotIn("Not in the config", out)
+
+
+
+class TestTheDisconnectLine(unittest.TestCase):
+    """The verb has to match what happened, on both platforms.
+
+    The CLI said "it will remount on next access" unconditionally -- a Linux
+    automount talking. On macOS nothing remounts it, and when nothing was
+    mounted nothing happened at all. The daemon knows which of the three it was
+    and says so in `note`; this stopped printing over the top of it.
+    """
+
+    def line(self, **result: object) -> str:
+        return _disconnect_line({"id": "nas-media", **result})
+
+    def test_a_daemon_that_reports_nothing_gets_the_plain_line(self) -> None:
+        # The systemd path sends no `unmounted` key, so Linux must read exactly
+        # as it did before any of this.
+        self.assertEqual(self.line(), "unmounted nas-media")
+
+    def test_the_daemons_note_is_used_rather_than_a_guess(self) -> None:
+        line = self.line(note="It will mount again as soon as anything opens the folder.")
+        self.assertEqual(
+            line,
+            "unmounted nas-media; it will mount again as soon as anything "
+            "opens the folder.",
+        )
+
+    def test_nothing_mounted_does_not_claim_an_unmount(self) -> None:
+        # "unmounted X; nothing was mounted there" was the first attempt, and
+        # it claims an unmount in its first word and denies it in its last.
+        line = self.line(unmounted=False, note="Nothing was mounted there.")
+        self.assertEqual(line, "nas-media was not mounted, so nothing changed")
+        self.assertNotIn("unmounted", line)
 
 
 if __name__ == "__main__":

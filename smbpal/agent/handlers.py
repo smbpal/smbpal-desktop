@@ -13,6 +13,13 @@ so the only question is whether the peer is that person. `ipc/peer.py` answers
 it from the kernel, and it already implements macOS: `getpeereid(2)` gives uid
 and gid, and its docstring says why `pid` is optional rather than a lie.
 
+**And root, which is the caller this exists for.** The daemon asks on behalf of
+whoever asked it (`agent/client.py`), so it arrives as uid 0. Admitting root is
+not a hole: root can `launchctl asuser` into this session and run anything at
+all in it, including something that reads the Keychain, so refusing it here
+would protect nothing and would leave the daemon unable to mount. Every other
+uid stays refused, which is the question the kernel's answer actually settles.
+
 **A credential never lands here.** `mount` takes a password and hands it
 straight to `netfs.mount`, which makes it a `CFString` for the length of one
 call. It is not stored, not logged, and not echoed in an error — the detail on
@@ -77,8 +84,11 @@ class AgentDispatcher:
 
     def _unmount(self, request: Request) -> dict[str, Any]:
         mountpoint = _require_str(request.params, "mountpoint")
-        self.mounter.unmount(mountpoint)
-        return {"mountpoint": mountpoint}
+        # `unmount` is idempotent and says which it was, so the caller can tell
+        # a person "unmounted" from "there was nothing mounted there" rather
+        # than reporting the first for both.
+        unmounted = bool(self.mounter.unmount(mountpoint))
+        return {"mountpoint": mountpoint, "unmounted": unmounted}
 
     def _remount_url(self, request: Request) -> dict[str, Any]:
         mountpoint = _require_str(request.params, "mountpoint")
@@ -86,6 +96,17 @@ class AgentDispatcher:
             "mountpoint": mountpoint,
             "url": self.mounter.remount_url(mountpoint),
         }
+
+    # --- who may ask -------------------------------------------------------
+
+    def _may(self, uid: int) -> bool:
+        """The owner, and root. Nobody else, which is the real question.
+
+        See the module docstring for why root is not a loophole. Kept as a
+        method rather than inlined so that the one-line rule has one place to
+        be read, and so a test can state it as a rule rather than as a case.
+        """
+        return uid in (self.uid, 0)
 
     # --- the wire ----------------------------------------------------------
 
@@ -99,7 +120,7 @@ class AgentDispatcher:
             method = self._methods().get(request.method)
             if method is None:
                 raise UnknownMethod(f"no such method: {request.method}")
-            if connection.peer.uid != self.uid:
+            if not self._may(connection.peer.uid):
                 raise NotYours(
                     "this agent serves one person and you are not them",
                     detail=(
@@ -109,6 +130,18 @@ class AgentDispatcher:
                 )
             return encode_success(request.id, method(request))
         except SmbpalError as exc:
+            # **The agent's stderr is a log file**, which is the whole point of
+            # the plist's `StandardErrorPath` — and until now a refused mount
+            # wrote nothing to it. The only record of why was the reply, which
+            # goes to the daemon and is gone. Found on 2 October 2026, by
+            # reading an empty log after a mount that failed. The method and the
+            # code; never the params, one of which can be a password.
+            log.info(
+                "%s -> %s: %s",
+                request.method if request else "<unparsed>",
+                exc.code,
+                exc.message,
+            )
             return encode_failure(request.id if request else None, exc)
         except Exception as exc:  # pragma: no cover - the last resort
             log.exception("agent failed to handle a request")

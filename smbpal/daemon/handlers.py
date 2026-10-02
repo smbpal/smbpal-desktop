@@ -11,8 +11,10 @@ import logging
 import os
 import pwd
 from typing import Any, Callable
+from urllib.parse import quote
 
 from smbpal import PROTOCOL_VERSION, __version__
+from smbpal.agent.client import AgentClients
 from smbpal.config import ConfigStore
 from smbpal.config import operations as ops
 from smbpal.discovery import discover
@@ -197,6 +199,7 @@ class Dispatcher:
         applier: Applier | None = None,
         mounter: Mounter | None = None,
         monitor: StateMonitor | None = None,
+        agents: AgentClients | None = None,
         identity: Callable[[], Identity] = identify,
     ) -> None:
         self.store = store
@@ -209,6 +212,10 @@ class Dispatcher:
         self.applier = applier
         self.mounter = mounter
         self.monitor = monitor
+        # Set on macOS, where mounting cannot happen here (D13). Not a second
+        # mounter: it is the same two operations, performed in the session of
+        # whoever asked, by the one process on that machine that is allowed to.
+        self.agents = agents
 
     def handle(self, connection: Connection, frame: bytes) -> bytes | None:
         request: Request | None = None
@@ -813,6 +820,8 @@ class Dispatcher:
     def _connection_connect(
         self, request: Request, peer: PeerCredentials
     ) -> dict[str, Any]:
+        if self.agents is not None:
+            return self._connect_via_agent(request, peer)
         connection, mount_name = self._unit_for(request)
         # Clear any latched failure first, or this "connect" is a promise we
         # cannot keep: systemd refuses a start-limited unit without running the
@@ -825,6 +834,8 @@ class Dispatcher:
     def _connection_disconnect(
         self, request: Request, peer: PeerCredentials
     ) -> dict[str, Any]:
+        if self.agents is not None:
+            return self._disconnect_via_agent(request, peer)
         connection, mount_name = self._unit_for(request)
         systemd.stop(mount_name, runner=self._runner())
         _audit(peer, "connection.disconnect", connection["id"])
@@ -842,6 +853,78 @@ class Dispatcher:
             "note": "Unmounted. It will mount again as soon as anything opens "
             "the folder, which on some desktops is immediately.",
         }
+
+    # --- mounting through a per-user agent (macOS, D13) --------------------
+
+    def _connect_via_agent(
+        self, request: Request, peer: PeerCredentials
+    ) -> dict[str, Any]:
+        """Mount in the session of whoever asked, not in this process.
+
+        **`peer.uid` is the whole reason this is safe to do.** The daemon acts
+        for everyone, so "which session" is not a question it may guess at: the
+        answer is the uid the kernel reported for this connection, the same one
+        polkit was asked about a moment ago. A mount for somebody else is not
+        something the protocol can even express.
+        """
+        connection = self._connection_for(request)
+        agent = self.agents.for_uid(peer.uid)
+        url = _smb_url(connection)
+        mountpoint = agent.mount(url, user=self._username_for(connection))
+        _audit(peer, "connection.connect", connection["id"])
+        return {"id": connection["id"], "url": url, "mountpoint": mountpoint}
+
+    def _disconnect_via_agent(
+        self, request: Request, peer: PeerCredentials
+    ) -> dict[str, Any]:
+        connection = self._connection_for(request)
+        agent = self.agents.for_uid(peer.uid)
+        unmounted = agent.unmount(connection["mountpoint"])
+        _audit(peer, "connection.disconnect", connection["id"])
+        # **The Linux note is false here and must not be repeated.** There it
+        # warns that the automount is still armed, so the share comes back the
+        # moment anything opens the folder. macOS has no automount: §6.8
+        # measured it refusing to reconnect a lost mount at all, which is the
+        # reason D13's agent exists. Saying "it will mount again" on a platform
+        # where it will not is the D14 defect with the sign reversed.
+        return {
+            "id": connection["id"],
+            "mountpoint": connection["mountpoint"],
+            "unmounted": unmounted,
+            "note": (
+                "Unmounted. macOS will not mount it again by itself — "
+                "`smbpal connection connect` does."
+                if unmounted
+                else "Nothing was mounted there, so nothing changed."
+            ),
+        }
+
+    def _connection_for(self, request: Request) -> dict[str, Any]:
+        """The connection, with no opinion about how it gets mounted.
+
+        `_unit_for` cannot serve here: it names a systemd unit, and it refuses
+        when `--no-apply` left the daemon without a mounter — which is the
+        normal state of a macOS daemon, since there is no Samba for it to
+        apply to and no systemd to apply with.
+        """
+        return _find_connection(
+            self.store.load(), _require_str(request.params, "ref")
+        )
+
+    def _username_for(self, connection: dict[str, Any]) -> str | None:
+        """The username, and never the password.
+
+        `CredentialsStore` has `username_for` and deliberately has no
+        `password_for`: that file is written for `mount.cifs` to read, and the
+        daemon reading it back would make root a party to every credential it
+        stores. On macOS it does not have to be — the credential belongs to the
+        session, in the login Keychain the agent can read and root cannot
+        (D13). So this hands over a name and lets the session supply the rest.
+        """
+        ref = connection.get("credential_ref")
+        if not ref or self.mounter is None:
+            return None
+        return self.mounter.credentials.username_for(str(ref))
 
     def _unit_for(self, request: Request) -> tuple[dict[str, Any], str]:
         if self.mounter is None:
@@ -938,6 +1021,28 @@ def _find_connection(config: dict[str, Any], ref: str) -> dict[str, Any]:
         if connection.get("id") == ref or connection.get("mountpoint") == ref:
             return connection
     raise NotFound(f"no connection called {ref!r}")
+
+
+def _smb_url(connection: dict[str, Any]) -> str:
+    """`smb://host/share`, and nothing else in it.
+
+    **No username and no password, deliberately.** `mount_smbfs` takes the
+    credential in the URL, which is the reason §3.2 ruled it out: a URL is the
+    kind of string that ends up in an argv, a log line and a mount table.
+    `NetFSMountURLSync` takes both as separate arguments (D13), so the URL here
+    carries only what it has to.
+
+    The share name is percent-encoded because it is allowed to contain a space
+    — `netfs.mount` refuses a string CoreFoundation cannot parse as a URL, and
+    does it before touching the network, so this would fail as *not a URL*
+    rather than as anything to do with the share. An IPv6 literal is bracketed
+    for the same reason.
+    """
+    host = str(connection["host"])
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    share = quote(str(connection["share"]), safe="")
+    return f"smb://{host}/{share}"
 
 
 def _find_share(config: dict[str, Any], ref: str) -> dict[str, Any]:
