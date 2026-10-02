@@ -12,6 +12,7 @@ import grp
 import json
 import os
 import socket
+import sys
 import threading
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -120,6 +121,28 @@ DEFAULT_TIMEOUT = 10.0
 REPLY_TIMEOUT = 130.0
 
 
+def _how_to_start() -> str:
+    """What to do about a daemon that is not listening, where you are standing.
+
+    `systemctl start smbpald` is a Linux sentence, and on macOS it names a
+    command that does not exist. That matters now rather than later: a Homebrew
+    install puts the CLI on a Mac, where this is the **first** message anybody
+    reads, and sending them to `systemctl` would send them looking for something
+    they cannot install (D14 — a message may not name a fix that is not one).
+
+    There is no daemon on macOS yet by design rather than by omission: D13 put
+    mounting in a per-user agent because it needs no elevation there, and the
+    privileged half that serves shares is deferred with the `.app`.
+    """
+    if sys.platform == "darwin":
+        return (
+            "There is no SMBPal daemon on macOS yet. Mounting runs in the "
+            "per-user agent — `smbpal-agent --status` — and serving shares is "
+            "not ported."
+        )
+    return "Start it with: systemctl start smbpald"
+
+
 class Client:
     """A synchronous request/response client with an optional event callback."""
 
@@ -158,7 +181,7 @@ class Client:
                 # correct ... but it must produce a clear error, not a stack trace."
                 raise DaemonUnreachable(
                     f"no SMBPal daemon is listening on {self.path}",
-                    detail="Start it with: systemctl start smbpald",
+                    detail=_how_to_start(),
                 ) from exc
             if exc.errno == errno.EACCES:
                 raise DaemonUnreachable(

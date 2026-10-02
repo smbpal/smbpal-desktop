@@ -1,3 +1,22 @@
+smbpal (0.2.6) trixie; urgency=medium
+
+  * macOS groundwork. On Linux this release changes nothing you can see,
+    except that the package now ships an `smbpal-agent` command which exists
+    for macOS and says so when it is run here.
+  * Mounting on macOS is implemented, and it runs in a per-user agent rather
+    than in the daemon. Two measurements put it there: mounting on macOS
+    needs no elevation at all, and the login Keychain -- where the password
+    belongs -- cannot be read by root.
+  * The agent installs itself with `smbpal-agent --install`, which writes a
+    LaunchAgent and loads it. `--status` says whether launchd has it, is
+    retrying it after a failure, or is pointing at a program that has moved,
+    because `launchctl` reports all three the same way.
+  * `smbpal` no longer tells a Mac user to run `systemctl`. There is no
+    SMBPal daemon on macOS yet, and naming a command the platform does not
+    have sent people looking for something they could not install.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Fri, 02 Oct 2026 14:50:00 +0100
+
 smbpal (0.2.5) trixie; urgency=medium
 
   * Three messages say what they mean. Each was accurate and each named a
@@ -18,7 +37,7 @@ smbpal (0.2.5) trixie; urgency=medium
     for the computer you typed the command on. It is now headed SHARING
     NOW.
 
- -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Tue, 30 Sep 2026 20:00:00 +0100
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Wed, 30 Sep 2026 20:00:00 +0100
 
 smbpal (0.2.4) trixie; urgency=medium
 

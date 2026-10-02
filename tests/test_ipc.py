@@ -7,6 +7,7 @@ import json
 import os
 import socket
 import stat
+import sys
 import tempfile
 import threading
 import unittest
@@ -27,7 +28,7 @@ from smbpal.errors import (
     UnknownMethod,
     UnsupportedVersion,
 )
-from smbpal.ipc.client import Client
+from smbpal.ipc.client import Client, _how_to_start
 from smbpal.ipc.peer import PeerCredentials
 from smbpal.ipc.protocol import MAX_FRAME_BYTES, encode_event
 from smbpal.ipc.server import UnixSocketTransport
@@ -579,7 +580,20 @@ class TestClientWithoutDaemon(unittest.TestCase):
             with self.assertRaises(DaemonUnreachable) as caught:
                 client.connect()
             self.assertIn("no SMBPal daemon", caught.exception.message)
-            self.assertIn("systemctl start smbpald", caught.exception.detail or "")
+            self.assertIn(_how_to_start(), caught.exception.detail or "")
+
+    def test_it_does_not_send_a_mac_user_to_systemctl(self) -> None:
+        """The first message a Homebrew install produces, and it was wrong.
+
+        `systemctl start smbpald` names a command macOS does not have, for a
+        daemon that is not ported there. Found by running the CLI on a Mac on
+        2 October 2026, while writing the formula that puts it there.
+        """
+        if sys.platform == "darwin":
+            self.assertNotIn("systemctl", _how_to_start())
+            self.assertIn("smbpal-agent", _how_to_start())
+        else:
+            self.assertIn("systemctl", _how_to_start())
 
 
 class TestWhyTheSocketRefusedUs(unittest.TestCase):

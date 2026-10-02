@@ -19,7 +19,9 @@ was the total dropping, which nothing was watching.
 from __future__ import annotations
 
 import ast
+import datetime
 import os
+import re
 import unittest
 import warnings
 from pathlib import Path
@@ -605,35 +607,55 @@ class TestTheLicence(unittest.TestCase):
         )
 
 
-class TestTheRpmChangelogDatesAreRealDays(unittest.TestCase):
+class TestTheChangelogDatesAreRealDays(unittest.TestCase):
     """rpmbuild warns "bogus date" and builds anyway, so nobody notices.
 
     0.2.5's entry said Tue for 30 September 2026, which is a Wednesday. It
     reached a published release, because a warning in four hundred lines of
     build output is not a signal. The weekday is derivable from the date, so
     nothing here is a matter of opinion.
+
+    **Both files, because the first version of this test only read one.** The
+    same wrong Tuesday was in `debian/changelog` as well, where lintian reports
+    it as a warning rather than an error and CI is set to fail only on errors.
+    Fixing one copy of a duplicated fact and testing that copy is how the second
+    one survives.
     """
 
-    def test_every_changelog_entry_names_the_right_weekday(self) -> None:
-        import datetime
-        import re
-        from pathlib import Path
+    def changelog(self, name: str) -> str:
+        return (Path(__file__).resolve().parent.parent / name).read_text()
 
-        spec = Path(__file__).resolve().parent.parent / "packaging/rpm/smbpal.spec"
-        entries = re.findall(
-            r"^\* (\w{3}) (\w{3}) (\d{1,2}) (\d{4}) ", spec.read_text(), re.M
-        )
+    def assert_weekdays(self, entries, parse: str) -> None:
         self.assertTrue(entries, "no changelog entries found; the regex has rotted")
-        for weekday, month, day, year in entries:
-            with self.subTest(entry=f"{weekday} {month} {day} {year}"):
-                real = datetime.datetime.strptime(
-                    f"{month} {day} {year}", "%b %d %Y"
-                ).date()
+        for weekday, *rest in entries:
+            stamp = " ".join(rest)
+            with self.subTest(entry=f"{weekday} {stamp}"):
+                real = datetime.datetime.strptime(stamp, parse).date()
                 self.assertEqual(
                     weekday,
                     real.strftime("%a"),
-                    f"{month} {day} {year} is a {real.strftime('%a')}",
+                    f"{stamp} is a {real.strftime('%a')}",
                 )
+
+    def test_every_rpm_changelog_entry_names_the_right_weekday(self) -> None:
+        self.assert_weekdays(
+            re.findall(
+                r"^\* (\w{3}) (\w{3}) (\d{1,2}) (\d{4}) ",
+                self.changelog("packaging/rpm/smbpal.spec"),
+                re.M,
+            ),
+            "%b %d %Y",
+        )
+
+    def test_every_debian_changelog_entry_names_the_right_weekday(self) -> None:
+        self.assert_weekdays(
+            re.findall(
+                r"^ -- .*  (\w{3}), (\d{2}) (\w{3}) (\d{4}) ",
+                self.changelog("packaging/debian/changelog"),
+                re.M,
+            ),
+            "%d %b %Y",
+        )
 
 
 class TestTheVersionIsOneNumber(unittest.TestCase):
