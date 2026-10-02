@@ -10,7 +10,7 @@
 # no second removal step.
 
 Name:           smbpal
-Version:        0.2.5
+Version:        0.2.6
 Release:        1%{?dist}
 Summary:        Share folders over SMB, and connect to shares on other machines
 
@@ -256,6 +256,17 @@ fi
 %{_datadir}/icons/hicolor/scalable/status/smbpal-attention.svg
 
 %changelog
+* Fri Oct 02 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.6-1
+- macOS groundwork. On Linux nothing visible changes, except that the package
+  now ships an `smbpal-agent` command which exists for macOS and says so.
+- Mounting on macOS is implemented, in a per-user agent rather than in the
+  daemon: mounting there needs no elevation, and the login Keychain that holds
+  the password cannot be read by root.
+- `smbpal-agent --install` writes a LaunchAgent and loads it; `--status` tells a
+  working agent from one launchd is retrying from one whose program has moved.
+- `smbpal` no longer tells a Mac user to run `systemctl` for a daemon that is
+  not ported there.
+
 * Wed Sep 30 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.5-1
 - A refused connection names both causes -- a stopped share and a blocked
   port look identical from here, and they are fixed in opposite ways -- and
