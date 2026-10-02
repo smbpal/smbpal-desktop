@@ -26,14 +26,19 @@ class FakeMounter:
     def __init__(self) -> None:
         self.mounted: list[tuple[str, str | None, str | None]] = []
         self.unmounted: list[str] = []
+        # What the real `netfs.unmount` returns: False when the path was not a
+        # mount point, which is a state a caller asked to reach rather than a
+        # failure. Settable, because the message for it differs.
+        self.unmount_result = True
 
     def mount(self, url: str, *, user: str | None = None,
               password: str | None = None) -> str:
         self.mounted.append((url, user, password))
         return "/Volumes/Media"
 
-    def unmount(self, mountpoint: str, *, force: bool = False) -> None:
+    def unmount(self, mountpoint: str, *, force: bool = False) -> bool:
         self.unmounted.append(mountpoint)
+        return self.unmount_result
 
     def remount_url(self, mountpoint: str) -> str | None:
         return "smb://nas.example/Media" if mountpoint == "/Volumes/Media" else None

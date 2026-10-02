@@ -18,6 +18,7 @@ from pathlib import Path
 from types import FrameType
 
 from smbpal import __version__, version_banner
+from smbpal.agent.client import AgentClients
 from smbpal.config import ConfigStore
 from smbpal.config.store import DEFAULT_CONFIG_PATH
 from smbpal.daemon.handlers import Authoriser, Dispatcher
@@ -73,6 +74,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_INTERVAL,
         help="seconds between connection state checks (default %(default)s)",
+    )
+    parser.add_argument(
+        "--mount-via",
+        choices=("auto", "systemd", "agent"),
+        default="auto",
+        help="who performs a mount. 'auto' (default) picks by platform: "
+        "systemd everywhere except macOS, where mounting cannot be done by a "
+        "root daemon at all and is delegated to the asking user's own "
+        "smbpal-agent (D13). The other two force it, which is for development.",
+    )
+    parser.add_argument(
+        "--agent-socket-dir",
+        type=Path,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--no-apply",
@@ -187,12 +203,30 @@ def main(argv: list[str] | None = None) -> int:
             prime=True,
         )
 
+    # **Mounting is the one thing that is not the same shape on both
+    # platforms.** On Linux the daemon writes a systemd unit and starts it; on
+    # macOS it cannot mount at all — an unprivileged `mount_smbfs` reached the
+    # network, and the login Keychain is unreadable from root, so both
+    # measurements point into the user's session (D13). `auto` is the whole of
+    # the platform decision, in one place, rather than a `sys.platform` test
+    # scattered through the handlers.
+    agents: AgentClients | None = None
+    if args.mount_via == "agent" or (
+        args.mount_via == "auto" and sys.platform == "darwin"
+    ):
+        agents = AgentClients(directory=args.agent_socket_dir)
+        log.info(
+            "mounting is delegated to each user's own smbpal-agent; "
+            "they install it with `smbpal-agent --install`"
+        )
+
     dispatcher = Dispatcher(
         store,
         authoriser=Authoriser(policy=args.authorisation),
         applier=applier,
         mounter=mounter,
         monitor=monitor,
+        agents=agents,
     )
     # Logged at every start, not only when it is interesting. A line saying
     # which rules are in force is worth nothing if it only appears when they
