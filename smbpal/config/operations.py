@@ -263,6 +263,7 @@ def add_connection(
     owner: str | None = None,
     fallback_host: str | None = None,
     in_use: set[str] | None = None,
+    style: MountpointStyle | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     result = copy.deepcopy(doc)
     connections = result.setdefault("connections", [])
@@ -279,6 +280,10 @@ def add_connection(
             owner,
             {c.get("mountpoint") for c in connections} | (in_use or set()),
             host=host,
+            # The daemon passes its own platform. Left to the default this is
+            # Linux, which on a Mac derives a path macOS ignores -- see
+            # `platform_style` and the daemon's call.
+            style=style,
         )
 
     # **Same host and share first, because the mountpoint check cannot see it.**

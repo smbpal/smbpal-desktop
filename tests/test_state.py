@@ -642,6 +642,36 @@ class TestPriming(MonitorTestCase):
 class TestIsTheServerThere(unittest.TestCase):
     """The real TCP check, against a listener this test owns."""
 
+    def test_a_host_it_may_not_ask_about_answers_none_not_false(self) -> None:
+        """**None and False are different answers and were the same one.**
+
+        macOS's Local Network privacy gate refuses an unapproved binary
+        instantly -- `EHOSTUNREACH` in 0.00 s to a LAN address, measured on
+        2 October 2026 against a Pi that was serving at the time. Rendering
+        that as "nothing answers on port 445" is what `connection add` was
+        printing about a working server.
+        """
+        import sys as _sys
+
+        from smbpal.mounts import probe as probe_module
+
+        if _sys.platform == "darwin":
+            self.assertIsNone(probe_module.server_reachable("nas.example"))
+            self.assertFalse(probe_module.can_probe("nas.example"))
+        else:
+            self.assertTrue(probe_module.can_probe("nas.example"))
+            self.assertIsNotNone(probe_module.server_reachable("nas.example"))
+
+    def test_loopback_is_exempt_so_the_question_is_per_host(self) -> None:
+        # Measured: a connection to 127.0.0.1 from the same binary that could
+        # not reach a LAN address succeeded in 0.001 s. A blanket "macOS cannot
+        # probe" would decline to answer a question it can answer.
+        from smbpal.mounts import probe as probe_module
+
+        for host in ("localhost", "127.0.0.1", "::1", "dev.localhost"):
+            with self.subTest(host=host):
+                self.assertTrue(probe_module.can_probe(host))
+
     def test_a_listening_port_is_reachable_and_a_closed_one_is_not(self) -> None:
         import socket
 

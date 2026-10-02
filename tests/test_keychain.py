@@ -37,29 +37,42 @@ class TestItImportsAnywhere(unittest.TestCase):
         self.assertIn("mount.cifs", caught.exception.detail or "")
 
 
-class TestThereIsNoWayToReadAPasswordBack(unittest.TestCase):
-    """The rule, as a test, because a convenience would otherwise arrive quietly.
+class TestWhoIsAllowedToReadAPassword(unittest.TestCase):
+    """**This rule was reversed by a measurement, and the test says so.**
 
-    `CredentialsStore` has `username_for` and no `password_for`, for the same
-    reason: the store exists so that something *else* can read it -- there
-    `mount.cifs`, here NetAuthAgent -- and a process that reads a secret it does
-    not need is a process that can leak one. It also keeps the agent away from
-    the one call that can block on a Keychain dialog, since an attributes-only
-    lookup needs no access to the data.
+    It began as `set`, `present`, `forget` and no read: the store exists so
+    that something *else* can read it, the way `mount.cifs` reads the file
+    `CredentialsStore` writes. NetAuthAgent turned out not to read it when
+    asked not to show UI -- measured against a real server on 2 October 2026 --
+    and the NetFS header has no option to turn the lookup on without permitting
+    a dialog a launchd agent must not raise.
+
+    **So what is asserted now is the property that actually mattered**, which
+    is not "nobody reads it" but "only the session does". The daemon runs as
+    root, cannot read this Keychain, and has nowhere to put a password it
+    fetched: the mount call on its own client carries none.
     """
 
-    def test_the_public_surface_is_set_present_and_forget(self) -> None:
-        public = {
-            name
-            for name in vars(keychain)
-            if not name.startswith("_") and callable(getattr(keychain, name))
-        }
-        self.assertEqual(
-            public & {"set_password", "present", "forget", "available"},
-            {"set_password", "present", "forget", "available"},
-        )
-        for forbidden in ("get_password", "password_for", "read_password", "copy_password"):
-            self.assertNotIn(forbidden, public)
+    def test_the_session_can_read_it(self) -> None:
+        self.assertTrue(callable(keychain.get_password))
+
+    def test_the_daemons_own_store_still_cannot(self) -> None:
+        # The Linux half of the same rule, unchanged: that file is written for
+        # `mount.cifs` to read, and a daemon reading it back would make root a
+        # party to every credential it stores.
+        from smbpal.mounts.credentials import CredentialsStore
+
+        self.assertTrue(hasattr(CredentialsStore, "username_for"))
+        for forbidden in ("password_for", "get_password", "read_password"):
+            self.assertFalse(hasattr(CredentialsStore, forbidden), forbidden)
+
+    def test_and_the_mount_call_between_them_carries_no_password(self) -> None:
+        # The agent fetches the credential itself, so the one call that crosses
+        # the daemon-to-agent boundary on the mount path still has no secret in
+        # it. `credential_set` remains the only one that does.
+        from smbpal.agent.client import AgentClient
+
+        self.assertNotIn("password", AgentClient.mount.__code__.co_varnames)
 
 
 @darwin_only
@@ -96,6 +109,14 @@ class TestAgainstTheRealKeychain(unittest.TestCase):
         self.assertEqual(
             keychain.set_password(HOST, self.account, "throwaway-second"), "replaced"
         )
+
+    def test_the_password_comes_back_exactly(self) -> None:
+        secret = "throwaway-with-£-and-a-space"
+        keychain.set_password(HOST, self.account, secret)
+        self.assertEqual(keychain.get_password(HOST, self.account), secret)
+
+    def test_reading_one_that_is_not_there_is_none_not_an_error(self) -> None:
+        self.assertIsNone(keychain.get_password(HOST, f"{self.account}-absent"))
 
     def test_forgetting_nothing_is_not_a_failure(self) -> None:
         # The shape `netfs.unmount` and `launchd.bootout` already have: a

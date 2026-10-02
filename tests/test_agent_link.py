@@ -58,6 +58,9 @@ class FakeKeychain:
         self.items[key] = password
         return "replaced" if existed else "created"
 
+    def get_password(self, host: str, account: str) -> str | None:
+        return self.items.get((host, account))
+
     def present(self, host: str, account: str) -> bool:
         return (host, account) in self.items
 

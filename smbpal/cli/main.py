@@ -710,7 +710,15 @@ def _cmd_connection_add(client: Client, args: argparse.Namespace) -> int:
             lines.append(f"  {stored['note']}")
     else:
         lines.append("  no credentials: it will mount as a guest")
-    if server_reachable(connection["host"]):
+    reachable = server_reachable(connection["host"])
+    if reachable is None:
+        # The probe could not be run -- macOS refuses it (see `can_probe`).
+        # Both branches below would be false here:
+        # the first claims nothing answers, which was being printed about a
+        # server that was serving, and the second promises an automount this
+        # platform does not have. So say neither.
+        pass
+    elif reachable:
         lines.append("  it will mount on first access")
     else:
         # Asked here because this is where somebody is still watching. A name

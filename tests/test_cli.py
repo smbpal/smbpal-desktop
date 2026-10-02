@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import sys
 import tempfile
 import threading
 import unittest
@@ -25,6 +26,7 @@ from smbpal.cli.main import (
     main,
 )
 from smbpal.config import ConfigStore
+from smbpal.config import operations
 from smbpal.mounts.apply import MARKER, Mounter
 from smbpal.mounts.credentials import CredentialsStore
 from smbpal.mounts.probe import MountProbe
@@ -216,9 +218,19 @@ class TestConnections(CliTestCase):
             "connection", "add", "nas.local", "Media", "--owner", "pi"
         )
         self.assertEqual(code, EXIT_OK)
-        self.assertIn("-> /media/pi/Media", out)
+        # The platform's own root, because the daemon now derives for the
+        # machine it runs on rather than always for Linux -- on a Mac it had
+        # been producing /media/<user>/..., a path macOS ignores.
+        expected = operations.default_mountpoint(
+            "Media", "pi", set(), host="nas.local",
+            style=operations.platform_style(sys.platform),
+        )
+        self.assertIn(f"-> {expected}", out)
+        # And it is written into the config rather than re-derived on read:
+        # defaulting is an input convenience, and a stored mountpoint that
+        # depends on which version of the function last ran is not a record.
         self.assertEqual(
-            self.store.load()["connections"][0]["mountpoint"], "/media/pi/Media"
+            self.store.load()["connections"][0]["mountpoint"], expected
         )
 
     def test_a_given_mountpoint_is_still_used(self) -> None:
