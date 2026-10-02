@@ -19,6 +19,7 @@ from smbpal.cli.main import (
     EXIT_ERROR,
     EXIT_NO_DAEMON,
     EXIT_OK,
+    _connect_line,
     _disconnect_line,
     connection_notes,
     main,
@@ -496,6 +497,37 @@ class TestUnaccounted(CliTestCase):
         _, out, _ = self.run_cli("status")
         self.assertNotIn("Not in the config", out)
 
+
+
+class TestTheConnectLine(unittest.TestCase):
+    """It read `result['unit']` unconditionally, which macOS does not send.
+
+    A mount through the agent has no systemd unit and the reply says
+    `mountpoint` instead, so the first successful macOS mount would have ended
+    in a `KeyError` traceback. Every macOS test until now was against a server
+    that does not exist, so only the failure path had ever run.
+    """
+
+    def test_linux_names_the_unit(self) -> None:
+        self.assertEqual(
+            _connect_line({"id": "nas-media", "unit": "mnt-nas.mount"}),
+            "mounted nas-media (mnt-nas.mount)",
+        )
+
+    def test_macos_names_the_mountpoint(self) -> None:
+        self.assertEqual(
+            _connect_line({"id": "nas-media", "mountpoint": "/Volumes/Media"}),
+            "mounted nas-media at /Volumes/Media",
+        )
+
+    def test_a_reply_with_neither_still_says_something(self) -> None:
+        self.assertEqual(_connect_line({"id": "nas-media"}), "mounted nas-media")
+
+    def test_the_note_about_a_moved_mountpoint_is_shown(self) -> None:
+        line = _connect_line(
+            {"id": "x", "mountpoint": "/Volumes/Media", "note": "macOS chose this."}
+        )
+        self.assertIn("macOS chose this.", line)
 
 
 class TestTheDisconnectLine(unittest.TestCase):

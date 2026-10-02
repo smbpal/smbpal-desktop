@@ -402,6 +402,80 @@ class TestTheDaemonStoresCredentialsThroughTheAgent(AgentLinkTestCase):
         )
 
 
+class TestWhereItActuallyLanded(AgentLinkTestCase):
+    """macOS chooses the mountpoint, so the record has to learn it.
+
+    `NetFSMountURLSync` is given no mountpath because `/Volumes` is
+    `root:wheel` and an unprivileged agent cannot create a directory there --
+    measured. So a stored mountpoint can be wrong, and
+    `connection.disconnect` unmounts the stored one. Left alone, a share would
+    stay mounted after a disconnect that reported success.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store = ConfigStore(self.root / "config.json")
+        self.store.save(
+            {
+                "version": 1,
+                "shares": [],
+                "connections": [
+                    {
+                        "type": "os",
+                        "id": "nas-media",
+                        "host": "nas.example",
+                        "share": "Media",
+                        "mountpoint": "/Users/someone/nas",
+                    }
+                ],
+            }
+        )
+        self.dispatcher = Dispatcher(self.store, agents=self.clients)
+        self.peer = PeerCredentials(uid=self.uid, gid=20)
+
+    def connect(self) -> dict:
+        request = Request(id="1", method="connection.connect", params={"ref": "nas-media"})
+        return Dispatcher._connection_connect(self.dispatcher, request, self.peer)
+
+    def stored(self) -> str:
+        return self.store.load()["connections"][0]["mountpoint"]
+
+    def test_the_record_learns_the_real_mountpoint(self) -> None:
+        result = self.connect()
+        self.assertEqual(result["mountpoint"], "/Volumes/Media")
+        self.assertEqual(self.stored(), "/Volumes/Media")
+        self.assertEqual(result["asked_for"], "/Users/someone/nas")
+
+    def test_and_says_so_rather_than_correcting_it_silently(self) -> None:
+        self.assertIn("macOS mounted this at", self.connect()["note"])
+
+    def test_disconnect_then_unmounts_what_is_really_there(self) -> None:
+        # The defect, at the level a person meets it: without the correction
+        # this unmounts /Users/someone/nas, finds nothing, and says so while
+        # the share stays mounted.
+        self.connect()
+        request = Request(
+            id="2", method="connection.disconnect", params={"ref": "nas-media"}
+        )
+        Dispatcher._connection_disconnect(self.dispatcher, request, self.peer)
+        self.assertEqual(self.agent.mounter.unmounted, ["/Volumes/Media"])
+
+    def test_a_mountpoint_that_was_already_right_is_left_alone(self) -> None:
+        # No note, and no config write: the common case, since /Volumes/<share>
+        # is what `default_mountpoint` derives on darwin anyway.
+        self.store.save(
+            {
+                **self.store.load(),
+                "connections": [
+                    {**self.store.load()["connections"][0], "mountpoint": "/Volumes/Media"}
+                ],
+            }
+        )
+        result = self.connect()
+        self.assertNotIn("note", result)
+        self.assertNotIn("asked_for", result)
+
+
 class TestTheUrlCarriesNothingItNeedNot(unittest.TestCase):
     def test_host_and_share_only(self) -> None:
         self.assertEqual(

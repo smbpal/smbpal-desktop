@@ -767,7 +767,27 @@ def _cmd_watch(client: Client, args: argparse.Namespace) -> int:
 
 def _cmd_connection_connect(client: Client, args: argparse.Namespace) -> int:
     result = client.call("connection.connect", {"ref": args.ref})
-    return _emit(args, result, lambda: f"mounted {result['id']} ({result['unit']})")
+    return _emit(args, result, lambda: _connect_line(result))
+
+
+def _connect_line(result: dict[str, Any]) -> str:
+    """What was mounted and where, in whichever terms the daemon used.
+
+    **This read `result['unit']` unconditionally**, which is a `KeyError` on
+    macOS: a mount through the agent has no systemd unit, and the reply says
+    `mountpoint` instead. A successful mount would have ended in a traceback —
+    and because every macOS test so far has been against a server that does
+    not exist, the failure path was the only one ever reached. Found by reading
+    on 2 October 2026, before the first real mount rather than during it.
+    """
+    line = f"mounted {result['id']}"
+    if result.get("unit"):
+        line += f" ({result['unit']})"
+    elif result.get("mountpoint"):
+        line += f" at {result['mountpoint']}"
+    if result.get("note"):
+        line += f"\n  {result['note']}"
+    return line
 
 
 def _cmd_connection_disconnect(client: Client, args: argparse.Namespace) -> int:

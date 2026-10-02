@@ -945,9 +945,68 @@ class Dispatcher:
         connection = self._connection_for(request)
         agent = self.agents.for_uid(peer.uid)
         url = _smb_url(connection)
-        mountpoint = agent.mount(url, user=self._username_for(connection))
+        landed = agent.mount(url, user=self._username_for(connection))
         _audit(peer, "connection.connect", connection["id"])
-        return {"id": connection["id"], "url": url, "mountpoint": mountpoint}
+        return {
+            "id": connection["id"],
+            "url": url,
+            "mountpoint": landed,
+            **self._record_where_it_landed(connection, landed),
+        }
+
+    def _record_where_it_landed(
+        self, connection: dict[str, Any], landed: str
+    ) -> dict[str, Any]:
+        """**macOS chooses the mountpoint, so the record has to learn it.**
+
+        `NetFSMountURLSync` is given no mountpath, by design: the directory has
+        to exist and `/Volumes` is `root:wheel`, so an unprivileged agent cannot
+        prepare the one place every Mac application looks. Measured 2 October
+        2026. Letting macOS choose always works; passing a path would work only
+        for a path inside the person's own home, which is the wrong place for a
+        network volume on that platform.
+
+        The consequence is a stored `mountpoint` that can be wrong, and
+        **`connection.disconnect` unmounts the stored one.** `/Volumes/Media`
+        is the derived default and is usually right, but a caller may name
+        anything, and two connections to a share of the same name disambiguate
+        differently here (`Media on rivendell`) from there (`Media-1`). So
+        prediction is unreliable in general and the only reliable source is the
+        mount itself.
+
+        Found by reading on 2 October 2026 rather than by running: the
+        disconnect test passed because nothing had been mounted, which is
+        exactly the case that hides it. Left alone, a share would stay mounted
+        after a disconnect that reported success.
+        """
+        if landed == connection.get("mountpoint"):
+            return {}
+        previous = self.store.load()
+        self.store.save(
+            {
+                **previous,
+                "connections": [
+                    {**candidate, "mountpoint": landed}
+                    if candidate["id"] == connection["id"]
+                    else candidate
+                    for candidate in previous.get("connections", [])
+                ],
+            }
+        )
+        log.info(
+            "%s mounted at %s, not %s; the record now says so",
+            connection["id"],
+            landed,
+            connection.get("mountpoint"),
+        )
+        return {
+            "asked_for": connection.get("mountpoint"),
+            "note": (
+                f"macOS mounted this at {landed} rather than "
+                f"{connection.get('mountpoint')} — it chooses the location, and "
+                "SMBPal has recorded where it went so that disconnecting finds it."
+            ),
+        }
 
     def _disconnect_via_agent(
         self, request: Request, peer: PeerCredentials
