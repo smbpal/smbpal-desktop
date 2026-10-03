@@ -1,3 +1,29 @@
+smbpal (0.2.7) trixie; urgency=medium
+
+  * macOS can mount a share, end to end, against a real server. On Linux this
+    release changes nothing you can see.
+  * The daemon asks your own agent to do the mounting. It connects to a socket
+    in your home directory and the agent checks which user is on the other end
+    before it acts, so root never holds the password and never reaches into
+    your Keychain.
+  * The password goes into your login Keychain, and the agent reads it back
+    from there. macOS will not consult the Keychain on behalf of a mount that
+    is forbidden to ask you anything, so SMBPal looks the password up itself.
+  * macOS picks the mountpoint, not SMBPal. A share named `Testshare` arrives
+    at `/Volumes/Testshare`, because `/Volumes` belongs to root and an agent
+    cannot prepare a directory there -- so SMBPal records where the share
+    landed instead of deciding beforehand.
+  * Every mount asks for a fresh session. macOS caches a server's credential
+    somewhere SMBPal cannot clear, which made a corrected password look broken
+    and a deleted one look as though it were still in use.
+  * Two macOS messages stopped misleading. Disconnecting says what it did once
+    rather than twice; and a machine that is serving a share is no longer
+    reported unreachable, which it never was -- macOS refuses local network
+    access to a program that has not been granted it, and SMBPal cannot ask
+    for that yet, so it now says nothing rather than something false.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Sat, 03 Oct 2026 10:20:00 +0100
+
 smbpal (0.2.6) trixie; urgency=medium
 
   * macOS groundwork. On Linux this release changes nothing you can see,

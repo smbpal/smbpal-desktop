@@ -10,7 +10,7 @@
 # no second removal step.
 
 Name:           smbpal
-Version:        0.2.6
+Version:        0.2.7
 Release:        1%{?dist}
 Summary:        Share folders over SMB, and connect to shares on other machines
 
@@ -256,6 +256,20 @@ fi
 %{_datadir}/icons/hicolor/scalable/status/smbpal-attention.svg
 
 %changelog
+* Sat Oct 03 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.7-1
+- macOS mounts a share end to end, against a real server. On Linux nothing
+  visible changes.
+- The daemon asks the user's own agent to mount, over the agent's socket, and
+  the agent checks the peer's uid: root never holds the password.
+- The password lives in the login Keychain and the agent reads it there,
+  because macOS will not consult the Keychain for a mount that may not prompt.
+- macOS chooses the mountpoint, so SMBPal records where the share landed
+  rather than deriving a path the platform ignores.
+- Every mount asks for a fresh session, because macOS caches a server
+  credential that SMBPal cannot clear.
+- On macOS, disconnect says what it did once rather than twice, and a serving
+  machine is no longer called unreachable when SMBPal was never allowed to ask.
+
 * Fri Oct 02 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.6-1
 - macOS groundwork. On Linux nothing visible changes, except that the package
   now ships an `smbpal-agent` command which exists for macOS and says so.
