@@ -25,6 +25,7 @@ from smbpal import version_banner
 from smbpal.cli.agent import TtyAgent
 from smbpal.cli.format import render_json, render_table
 from smbpal.discovery import identity
+from smbpal.discovery.shares import Share, mountable
 from smbpal.errors import DaemonUnreachable, NotFound, SmbpalError
 from smbpal.mounts.probe import server_reachable
 from smbpal.ipc.client import Client
@@ -751,6 +752,7 @@ def _cmd_connection_add(client: Client, args: argparse.Namespace) -> int:
         f"//{connection['host']}/{connection['share']} -> {connection['mountpoint']}"
     ]
 
+    password: str | None = None
     if args.user:
         password = _read_password(args, f"Password for {args.user}@{args.host}: ")
         if password is None:
@@ -773,6 +775,8 @@ def _cmd_connection_add(client: Client, args: argparse.Namespace) -> int:
             lines.append(f"  {stored['note']}")
     else:
         lines.append("  no credentials: it will mount as a guest")
+    wrong_name = _share_name_note(client, connection, args.user, password)
+    lines.extend(wrong_name)
     reachable = server_reachable(connection["host"])
     if reachable is None:
         # The probe could not be run -- macOS refuses it (see `can_probe`).
@@ -781,8 +785,17 @@ def _cmd_connection_add(client: Client, args: argparse.Namespace) -> int:
         # server that was serving, and the second promises an automount this
         # platform does not have. So say neither.
         pass
-    elif reachable:
+    elif reachable and not wrong_name:
         lines.append("  it will mount on first access")
+    elif reachable:
+        # D14 again: the port answers, so the old unconditional line printed
+        # `it will mount on first access` directly under `has no share called
+        # 'Public'` — a promise contradicted by the line above it. Reachability
+        # is not the binding constraint once the name is known to be wrong.
+        lines.append(
+            "  it will mount once the name is right: "
+            "`smbpal connection remove` and add it again"
+        )
     else:
         # Asked here because this is where somebody is still watching. A name
         # nothing answers for is saved happily and then declined by the monitor
@@ -796,6 +809,63 @@ def _cmd_connection_add(client: Client, args: argparse.Namespace) -> int:
         )
         lines.append("  it will mount when something does")
     return _emit(args, connection, lambda: "\n".join(lines))
+
+
+def _share_name_note(
+    client: Client,
+    connection: dict[str, Any],
+    username: str | None,
+    password: str | None,
+) -> list[str]:
+    """Say so when the share just saved is not one the server offers.
+
+    **Advisory, never a refusal**, for the reason the reachability probe above
+    is: a server that is switched off, or a share about to be created on it,
+    are both ordinary things to configure for. But a *name* that the server
+    will never have is a typo, and the only thing that used to report it was a
+    mount failure days later reading *the server has no share by that name*.
+    §6.19: the share on a Mac is called `Luke H's Public Folder` and the
+    obvious guess is `Public`.
+
+    The credential is the one just collected, because macOS refuses an
+    anonymous listing outright (§6.19) and a check that only worked against
+    Samba would be worse than none — it would be silent in exactly the case
+    that motivated it.
+
+    Silent whenever the listing cannot be had. Listings fail for many ordinary
+    reasons, and a line about it on every guest `add` would be noise standing
+    where the useful note goes.
+    """
+    try:
+        listed = client.call(
+            "server.shares",
+            {
+                "host": connection["host"],
+                "username": username or "",
+                "password": password or "",
+            },
+        )
+    except (SmbpalError, OSError):
+        return []
+    if not isinstance(listed, list):
+        return []
+    try:
+        names = mountable(Share(**row) for row in listed)
+    except TypeError:
+        # An older daemon answering a shape this does not know. The connection
+        # is already saved; a rendering detail must not turn that into a
+        # failure.
+        return []
+    # SMB share names are matched case-insensitively, so `public` for `Public`
+    # is not a typo and must not be reported as one.
+    wanted = connection["share"].casefold()
+    if not names or any(name.casefold() == wanted for name in names):
+        return []
+    return [
+        f"  warning: {connection['host']} has no share called "
+        f"{connection['share']!r}",
+        f"  it offers: {', '.join(names)}",
+    ]
 
 
 def _cmd_connection_use_fallback(client: Client, args: argparse.Namespace) -> int:

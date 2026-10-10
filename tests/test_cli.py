@@ -211,6 +211,117 @@ class TestConnections(CliTestCase):
         code, _, _ = self.run_cli("connection", "remove", "/mnt/nas")
         self.assertEqual(code, EXIT_OK)
 
+    def _fake_shares(self, rows: object) -> list[dict[str, object]]:
+        """Patch `server.shares` to answer `rows`, or raise if it is an error.
+
+        Returns the list of params it was called with, so a test can assert
+        what the CLI sent as well as what it printed.
+        """
+        import smbpal.daemon.handlers as handlers
+
+        seen: list[dict[str, object]] = []
+
+        def fake(_self: object, request: object, _peer: object) -> object:
+            seen.append(dict(request.params))  # type: ignore[attr-defined]
+            if isinstance(rows, Exception):
+                raise rows
+            return rows
+
+        original = handlers._METHODS["server.shares"]
+        handlers._METHODS["server.shares"] = fake
+        self.addCleanup(
+            handlers._METHODS.__setitem__, "server.shares", original
+        )
+        return seen
+
+    def test_add_warns_when_the_server_has_no_share_by_that_name(self) -> None:
+        """§6.19, and the problem that started it.
+
+        The share on a Mac is called `Luke H's Public Folder`; the obvious
+        guess is `Public`; and until `browse` existed the only thing that ever
+        said so was a mount failure days later.
+        """
+        self._fake_shares(
+            [
+                {"name": "Luke H\u2019s Public Folder", "kind": "disk", "comment": ""},
+                {"name": "smbpal", "kind": "disk", "comment": ""},
+                {"name": "IPC$", "kind": "ipc", "comment": ""},
+            ]
+        )
+        code, out, _ = self.run_cli(
+            "connection", "add", "nas.local", "Public", "/mnt/nas"
+        )
+        # Advisory, never a refusal: the connection is saved either way.
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("has no share called 'Public'", out)
+        self.assertIn("Luke H\u2019s Public Folder", out)
+        # Disk shares only. Offering IPC$ as a suggestion would be worse than
+        # offering nothing.
+        self.assertNotIn("IPC$", out)
+        # D14: the port answers, so the reachability line used to promise
+        # `it will mount on first access` directly under a line saying the
+        # share does not exist. Reachability is not the binding constraint
+        # once the name is known to be wrong.
+        self.assertNotIn("mount on first access", out)
+        self.assertIn("once the name is right", out)
+
+    def test_add_says_nothing_when_the_name_is_right(self) -> None:
+        self._fake_shares([{"name": "Media", "kind": "disk", "comment": ""}])
+        code, out, _ = self.run_cli(
+            "connection", "add", "nas.local", "Media", "/mnt/nas"
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertNotIn("warning", out)
+
+    def test_a_difference_in_case_is_not_a_typo(self) -> None:
+        # SMB matches share names case-insensitively, so this mounts fine.
+        self._fake_shares([{"name": "Media", "kind": "disk", "comment": ""}])
+        _, out, _ = self.run_cli(
+            "connection", "add", "nas.local", "media", "/mnt/nas"
+        )
+        self.assertNotIn("warning", out)
+
+    def test_add_is_silent_when_the_listing_cannot_be_had(self) -> None:
+        # macOS refuses an anonymous listing outright, and a server may be
+        # switched off. A line about it on every guest add would be noise
+        # standing where the useful note goes.
+        from smbpal.errors import Unavailable
+
+        self._fake_shares(Unavailable("cannot list shares on nas.local"))
+        code, out, _ = self.run_cli(
+            "connection", "add", "nas.local", "Public", "/mnt/nas"
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("added connection", out)
+        self.assertNotIn("warning", out)
+
+    def test_add_checks_the_name_with_the_credential_it_just_collected(self) -> None:
+        # The whole reason the check runs after the credential is stored:
+        # macOS will not list anonymously, so checking before would be silent
+        # in exactly the case that motivated it.
+        import smbpal.daemon.handlers as handlers
+
+        seen = self._fake_shares([{"name": "Media", "kind": "disk", "comment": ""}])
+        # Storing a credential needs a mounter, which a --no-apply daemon has
+        # not got, and without this the add fails before the check is reached.
+        original = handlers._METHODS["connection.set_credentials"]
+        handlers._METHODS["connection.set_credentials"] = lambda *_a: {
+            "id": "nas-local-media",
+            "username": "pi",
+        }
+        self.addCleanup(
+            handlers._METHODS.__setitem__, "connection.set_credentials", original
+        )
+        with unittest.mock.patch(
+            "smbpal.cli.main.getpass.getpass", return_value="hunter2"
+        ):
+            self.run_cli(
+                "connection", "add", "nas.local", "Media", "/mnt/nas", "--user", "pi"
+            )
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["username"], "pi")
+        self.assertEqual(seen[0]["password"], "hunter2")
+
     def test_set_credentials_passes_the_reference_through_and_renders_the_note(
         self,
     ) -> None:
