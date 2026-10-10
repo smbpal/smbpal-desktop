@@ -1,3 +1,28 @@
+smbpal (0.2.8) trixie; urgency=medium
+
+  * Macs now appear under their real names. A name with any character outside
+    plain ASCII was being mangled -- an apostrophe became three symbols -- and
+    since macOS calls a machine "<Name>'s MacBook Air" by default, that was
+    very nearly every Mac on the network.
+  * You can connect to shares SMBPal used to refuse. A share name containing
+    an apostrophe or a dollar was rejected for a reason that applies only to
+    shares this machine serves, not to shares it mounts. That blocked the
+    folder every Mac shares by default, and every `...$` share on Windows.
+  * New: `smbpal browse <host>` lists the shares a server offers, so a name
+    no longer has to be guessed. It needs a username on some servers --
+    macOS refuses to list anything to an anonymous caller.
+  * `smbpal connection add` now says so when the server has no share by the
+    name you gave, and prints the ones it does have, instead of saving the
+    typo and failing to mount days later.
+  * New: `smbpal connection set-credentials <ref> --user <name>` changes the
+    password on a connection that already exists. Until now a password could
+    be set only when the connection was created, and correcting one meant
+    deleting the connection and typing it all again.
+  * This release depends on libsmbclient, which is what lists a server's
+    shares without putting a password on a command line or in a file.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Sat, 10 Oct 2026 22:40:00 +0100
+
 smbpal (0.2.7) trixie; urgency=medium
 
   * macOS can mount a share, end to end, against a real server. On Linux this
