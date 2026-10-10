@@ -42,6 +42,11 @@ BuildRequires:  systemd-rpm-macros
 Requires:       samba
 Requires:       samba-common-tools
 Requires:       cifs-utils
+# `smbpal browse <host>` binds libsmbclient through ctypes rather than shelling
+# out to `smbclient -L`: the CLI takes the password in argv or in a file on
+# disk, which M0 §9 forbids, and the library asks for it through a callback.
+# 268 KiB against smbclient's 2419 KiB, measured 10 October 2026.
+Requires:       libsmbclient
 Requires:       polkit
 
 # The GUI half, kept out of Requires for the reason `pyproject.toml` gives:

@@ -19,6 +19,7 @@ from smbpal.agent.client import AgentClients
 from smbpal.config import ConfigStore
 from smbpal.config import operations as ops
 from smbpal.discovery import discover
+from smbpal.discovery.shares import list_shares
 from smbpal.discovery.identity import Identity, identify
 from smbpal.errors import (
     AlreadyExists,
@@ -106,6 +107,7 @@ class Authoriser:
             "credential.list",
             "connection.watch",
             "browse",
+            "server.shares",
         }
     )
 
@@ -1137,6 +1139,30 @@ class Dispatcher:
         timeout = max(1.0, min(float(timeout), 30.0))
         return [machine.to_wire() for machine in discover(timeout=timeout)]
 
+    def _server_shares(self, request: Request, _peer: PeerCredentials) -> list[Any]:
+        """List one server's shares — the other half of `browse`.
+
+        **Unauthenticated, like `browse`**, and for the same reason: it reads
+        somebody else's server and changes nothing here. A credential is
+        accepted but never stored and never read from the store, which is the
+        deliberate part. Resolving a `credential_ref` here would let any local
+        caller enumerate a server using a password only root can read, and a
+        share listing is not worth that. A caller who has the password sends
+        it, exactly as `connection.set_credentials` already does.
+        """
+        params = request.params
+        host = _require_str(params, "host")
+        timeout = params.get("timeout", 5.0)
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
+            raise InvalidParams("'timeout' must be a number of seconds")
+        shares = list_shares(
+            host,
+            username=_optional_str(params, "username") or "",
+            password=_optional_str(params, "password") or "",
+            timeout=max(1.0, min(float(timeout), 30.0)),
+        )
+        return [share.to_wire() for share in shares]
+
 
 def _can_sign_in(share: dict[str, Any], accounts: set[str] | None) -> bool | None:
     """Whether anybody can open this share from another machine at all.
@@ -1268,4 +1294,5 @@ _METHODS: dict[str, Method] = {
     "connection.live": Dispatcher._connection_live,
     "connection.watch": Dispatcher._connection_watch,
     "browse": Dispatcher._browse,
+    "server.shares": Dispatcher._server_shares,
 }

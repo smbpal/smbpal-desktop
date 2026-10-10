@@ -343,6 +343,42 @@ class TestBrowse(CliTestCase):
         self.assertEqual(out.count("RASPBERRYPI"), 1)
 
 
+    def test_browse_with_a_host_lists_that_server_s_shares(self) -> None:
+        # docs §6.19: the share on a Mac is called `Luke H's Public Folder`
+        # and the obvious guess is `Public`. Before this existed, a wrong
+        # guess had no way to become a right one.
+        import smbpal.daemon.handlers as handlers
+        from tests.test_shares import MAC_LISTING
+        from smbpal.discovery.shares import interpret
+
+        def fake(_self: object, _req: object, _peer: object) -> list[dict[str, str]]:
+            return [s.to_wire() for s in interpret(MAC_LISTING)]
+
+        original = handlers._METHODS["server.shares"]
+        handlers._METHODS["server.shares"] = fake
+        self.addCleanup(handlers._METHODS.__setitem__, "server.shares", original)
+
+        code, out, _ = self.run_cli("browse", "mac.local")
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("Luke H\u2019s Public Folder", out)
+        self.assertIn("smbpal", out)
+        # The kind column is why IPC$ can be shown without being confusing.
+        self.assertIn("ipc", out)
+
+    def test_browse_with_no_host_still_finds_machines(self) -> None:
+        # One command, two jobs: the host argument is what separates them, and
+        # adding it must not have changed the no-argument behaviour.
+        import smbpal.daemon.handlers as handlers
+
+        called: list[str] = []
+        original = handlers._METHODS["browse"]
+        handlers._METHODS["browse"] = lambda _s, _r, _p: called.append("browse") or []
+        self.addCleanup(handlers._METHODS.__setitem__, "browse", original)
+
+        code, _, _ = self.run_cli("browse")
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(called, ["browse"])
+
 class TestBrowseHeadingSaysWhatItMeasures(CliTestCase):
     """D14, and the reason it is a test rather than a tidier word.
 

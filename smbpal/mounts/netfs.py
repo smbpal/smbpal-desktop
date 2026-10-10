@@ -95,7 +95,12 @@ _STATUS: dict[int | None, tuple[str, str, bool]] = {
         "the username or password was refused by the server",
         False,
     ),
-    _status("ENOENT"): ("failed", "the server has no share by that name", False),
+    _status("ENOENT"): (
+        "failed",
+        "the server has no share by that name. "
+        "`smbpal browse HOST` lists what it offers",
+        False,
+    ),
     _status("ETIMEDOUT"): ("unreachable", "the server did not answer in time", True),
     _status("ECONNREFUSED"): (
         "unreachable",

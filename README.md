@@ -77,7 +77,7 @@ smbpal connection list | add <host> <share> <mountpoint> [--user <name>] [--fall
 smbpal watch [--once]
 smbpal credential list | set <account> | remove <account>
 smbpal apply
-smbpal browse
+smbpal browse [<host>] [--user <name>]
 smbpal ping
 ```
 
