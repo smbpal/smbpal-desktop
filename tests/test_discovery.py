@@ -44,6 +44,25 @@ class TestParse(unittest.TestCase):
         line = "=;en0;IPv4;Ada\\039s\\032Mac;_smb._tcp;local;mac.local;192.0.2.6;445;"
         self.assertEqual(parse(line)[0].name, "Ada's Mac")
 
+    def test_a_multibyte_escape_is_one_character(self) -> None:
+        # avahi escapes each non-printable *byte*, so U+2019 arrives as three
+        # escapes. Decoding them one at a time produced `Lukeâ€™s`, and
+        # macOS names a machine `<Name>’s MacBook Air` by default — so this was
+        # nearly every Mac discovered from Linux. Docs §6.19.
+        line = (
+            "=;en0;IPv4;Luke\\226\\128\\153s MacBook Air;_smb._tcp;local;"
+            "mac.local;192.0.2.7;445;"
+        )
+        self.assertEqual(parse(line)[0].name, "Luke\u2019s MacBook Air")
+
+    def test_a_truncated_sequence_renders_rather_than_dropping_it(self) -> None:
+        # A name we cannot render perfectly is still a machine someone wants to
+        # mount, so the bad byte becomes U+FFFD and the row survives.
+        line = "=;en0;IPv4;trunc\\226ated;_smb._tcp;local;mac.local;192.0.2.8;445;"
+        service = parse(line)[0]
+        self.assertEqual(service.hostname, "mac.local")
+        self.assertIn("\ufffd", service.name)
+
     def test_a_malformed_line_is_skipped_not_fatal(self) -> None:
         self.assertEqual(parse("=;too;few;fields\n=;a;b;c;d;e;f;g;notaport;"), [])
 

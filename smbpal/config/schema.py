@@ -32,6 +32,21 @@ _ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _SHARE_NAME_FORBIDDEN = set('\n\r\t/\\[]:;"\'`$%\x00')
 _SHARE_NAME_MAX = 80
 
+# A **remote** share name is a different object. SMBPal writes it into no file
+# it owns; it only addresses it. Applying the served-share set above to it
+# rejected `Luke H's Public Folder` — the share every Mac ships — and every
+# `...$` share on Windows, for a reason that is about `smb.conf` and so does not
+# apply. Measured against a real Mac, 10 October 2026; docs §6.19.
+#
+# What still has to stay out, and why each one:
+#   \n \r \t \0   a unit file is line-oriented and `What=` carries this value,
+#                 so a newline in it is an arbitrary extra directive.
+#   / \           these decide *which* share is addressed, not what it is called.
+#   %             systemd expands `%` in a unit value as a specifier (`%H`, `%i`).
+# Everything else — apostrophes, `$`, spaces, brackets, quotes — reaches only
+# `What=//host/share`, where nothing interprets it and no shell is involved.
+_REMOTE_SHARE_NAME_FORBIDDEN = set("\n\r\t/\\%\x00")
+
 # Section names Samba gives its own meaning. A share called `global` would not be
 # a share.
 # Public: `samba.control` needs the same list to tell Samba's own machinery
@@ -200,7 +215,7 @@ def _validate_share(problems: list[Problem], where: str, share: dict[str, Any]) 
     )
     _check_type_discriminator(problems, where, share)
     _check_id(problems, where, share)
-    _check_share_name(problems, f"{where}.name", share.get("name"))
+    _check_share_name(problems, f"{where}.name", share.get("name"), served=True)
     _check_absolute_path(problems, f"{where}.path", share.get("path"))
     _check_optional_bool(problems, f"{where}.read_only", share.get("read_only"))
     _check_optional_bool(problems, f"{where}.enabled", share.get("enabled"))
@@ -220,7 +235,9 @@ def _validate_connection(
     _check_type_discriminator(problems, where, connection)
     _check_id(problems, where, connection)
     _check_host(problems, f"{where}.host", connection.get("host"))
-    _check_share_name(problems, f"{where}.share", connection.get("share"))
+    _check_share_name(
+        problems, f"{where}.share", connection.get("share"), served=False
+    )
     _check_absolute_path(problems, f"{where}.mountpoint", connection.get("mountpoint"))
     _check_optional_ref(
         problems, f"{where}.credential_ref", connection.get("credential_ref")
@@ -315,7 +332,17 @@ def _check_id_unique(
         seen[value] = where
 
 
-def _check_share_name(problems: list[Problem], where: str, value: Any) -> None:
+def _check_share_name(
+    problems: list[Problem], where: str, value: Any, *, served: bool
+) -> None:
+    """Validate a share name, which is two jobs rather than one.
+
+    `served=True` is a share SMBPal *publishes*, whose name becomes an
+    `smb.conf` section header. `served=False` is a share it *mounts*, which it
+    only ever addresses. One set of rules for both rejected the default macOS
+    share; the reason for the strict set is a file format SMBPal does not write
+    in the second case.
+    """
     if value is None:
         return
     if not isinstance(value, str):
@@ -326,18 +353,29 @@ def _check_share_name(problems: list[Problem], where: str, value: Any) -> None:
         return
     if len(value) > _SHARE_NAME_MAX:
         problems.append(Problem(where, f"is longer than {_SHARE_NAME_MAX} characters"))
-    bad = sorted(_SHARE_NAME_FORBIDDEN & set(value))
+    bad = sorted(
+        (_SHARE_NAME_FORBIDDEN if served else _REMOTE_SHARE_NAME_FORBIDDEN)
+        & set(value)
+    )
     if bad:
         problems.append(
             Problem(
                 where,
                 "contains "
                 + ", ".join(repr(c) for c in bad)
-                + ". A share name is written into a section header, so a newline "
-                "in it is arbitrary smb.conf.",
+                + (
+                    ". A share name is written into a section header, so a "
+                    "newline in it is arbitrary smb.conf."
+                    if served
+                    else ". A mount unit's What= carries this value, and "
+                    "systemd reads '%' in it as a specifier."
+                ),
             )
         )
-    if value.lower() in _RESERVED_SHARE_NAMES:
+    # Only for a share SMBPal publishes. A *remote* server may perfectly well
+    # have a share called `homes`, and refusing to mount it would be our
+    # opinion about somebody else's server.
+    if served and value.lower() in _RESERVED_SHARE_NAMES:
         problems.append(
             Problem(where, f"is {value!r}, which Samba reserves for its own section")
         )
