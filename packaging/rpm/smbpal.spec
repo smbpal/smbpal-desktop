@@ -10,7 +10,7 @@
 # no second removal step.
 
 Name:           smbpal
-Version:        0.2.7
+Version:        0.2.8
 Release:        1%{?dist}
 Summary:        Share folders over SMB, and connect to shares on other machines
 
@@ -261,6 +261,20 @@ fi
 %{_datadir}/icons/hicolor/scalable/status/smbpal-attention.svg
 
 %changelog
+* Sat Oct 10 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.8-1
+- Macs appear under their real names. Any character outside plain ASCII was
+  mangled, and macOS names a machine "<Name>'s MacBook Air" by default.
+- Shares with an apostrophe or a dollar in the name can be mounted. They were
+  refused for a reason that applies only to shares this machine serves.
+- New: `smbpal browse <host>` lists the shares a server offers. Some servers,
+  macOS among them, will not list anything without a username.
+- `smbpal connection add` says when the server has no share by that name, and
+  prints the ones it has.
+- New: `smbpal connection set-credentials` changes the password on a
+  connection that already exists.
+- Requires libsmbclient, which lists a server's shares without putting a
+  password on a command line or in a file.
+
 * Sat Oct 03 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.7-1
 - macOS mounts a share end to end, against a real server. On Linux nothing
   visible changes.
