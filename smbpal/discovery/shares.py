@@ -52,8 +52,9 @@ _KINDS = {
 
 DEFAULT_TIMEOUT = 5.0
 
-# libsmbclient's legacy entry points operate on one global context, so two
-# listings at once would share it. The daemon answers requests on one thread
+# Each listing owns its context, so there is no global state to share — but
+# Samba's library-wide initialisation (talloc, loadparm) is process-global and
+# is not documented as thread-safe. The daemon answers requests on one thread
 # today, and this makes that not something to remember.
 _LOCK = threading.Lock()
 
@@ -120,13 +121,15 @@ def list_shares(
 # --- the ctypes layer, which is the only part that needs the library -------
 #
 # **This mirrors D13's NetFS adapter** (§6.4, §6.9): bind the platform's own
-# library rather than wrap its CLI. The legacy entry points (`smbc_opendir`
-# and friends) operate on a global context, and the context API is used only
-# far enough to set a timeout and install the auth callback before handing
-# that context to `smbc_set_context`. Without a timeout a listing of a host
-# that is switched off blocks the daemon's handler for as long as SMB's own
-# retries take, which is the one failure mode `browse.py` already guards
-# against with `subprocess(timeout=...)`.
+# library rather than wrap its CLI. Everything goes through one context that
+# this call owns — created, configured, used and freed — and the directory
+# functions are taken off it rather than called through libsmbclient's legacy
+# wrappers, for the measured reason recorded below.
+#
+# The timeout is why the context is configured rather than defaulted: without
+# one, listing a host that is switched off blocks the daemon's handler for as
+# long as SMB's own retries take, which is the failure mode `browse.py`
+# already guards against with `subprocess(timeout=...)`.
 
 
 class SmbcDirent(ctypes.Structure):
@@ -149,15 +152,33 @@ class SmbcDirent(ctypes.Structure):
     ]
 
 
+# **The out-parameters are `POINTER(c_char)`, not `c_char_p`.** ctypes marshals
+# a `c_char_p` argument into a Python `bytes` — a copy — so a callback declared
+# that way receives an immutable object, the pointer is lost, and writing into
+# it is at best useless. Only the two genuinely-input strings are `c_char_p`.
+# The directory calls are taken off the context rather than used through the
+# legacy `smbc_opendir` wrappers. **Measured 10 October 2026:** the wrappers
+# returned `EINVAL` for every URL, anonymous or authenticated, against a Mac
+# that `smbclient -L` listed fine from the same machine seconds later. The
+# compat layer keeps its own initialisation and file-descriptor table that only
+# `smbc_init()` sets up, and `smbc_new_context` + `smbc_set_context` does not
+# stand in for it. Going through the context has no global state to get wrong.
+_OPENDIR_FN = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p)
+_READDIR_FN = ctypes.CFUNCTYPE(
+    ctypes.POINTER(SmbcDirent), ctypes.c_void_p, ctypes.c_void_p
+)
+_CLOSEDIR_FN = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+
+_CHAR_OUT = ctypes.POINTER(ctypes.c_char)
 _AUTH_FN = ctypes.CFUNCTYPE(
     None,
-    ctypes.c_char_p,  # server
-    ctypes.c_char_p,  # share
-    ctypes.c_char_p,  # workgroup, written in place
+    ctypes.c_char_p,  # server, in
+    ctypes.c_char_p,  # share, in
+    _CHAR_OUT,  # workgroup, written in place
     ctypes.c_int,
-    ctypes.c_char_p,  # username, written in place
+    _CHAR_OUT,  # username, written in place
     ctypes.c_int,
-    ctypes.c_char_p,  # password, written in place
+    _CHAR_OUT,  # password, written in place
     ctypes.c_int,
 )
 
@@ -174,8 +195,6 @@ def _load() -> ctypes.CDLL:
     lib.smbc_new_context.restype = ctypes.c_void_p
     lib.smbc_init_context.argtypes = [ctypes.c_void_p]
     lib.smbc_init_context.restype = ctypes.c_void_p
-    lib.smbc_set_context.argtypes = [ctypes.c_void_p]
-    lib.smbc_set_context.restype = ctypes.c_void_p
     lib.smbc_free_context.argtypes = [ctypes.c_void_p, ctypes.c_int]
     lib.smbc_free_context.restype = ctypes.c_int
     lib.smbc_setTimeout.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -184,12 +203,12 @@ def _load() -> ctypes.CDLL:
     lib.smbc_setDebug.restype = None
     lib.smbc_setFunctionAuthData.argtypes = [ctypes.c_void_p, _AUTH_FN]
     lib.smbc_setFunctionAuthData.restype = None
-    lib.smbc_opendir.argtypes = [ctypes.c_char_p]
-    lib.smbc_opendir.restype = ctypes.c_int
-    lib.smbc_readdir.argtypes = [ctypes.c_uint]
-    lib.smbc_readdir.restype = ctypes.POINTER(SmbcDirent)
-    lib.smbc_closedir.argtypes = [ctypes.c_int]
-    lib.smbc_closedir.restype = ctypes.c_int
+    lib.smbc_getFunctionOpendir.argtypes = [ctypes.c_void_p]
+    lib.smbc_getFunctionOpendir.restype = _OPENDIR_FN
+    lib.smbc_getFunctionReaddir.argtypes = [ctypes.c_void_p]
+    lib.smbc_getFunctionReaddir.restype = _READDIR_FN
+    lib.smbc_getFunctionClosedir.argtypes = [ctypes.c_void_p]
+    lib.smbc_getFunctionClosedir.restype = _CLOSEDIR_FN
     return lib
 
 
@@ -259,11 +278,11 @@ def _libsmbclient_lister(timeout: float) -> Lister:
         def auth(
             _server: bytes | None,
             _share: bytes | None,
-            workgroup: bytes | None,
+            workgroup: object,
             _wglen: int,
-            user: bytes | None,
+            user: object,
             userlen: int,
-            passwd: bytes | None,
+            passwd: object,
             pwlen: int,
         ) -> None:
             # The buffers are the library's, and it says how long they are.
@@ -288,9 +307,12 @@ def _libsmbclient_lister(timeout: float) -> Lister:
                         "libsmbclient would not initialise",
                         detail=_strerror(ctypes.get_errno()),
                     )
-                lib.smbc_set_context(context)
-                handle = lib.smbc_opendir(f"smb://{host}".encode())
-                if handle < 0:
+                opendir = lib.smbc_getFunctionOpendir(context)
+                readdir = lib.smbc_getFunctionReaddir(context)
+                closedir = lib.smbc_getFunctionClosedir(context)
+                ctypes.set_errno(0)
+                handle = opendir(context, f"smb://{host}".encode())
+                if not handle:
                     raise Unavailable(
                         f"cannot list shares on {host}",
                         detail=_strerror(ctypes.get_errno()),
@@ -298,26 +320,40 @@ def _libsmbclient_lister(timeout: float) -> Lister:
                 try:
                     entries = []
                     while True:
+                        # readdir returning NULL is both "no more entries" and
+                        # "it failed", told apart only by errno, so it is
+                        # cleared before each call rather than once.
                         ctypes.set_errno(0)
-                        pointer = lib.smbc_readdir(handle)
+                        pointer = readdir(context, handle)
                         if not pointer:
+                            errno = ctypes.get_errno()
+                            if errno:
+                                raise Unavailable(
+                                    f"listing {host} stopped part way through",
+                                    detail=_strerror(errno),
+                                )
                             break
                         entries.append(_entry(pointer))
                     return entries
                 finally:
-                    lib.smbc_closedir(handle)
+                    closedir(context, handle)
             finally:
                 lib.smbc_free_context(context, 1)
 
     return run
 
 
-def _write_into(buffer: bytes | None, size: int, value: str) -> None:
-    """Copy `value` into a library-owned char buffer, NUL-terminated."""
-    if buffer is None or size <= 0:
+def _write_into(buffer: object, size: int, value: str) -> None:
+    """Copy `value` into a library-owned char buffer, NUL-terminated.
+
+    The buffer and its length are the library's; this never decides either.
+    A NULL pointer or a zero length is a refusal to be honoured rather than
+    worked around — writing anyway is a segfault in a daemon.
+    """
+    if buffer is None or not buffer or size <= 0:
         return
-    encoded = value.encode("utf-8")[: size - 1]
-    ctypes.memmove(buffer, encoded + b"\0", len(encoded) + 1)
+    encoded = value.encode("utf-8")[: size - 1] + b"\0"
+    ctypes.memmove(buffer, encoded, len(encoded))
 
 
 def _strerror(errno: int) -> str:
@@ -327,12 +363,14 @@ def _strerror(errno: int) -> str:
 
 
 def probe_layout() -> dict[str, int]:
-    """What this believes `struct smbc_dirent` looks like, for verification.
+    """What this *believes* `struct smbc_dirent` looks like.
 
-    There is no way to test the declaration above from a machine without the
-    library, and a wrong offset reads memory rather than failing. Printed by
-    `python3 -m smbpal.discovery.shares` so the numbers can be checked against
-    the installed header before this is trusted.
+    **This is not a verification.** The numbers are computed by ctypes from
+    the declaration above, so they agree with it by construction. They are
+    worth printing only to compare against the installed
+    `samba-4.0/libsmbclient.h`, or against a listing that comes back with
+    names a person recognises. A wrong offset reads memory rather than
+    failing, so the only honest check is one of those two.
     """
     return {
         "sizeof": ctypes.sizeof(SmbcDirent),
@@ -341,11 +379,21 @@ def probe_layout() -> dict[str, int]:
 
 
 if __name__ == "__main__":  # pragma: no cover - a diagnostic, not a code path
+    import getpass
     import json
-    import sys
 
     print(json.dumps(probe_layout(), indent=2))
-    print(f"{SONAME} loadable: {available()}")
+    print(f"{SONAME} loadable: {available()}\n")
     if len(sys.argv) > 1:
-        for share in list_shares(sys.argv[1], username="", password=""):
+        user = sys.argv[2] if len(sys.argv) > 2 else ""
+        secret = getpass.getpass(f"Password for {user}: ") if user else ""
+        try:
+            shares = list_shares(sys.argv[1], username=user, password=secret)
+        except Unavailable as exc:
+            # The detail is the errno, which is the whole point of running
+            # this by hand. `Unavailable.__str__` is the one-line form.
+            print(f"FAILED: {exc}")
+            print(f"detail: {getattr(exc, 'detail', None)}")
+            raise SystemExit(1) from None
+        for share in shares:
             print(f"{share.kind:10} {share.name}  {share.comment}")
