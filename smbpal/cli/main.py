@@ -182,6 +182,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--stdin-password", action="store_true", help="read the password from stdin"
     )
 
+    # The RPC has existed since M4 and `connection add --user` was its only
+    # caller, so a password could be set when a connection was created and
+    # never afterwards. An id is derived from host and share, so re-adding to
+    # correct a password is refused as a duplicate: the only route was remove
+    # and add again, which throws away the mountpoint, the auto-connect choice
+    # and the fallback address to fix a typo.
+    set_credentials = connection_cmds.add_parser(
+        "set-credentials",
+        help="store or replace the password for a connection that exists",
+    )
+    set_credentials.add_argument("ref", help="connection id or mountpoint")
+    set_credentials.add_argument(
+        "--user", required=True, help="username on the remote server"
+    )
+    set_credentials.add_argument(
+        "--domain", help="Windows domain, if the server wants one"
+    )
+    set_credentials.add_argument(
+        "--stdin-password", action="store_true", help="read the password from stdin"
+    )
+
     connection_remove = connection_cmds.add_parser("remove", help="remove a connection")
     connection_remove.add_argument("ref", help="connection id or mountpoint")
 
@@ -880,6 +901,42 @@ def _read_password(args: argparse.Namespace, prompt: str) -> str | None:
     return password
 
 
+def _cmd_connection_set_credentials(
+    client: Client, args: argparse.Namespace
+) -> int:
+    """`smbpal connection set-credentials REF --user NAME`.
+
+    The daemon end does more than store the password: it clears the monitor's
+    latch for that connection, because a refused credential stops priming and
+    new credentials are new information about a connection the monitor may
+    have given up on. `apply` then clears a start-limited unit with
+    `reset-failed`. So this is the whole recovery path from a rejected
+    password, not just the storage half.
+    """
+    password = _read_password(args, f"Password for {args.user} on {args.ref}: ")
+    if password is None:
+        return EXIT_ERROR
+    stored = client.call(
+        "connection.set_credentials",
+        {
+            "ref": args.ref,
+            "username": args.user,
+            "password": password,
+            "domain": args.domain,
+        },
+    )
+
+    def human() -> str:
+        lines = [f"credentials stored for {stored['username']} on {stored['id']}"]
+        # macOS says where it put them, and whether it replaced an item that
+        # was already in the login Keychain for that server and account.
+        if stored.get("note"):
+            lines.append(f"  {stored['note']}")
+        return "\n".join(lines)
+
+    return _emit(args, stored, human)
+
+
 def _cmd_connection_remove(client: Client, args: argparse.Namespace) -> int:
     connection = client.call("connection.remove", {"ref": args.ref})
     return _emit(args, connection, lambda: f"removed connection {connection['id']}")
@@ -903,6 +960,7 @@ _COMMANDS: dict[tuple[str, str | None], Handler] = {
     ("credential", "remove"): _cmd_credential_remove,
     ("connection", "list"): _cmd_connection_list,
     ("connection", "add"): _cmd_connection_add,
+    ("connection", "set-credentials"): _cmd_connection_set_credentials,
     ("connection", "remove"): _cmd_connection_remove,
     ("connection", "connect"): _cmd_connection_connect,
     ("connection", "disconnect"): _cmd_connection_disconnect,

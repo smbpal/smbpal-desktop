@@ -73,6 +73,7 @@ smbpal status
 smbpal share list | add <name> <path> --user <account> [--read-only] [--disabled]
                   | remove <ref> | make-writable <ref>
 smbpal connection list | add <host> <share> <mountpoint> [--user <name>] [--fallback <ip>]
+                       | set-credentials <ref> --user <name> [--domain <d>]
                        | remove <ref> | connect <ref> | disconnect <ref> | use-fallback <ref>
 smbpal watch [--once]
 smbpal credential list | set <account> | remove <account>

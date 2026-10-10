@@ -211,6 +211,92 @@ class TestConnections(CliTestCase):
         code, _, _ = self.run_cli("connection", "remove", "/mnt/nas")
         self.assertEqual(code, EXIT_OK)
 
+    def test_set_credentials_passes_the_reference_through_and_renders_the_note(
+        self,
+    ) -> None:
+        """The gap this closed: a password could be set once and never again.
+
+        An id is derived from host and share, so re-adding to correct a
+        password is refused as a duplicate, and remove-then-add throws away
+        the mountpoint, the auto-connect choice and the fallback address to
+        fix a typo. Found costing something on a Pi, 10 October 2026.
+
+        The RPC is faked because storing a credential needs a mounter, which
+        a `--no-apply` daemon has not got. What is under test here is the CLI
+        half: what it sends, and what it prints.
+        """
+        import smbpal.daemon.handlers as handlers
+
+        seen: list[dict[str, object]] = []
+
+        def fake(_self: object, request: object, _peer: object) -> dict[str, str]:
+            seen.append(dict(request.params))  # type: ignore[attr-defined]
+            return {
+                "id": "nas-local-media",
+                "username": "pi",
+                "note": "stored in the login Keychain",
+            }
+
+        original = handlers._METHODS["connection.set_credentials"]
+        handlers._METHODS["connection.set_credentials"] = fake
+        self.addCleanup(
+            handlers._METHODS.__setitem__, "connection.set_credentials", original
+        )
+
+        with unittest.mock.patch(
+            "smbpal.cli.main.getpass.getpass", return_value="hunter2"
+        ):
+            code, out, _ = self.run_cli(
+                "connection", "set-credentials", "/mnt/nas",
+                "--user", "pi", "--domain", "WORKGROUP",
+            )
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(
+            seen,
+            [
+                {
+                    "ref": "/mnt/nas",
+                    "username": "pi",
+                    "password": "hunter2",
+                    "domain": "WORKGROUP",
+                }
+            ],
+        )
+        self.assertIn("credentials stored for pi", out)
+        # macOS says where it put them; `connection add --user` already
+        # prints this and the new verb has to as well, or replacing a
+        # Keychain item happens silently.
+        self.assertIn("login Keychain", out)
+
+    def test_set_credentials_refuses_an_empty_password_without_calling_the_daemon(
+        self,
+    ) -> None:
+        import smbpal.daemon.handlers as handlers
+
+        called: list[object] = []
+        original = handlers._METHODS["connection.set_credentials"]
+        handlers._METHODS["connection.set_credentials"] = lambda *a: called.append(a)
+        self.addCleanup(
+            handlers._METHODS.__setitem__, "connection.set_credentials", original
+        )
+
+        with unittest.mock.patch("smbpal.cli.main.getpass.getpass", return_value=""):
+            code, _, err = self.run_cli(
+                "connection", "set-credentials", "/mnt/nas", "--user", "pi"
+            )
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertIn("must not be empty", err)
+        self.assertEqual(called, [])
+
+    def test_set_credentials_needs_a_username(self) -> None:
+        # Without one there is nothing to store the password against, and
+        # defaulting to the local user would send a credential to somebody
+        # else's server under a name they did not choose. argparse exits 2.
+        with self.assertRaises(SystemExit) as raised:
+            self.run_cli("connection", "set-credentials", "/mnt/nas")
+        self.assertEqual(raised.exception.code, 2)
+
     def test_the_mountpoint_can_be_left_out(self) -> None:
         # The whole path: an omitted positional must not become a resolved
         # path from the CLI's working directory on the way to the daemon.
