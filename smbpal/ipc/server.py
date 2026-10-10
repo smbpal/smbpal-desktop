@@ -1,8 +1,8 @@
 """The Unix socket transport — the only one Phase 1 ships.
 
-`/run/smbpal/smbpald.sock`, mode 0660, group `smbpal` (D4). §11.1 ruled out a
-listening TCP socket, loopback included: a port that exists is a port that can
-be reached.
+`/run/smbpal/smbpald.sock` on Linux and `/var/run/smbpal/smbpald.sock` on
+macOS, mode 0660, group `smbpal` (D4). §11.1 ruled out a listening TCP socket,
+loopback included: a port that exists is a port that can be reached.
 
 The socket's group is a guard on *who may talk*, not on *who may act*. Every
 request still carries the peer's kernel-reported identity to the handler, and
@@ -18,6 +18,7 @@ import os
 import selectors
 import socket
 import stat
+import sys
 import threading
 from pathlib import Path
 from typing import Iterator
@@ -28,19 +29,63 @@ from smbpal.ipc.transport import Handler
 
 log = logging.getLogger(__name__)
 
-DEFAULT_SOCKET_PATH = Path("/run/smbpal/smbpald.sock")
+def default_socket_path() -> Path:
+    """Where the daemon listens when nobody says otherwise.
+
+    **`/run` does not exist on macOS and cannot be created** — `/` is the
+    Signed System Volume, so `mkdir /run` fails for root as surely as for
+    anyone. A constant `/run/smbpal/smbpald.sock` therefore named a path the
+    daemon could not create and the CLI could not find, and every macOS
+    invocation needed `--socket`. Measured 10 October 2026 by a Homebrew
+    install run the way a user would; porting surface §6.20. Nine sessions of
+    macOS work missed it because every runbook passes `--socket` explicitly for
+    an unrelated reason.
+
+    `agent/main.py` has had `default_socket_path()` since D13, under
+    `~/Library/Application Support`. This is the system half of the same idea,
+    which nothing had needed yet because nothing starts the daemon on macOS.
+
+    **Linux keeps its exact string.** `/var/run` is a symlink to `/run` there,
+    so one path would resolve on both and looks free — but that string is also
+    in the systemd units, the polkit rules and the group-guard documentation,
+    and changing what they agree on to a symlink pointing at the same place
+    buys nothing and invites a mismatch.
+    """
+    if sys.platform == "darwin":
+        return Path("/var/run/smbpal/smbpald.sock")
+    return Path("/run/smbpal/smbpald.sock")
+
+
+DEFAULT_SOCKET_PATH = default_socket_path()
 DEFAULT_SOCKET_GROUP = "smbpal"
 _SOCKET_MODE = 0o660
 _RUNTIME_DIR_MODE = 0o750
 
 # Directories the daemon will never take ownership of, however it is invoked.
 # Checked both as given and resolved, so /var/run catches as the /run symlink
-# it is. World-writable directories are refused by mode rather than by name:
-# /tmp resolves to /private/tmp on macOS and would walk straight past a list,
-# and a directory anyone can rename out from under the socket is the wrong
-# place for a guarded socket whatever it is called.
+# it is on Linux. World-writable directories are refused by mode rather than by
+# name: /tmp resolves to /private/tmp on macOS and would walk straight past a
+# list, and a directory anyone can rename out from under the socket is the
+# wrong place for a guarded socket whatever it is called.
+#
+# The `/private` forms are the macOS resolved spellings, and they are listed
+# because the resolve step only helps when what it produces is in the set.
+# `/var/run` on macOS resolves to `/private/var/run`, which is `drwxrwxr-x` —
+# so it is caught by neither the name check nor the world-writable one unless
+# it is named. Found while giving macOS a default under /var/run (§6.20).
 _SHARED_DIRS = frozenset(
-    Path(p) for p in ("/", "/run", "/var/run", "/tmp", "/var/tmp", "/dev/shm")
+    Path(p)
+    for p in (
+        "/",
+        "/run",
+        "/var/run",
+        "/tmp",
+        "/var/tmp",
+        "/dev/shm",
+        "/private/var/run",
+        "/private/tmp",
+        "/private/var/tmp",
+    )
 )
 _READ_CHUNK = 65536
 
