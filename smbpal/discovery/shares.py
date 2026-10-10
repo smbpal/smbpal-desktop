@@ -315,7 +315,7 @@ def _libsmbclient_lister(timeout: float) -> Lister:
                 if not handle:
                     raise Unavailable(
                         f"cannot list shares on {host}",
-                        detail=_strerror(ctypes.get_errno()),
+                        detail=_refusal(ctypes.get_errno(), bool(username)),
                     )
                 try:
                     entries = []
@@ -360,6 +360,31 @@ def _strerror(errno: int) -> str:
     import os
 
     return f"errno {errno}: {os.strerror(errno)}" if errno else "no errno reported"
+
+
+def _refusal(errno: int, authenticated: bool) -> str:
+    """Why a listing would not open, and what to try when nothing says.
+
+    **Measured 10 October 2026.** An anonymous listing of a Mac fails with the
+    handle NULL and `errno` left at 0 — no reason reported at all — while the
+    same listing with a username returns all five shares. macOS refuses
+    anonymous enumeration whether or not guest access is enabled on a share,
+    so "no reason given" has one overwhelmingly likely cause and the message
+    says so rather than shrugging.
+    """
+    if errno:
+        return _strerror(errno)
+    if authenticated:
+        return (
+            "the server closed the listing without giving a reason. The "
+            "credential may be refused for enumeration even where it works "
+            "for a mount."
+        )
+    return (
+        "the server gave no reason, which is what an anonymous listing looks "
+        "like when it is refused — macOS always refuses one, guest access or "
+        "not. Try again with --user."
+    )
 
 
 def probe_layout() -> dict[str, int]:

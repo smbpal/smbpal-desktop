@@ -98,7 +98,7 @@ _STATUS: dict[int | None, tuple[str, str, bool]] = {
     _status("ENOENT"): (
         "failed",
         "the server has no share by that name. "
-        "`smbpal browse HOST` lists what it offers",
+        "`smbpal browse HOST --user NAME` lists what it offers",
         False,
     ),
     _status("ETIMEDOUT"): ("unreachable", "the server did not answer in time", True),

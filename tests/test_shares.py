@@ -113,7 +113,13 @@ class TestListShares(unittest.TestCase):
 
 
 class TestStructLayout(unittest.TestCase):
-    """Pinned offsets. A reordered field reads memory rather than failing."""
+    """Pinned offsets. A reordered field reads memory rather than failing.
+
+    **Confirmed against a real server on 10 October 2026**, which is the only
+    check that counts: a listing of a Mac returned `Luke H\u2019s Public Folder`
+    with its U+2019 intact and matching `smbclient -L` exactly. A wrong `name`
+    offset or `namelen` could not produce an exact multi-byte name.
+    """
 
     def test_the_declared_layout_is_the_one_measured(self) -> None:
         self.assertEqual(

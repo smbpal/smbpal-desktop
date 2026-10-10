@@ -88,14 +88,14 @@ _LINUX_MOUNT_ERRNO: dict[int, tuple[str, str, bool]] = {
     2: (
         "failed",
         "the server has no share by that name. "
-        "`smbpal browse HOST` lists what it offers",
+        "`smbpal browse HOST --user NAME` lists what it offers",
         False,
     ),
     5: ("failed", "the server reported an I/O error", True),
     6: (
         "failed",
         "the server has no share by that name. "
-        "`smbpal browse HOST` lists what it offers",
+        "`smbpal browse HOST --user NAME` lists what it offers",
         False,
     ),
     101: ("unreachable", "the network is unreachable", True),
