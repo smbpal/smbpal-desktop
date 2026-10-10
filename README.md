@@ -57,8 +57,9 @@ python3 -m smbpal.daemon.main --no-apply --socket /tmp/d.sock --config /tmp/c.js
         --socket-group ''
 ```
 
-In production it is a root system service on `/run/smbpal/smbpald.sock`, mode
-0660, group `smbpal`. Root is not a preference: `passdb.tdb` is `0600 root:root`
+In production it is a root system service on `/run/smbpal/smbpald.sock` — or
+`/var/run/smbpal/smbpald.sock` on macOS, where `/run` cannot exist — mode 0660,
+group `smbpal`. Root is not a preference: `passdb.tdb` is `0600 root:root`
 (M0 §2), so nothing short of root can touch Samba's credential store.
 
 ## Status: M5 done

@@ -21,6 +21,7 @@ from smbpal.daemon.handlers import Authoriser, Dispatcher
 from smbpal.daemon import polkit as polkit_module
 from smbpal.daemon.polkit import MANAGE_SHARES
 from smbpal.ipc import client as client_module
+from smbpal.ipc import server as server_module
 from smbpal.errors import (
     BadRequest,
     DaemonUnreachable,
@@ -548,6 +549,56 @@ class TestTheDirectoryTheSocketIsIn(unittest.TestCase):
         self.assertFalse(path.exists())
 
 
+class TestWhereTheSocketGoesByDefault(unittest.TestCase):
+    """§6.20. The constant named a path macOS cannot have.
+
+    `/run` does not exist on macOS and cannot be created — `/` is the Signed
+    System Volume — so `/run/smbpal/smbpald.sock` was a default the daemon
+    could not bind and the CLI could not find, and every macOS invocation
+    needed `--socket`. Nine sessions of macOS work missed it because every
+    runbook passes `--socket` for an unrelated reason; a Homebrew install run
+    the way a user would is what found it, on 10 October 2026.
+    """
+
+    def path_on(self, platform: str) -> Path:
+        with mock.patch.object(server_module.sys, "platform", platform):
+            return server_module.default_socket_path()
+
+    def test_linux_keeps_its_exact_string(self) -> None:
+        # Not `/var/run/...`, though that resolves to the same place through
+        # the symlink: this string is also in the systemd units, the polkit
+        # rules and the group-guard documentation.
+        self.assertEqual(
+            self.path_on("linux"), Path("/run/smbpal/smbpald.sock")
+        )
+
+    def test_macos_gets_the_path_it_can_actually_have(self) -> None:
+        self.assertEqual(
+            self.path_on("darwin"), Path("/var/run/smbpal/smbpald.sock")
+        )
+
+    def test_neither_default_lands_in_a_directory_bind_would_refuse(self) -> None:
+        """The property that makes a default usable rather than merely present.
+
+        `_apply_directory_ownership` refuses to take over a shared directory,
+        so a default whose parent is on that list would fail at `bind()` —
+        swapping one unusable default for another.
+        """
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform):
+                parent = self.path_on(platform).parent
+                self.assertNotIn(parent, server_module._SHARED_DIRS)
+
+    def test_the_macos_resolved_spellings_are_refused(self) -> None:
+        # The resolve step only helps when what it produces is in the set, and
+        # `/var/run` on macOS resolves to `/private/var/run`, which is
+        # drwxrwxr-x — caught by neither the name check nor the world-writable
+        # one unless it is named.
+        for shared in ("/private/var/run", "/private/tmp", "/private/var/tmp"):
+            with self.subTest(directory=shared):
+                self.assertIn(Path(shared), server_module._SHARED_DIRS)
+
+
 class TestEvents(ServerTestCase):
     def test_a_broadcast_event_reaches_a_connected_client(self) -> None:
         # Nothing emits events yet. M5 will, and retrofitting a push channel
@@ -610,13 +661,35 @@ class TestWhyTheSocketRefusedUs(unittest.TestCase):
         return grp.struct_group(("smbpal", "x", gid, list(members)))
 
     def answer(
-        self, group: Any, held: tuple[int, ...] = (), user: str = "someone"
+        self,
+        group: Any,
+        held: tuple[int, ...] = (),
+        user: str = "someone",
+        socket_path: str | None = None,
     ) -> str:
         with mock.patch.object(client_module.grp, "getgrnam", return_value=group), \
              mock.patch.object(client_module.os, "getgroups", return_value=list(held)), \
              mock.patch.object(client_module.os, "getgid", return_value=1000), \
              mock.patch.object(client_module.getpass, "getuser", return_value=user):
-            return client_module.why_refused()
+            return client_module.why_refused(socket_path=socket_path)
+
+    def test_the_advice_names_the_socket_in_use_not_the_default(self) -> None:
+        """It read the constant, so it could name a path nothing was using.
+
+        A `--socket` run was sent to inspect the default instead of its own
+        socket — and until §6.20 the default on macOS was a directory that
+        cannot exist, advised in the middle of a message about permissions.
+        D14: a message may not name a fix that is not one.
+        """
+        said = self.answer(
+            self.group(members=("someone",)),
+            held=(9999,),
+            socket_path="/tmp/smbpal-elsewhere/smbpald.sock",
+        )
+        self.assertIn(
+            "ls -ld /tmp/smbpal-elsewhere /tmp/smbpal-elsewhere/smbpald.sock", said
+        )
+        self.assertNotIn(str(server_module.DEFAULT_SOCKET_PATH), said)
 
     def test_a_member_whose_session_predates_it_is_told_to_log_out(self) -> None:
         said = self.answer(self.group(members=("someone",)), held=())

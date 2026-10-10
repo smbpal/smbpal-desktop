@@ -35,7 +35,9 @@ from smbpal.ipc.server import DEFAULT_SOCKET_PATH
 GROUP = "smbpal"
 
 
-def why_refused(group_name: str = GROUP) -> str:
+def why_refused(
+    group_name: str = GROUP, socket_path: Path | str | None = None
+) -> str:
     """What to do about `EACCES` on the socket, for this machine, right now.
 
     **One sentence used to cover three different situations**, and the one it
@@ -72,10 +74,18 @@ def why_refused(group_name: str = GROUP) -> str:
     if held:
         # The group is not the problem, so saying it is would send somebody
         # to re-run a command that already worked.
+        #
+        # **The socket in use, not the default.** This read the constant, so a
+        # `--socket` run sent somebody to inspect a path it was not using --
+        # and until §6.20 the constant was `/run/smbpal/...` on macOS, where
+        # the advice was to `ls -ld` a directory that cannot exist, in the
+        # middle of a message about permissions. D14: a message may not name a
+        # fix that is not one.
+        guarded = Path(socket_path) if socket_path else DEFAULT_SOCKET_PATH
         return (
             f"This session is in the '{group_name}' group already, so the "
             f"refusal is about the socket rather than about you. Check what "
-            f"guards it: ls -ld {DEFAULT_SOCKET_PATH.parent} {DEFAULT_SOCKET_PATH}"
+            f"guards it: ls -ld {guarded.parent} {guarded}"
         )
     if member:
         return (
@@ -186,7 +196,7 @@ class Client:
             if exc.errno == errno.EACCES:
                 raise DaemonUnreachable(
                     f"not allowed to connect to {self.path}",
-                    detail=why_refused(),
+                    detail=why_refused(socket_path=self.path),
                 ) from exc
             raise DaemonUnreachable(
                 f"cannot connect to {self.path}", detail=str(exc)
