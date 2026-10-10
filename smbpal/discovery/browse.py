@@ -141,11 +141,35 @@ def _split_escaped(line: str, *, limit: int) -> list[str]:
 
 
 def _unescape(value: str) -> str:
-    def replace(match: re.Match[str]) -> str:
-        body = match.group(1)
-        return chr(int(body)) if len(body) == 3 and body.isdigit() else body
+    """Undo avahi's escaping, decoding `\\ddd` runs as **bytes**.
 
-    return _ESCAPE.sub(replace, value)
+    avahi escapes each non-printable *byte*, so one character outside ASCII
+    arrives as several escapes: `Luke\\226\\128\\153s` is a single U+2019. The
+    first version of this mapped each escape to a codepoint of its own with
+    `chr(int(body))`, which turned every such name into mojibake —
+    `Lukeâ€™s MacBook Air`. **macOS names a machine
+    `<Name>’s MacBook Air` with a curly apostrophe by default**, so that was
+    nearly every Mac discovered from a Linux client. Found by browsing a real
+    Mac, 10 October 2026; docs §6.19.
+
+    The whole string goes through a byte buffer rather than only the escapes,
+    because a multi-byte character may be split across escaped and unescaped
+    runs and only one decode can see both halves. `errors="replace"` because a
+    truncated sequence is a name to render imperfectly, never a reason to drop
+    a machine off the list.
+    """
+    out = bytearray()
+    # `re.split` on a pattern with one group alternates literal, body, literal.
+    for index, part in enumerate(_ESCAPE.split(value)):
+        if index % 2 == 0:
+            out += part.encode("utf-8")
+        elif part.isascii() and part.isdigit() and len(part) == 3 and int(part) < 256:
+            # `\\d` matches non-ASCII digits too, and `\\999` is not a byte, so
+            # neither is taken on trust just because the regex matched.
+            out.append(int(part))
+        else:
+            out += part.encode("utf-8")
+    return out.decode("utf-8", errors="replace")
 
 
 # --- the §3e rules ---------------------------------------------------------

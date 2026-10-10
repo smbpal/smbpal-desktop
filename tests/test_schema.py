@@ -105,6 +105,58 @@ class TestShareName(unittest.TestCase):
         )
 
 
+
+class TestRemoteShareName(unittest.TestCase):
+    """A share SMBPal *mounts* is not a share it *publishes*.
+
+    The served-share rules exist to keep a name out of an `smb.conf` section
+    header. A remote name reaches no file SMBPal writes, and applying them to
+    it made the default macOS share unaddressable. Docs §6.19, 10 October 2026.
+    """
+
+    def test_the_default_macos_share_is_addressable(self) -> None:
+        # Every Mac ships `<Full Name>'s Public Folder`. The apostrophe is the
+        # whole reason this test exists.
+        doc = {
+            "version": 1,
+            "connections": [_connection(share="Luke H's Public Folder")],
+        }
+        self.assertEqual(_problems(doc), [])
+
+    def test_the_same_name_is_still_refused_for_a_share_we_publish(self) -> None:
+        doc = {"version": 1, "shares": [_share(name="Luke H's Public Folder")]}
+        self.assertEqual(_problems(doc), ["shares[0].name"])
+
+    def test_a_dollar_share_is_addressable(self) -> None:
+        for name in ("C$", "IPC$", "ADMIN$"):
+            with self.subTest(share=name):
+                doc = {"version": 1, "connections": [_connection(share=name)]}
+                self.assertEqual(_problems(doc), [])
+
+    def test_a_name_samba_reserves_is_still_mountable(self) -> None:
+        # Somebody else's server may have a share called `homes`. Refusing to
+        # mount it would be our opinion about their smb.conf.
+        doc = {"version": 1, "connections": [_connection(share="homes")]}
+        self.assertEqual(_problems(doc), [])
+
+    def test_a_newline_is_still_rejected(self) -> None:
+        # The value lands in a mount unit's `What=`, and a unit file is
+        # line-oriented, so this is an arbitrary extra directive.
+        doc = {"version": 1, "connections": [_connection(share="Media\nWhat=/evil")]}
+        self.assertEqual(_problems(doc), ["connections[0].share"])
+
+    def test_a_percent_is_still_rejected(self) -> None:
+        # systemd reads `%` in a unit value as a specifier.
+        doc = {"version": 1, "connections": [_connection(share="100%Media")]}
+        self.assertEqual(_problems(doc), ["connections[0].share"])
+
+    def test_a_separator_is_still_rejected(self) -> None:
+        # These decide *which* share is addressed, not what it is called.
+        for bad in ("a/b", "a\\b", "a\x00b"):
+            with self.subTest(share=bad):
+                doc = {"version": 1, "connections": [_connection(share=bad)]}
+                self.assertEqual(_problems(doc), ["connections[0].share"])
+
 class TestIdentifiers(unittest.TestCase):
     def test_an_id_that_could_escape_a_path_is_rejected(self) -> None:
         # Ids become systemd unit names and credential file names.
