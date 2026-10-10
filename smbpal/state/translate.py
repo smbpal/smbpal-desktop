@@ -87,11 +87,17 @@ _LINUX_MOUNT_ERRNO: dict[int, tuple[str, str, bool]] = {
     ),
     2: (
         "failed",
-        "the server has no share by that name",
+        "the server has no share by that name. "
+        "`smbpal browse HOST --user NAME` lists what it offers",
         False,
     ),
     5: ("failed", "the server reported an I/O error", True),
-    6: ("failed", "the server has no share by that name", False),
+    6: (
+        "failed",
+        "the server has no share by that name. "
+        "`smbpal browse HOST --user NAME` lists what it offers",
+        False,
+    ),
     101: ("unreachable", "the network is unreachable", True),
     110: ("unreachable", "the server did not answer in time", True),
     # D14. `ECONNREFUSED` is the symptom of two opposite causes -- Samba

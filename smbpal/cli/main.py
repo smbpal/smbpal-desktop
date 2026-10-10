@@ -63,9 +63,24 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("status", help="what is configured, and its state")
     commands.add_parser("ping", help="check the daemon is answering")
 
-    browse = commands.add_parser("browse", help="find SMB servers on this network")
+    browse = commands.add_parser(
+        "browse", help="find SMB servers, or list one server's shares"
+    )
+    browse.add_argument(
+        "host",
+        nargs="?",
+        help="a server to list the shares of. Omit it to find servers instead.",
+    )
     browse.add_argument(
         "--timeout", type=float, default=5.0, help="seconds to listen (default 5)"
+    )
+    browse.add_argument(
+        "--user",
+        help="username to list as. Omit it to list anonymously, which many "
+        "servers allow and some do not.",
+    )
+    browse.add_argument(
+        "--stdin-password", action="store_true", help="read the password from stdin"
     )
 
     share = commands.add_parser("share", help="shares this machine serves")
@@ -437,6 +452,8 @@ def _cmd_connection_live(client: Client, args: argparse.Namespace) -> int:
 
 
 def _cmd_browse(client: Client, args: argparse.Namespace) -> int:
+    if args.host:
+        return _cmd_browse_shares(client, args)
     machines = client.call("browse", {"timeout": args.timeout})
 
     def human() -> str:
@@ -459,6 +476,31 @@ def _cmd_browse(client: Client, args: argparse.Namespace) -> int:
         )
 
     return _emit(args, machines, human)
+
+
+def _cmd_browse_shares(client: Client, args: argparse.Namespace) -> int:
+    """`smbpal browse HOST` — what that server offers.
+
+    Added 10 October 2026 after docs §6.19: a share on a Mac is called
+    `Luke H's Public Folder`, the obvious guess is `Public`, and until this
+    existed the only answer to a wrong guess was *the server has no share by
+    that name* with no way to find out what they were.
+    """
+    params: dict[str, object] = {"host": args.host, "timeout": args.timeout}
+    if args.user:
+        password = _read_password(args, f"Password for {args.user}@{args.host}: ")
+        if password is None:
+            return 2
+        params["username"] = args.user
+        params["password"] = password
+    shares = client.call("server.shares", params)
+
+    def human() -> str:
+        if not shares:
+            return f"{args.host} offers no shares, or did not say what it offers"
+        return render_table(shares, ("name", "kind", "comment"))
+
+    return _emit(args, shares, human)
 
 
 def _cmd_share_list(client: Client, args: argparse.Namespace) -> int:
