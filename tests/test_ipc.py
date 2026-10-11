@@ -872,3 +872,80 @@ class TestTheGroupAdviceFitsThePlatform(unittest.TestCase):
     def test_a_linux_member_is_told_about_the_session(self) -> None:
         said = self.advice("linux", member=True)
         self.assertIn("Log out and back in", said)
+
+
+class TestWaitingForTheRuntimeDirectory(unittest.TestCase):
+    """The boot race, closed where the condition actually is.
+
+    **`/var/run` does not survive a reboot on macOS** -- `/var/run/smbpal` had a
+    birth time six seconds later than `kern.boottime`, measured 11 October 2026
+    -- and there the daemon is not root, so `mkdir` under `/var/run`
+    (`root:daemon`) is `EPERM`. The privileged helper creates the directory,
+    launchd gives no ordering between the two jobs, and a daemon that loses the
+    race would exit on the failed bind.
+
+    `KeepAlive` was the first answer and came back out: launchd cannot tell a
+    lost race from a config the daemon refused to start on, and it refuses on
+    purpose. So the wait is here, and what these tests pin is that it waits for
+    **one** condition and reports everything else at once.
+    """
+
+    def transport(self, path: Path) -> UnixSocketTransport:
+        return UnixSocketTransport(path=path, group=None)
+
+    def test_it_creates_the_directory_when_it_can(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "runtime" / "smbpald.sock"
+            self.transport(target)._ensure_runtime_directory()
+            self.assertTrue(target.parent.is_dir())
+
+    def test_it_returns_as_soon_as_the_directory_appears(self) -> None:
+        """The helper creating it is the thing being waited for, so the wait
+        must end on the directory existing and not on the clock."""
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "runtime"
+            transport = self.transport(directory / "smbpald.sock")
+            attempts = []
+            real_mkdir = Path.mkdir
+
+            def refuse_once(self: Path, *args: object, **kwargs: object) -> None:
+                attempts.append(self)
+                if len(attempts) == 1:
+                    # What macOS does: not allowed, and somebody else will.
+                    real_mkdir(self, parents=True, exist_ok=True)
+                    raise PermissionError(13, "Permission denied")
+
+            with mock.patch.object(Path, "mkdir", refuse_once):
+                with mock.patch("smbpal.ipc.server.time.sleep") as slept:
+                    transport._ensure_runtime_directory()
+            self.assertEqual(len(attempts), 1)
+            slept.assert_not_called()
+
+    def test_it_does_not_wait_for_anything_but_permission(self) -> None:
+        """**The point of the whole design.** Waiting on any error would turn a
+        real misconfiguration into a thirty-second pause followed by the same
+        message, which is the behaviour `KeepAlive` was removed for."""
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = self.transport(Path(tmp) / "runtime" / "smbpald.sock")
+            with mock.patch.object(
+                Path, "mkdir", side_effect=OSError(28, "No space left on device")
+            ):
+                with mock.patch("smbpal.ipc.server.time.sleep") as slept:
+                    with self.assertRaises(OSError) as caught:
+                        transport._ensure_runtime_directory()
+            self.assertEqual(caught.exception.errno, 28)
+            slept.assert_not_called()
+
+    def test_it_gives_up_rather_than_waiting_for_ever(self) -> None:
+        """A helper that never starts is a different problem, and a daemon that
+        hangs on it instead of exiting is one nobody can diagnose."""
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = self.transport(Path(tmp) / "runtime" / "smbpald.sock")
+            clock = iter([0.0] + [100.0] * 8)
+            with mock.patch.object(
+                Path, "mkdir", side_effect=PermissionError(13, "Permission denied")
+            ):
+                with mock.patch("smbpal.ipc.server.time.monotonic", lambda: next(clock)):
+                    with mock.patch("smbpal.ipc.server.time.sleep"):
+                        with self.assertRaises(PermissionError):
+                            transport._ensure_runtime_directory()

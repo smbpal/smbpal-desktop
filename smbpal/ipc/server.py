@@ -20,6 +20,7 @@ import socket
 import stat
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Iterator
 
@@ -60,6 +61,25 @@ DEFAULT_SOCKET_PATH = default_socket_path()
 DEFAULT_SOCKET_GROUP = "smbpal"
 _SOCKET_MODE = 0o660
 _RUNTIME_DIR_MODE = 0o750
+
+# **macOS only in practice, and it closes a measured race.** `/var/run` does not
+# survive a reboot -- `/var/run/smbpal` had a birth time six seconds later than
+# `kern.boottime`, measured 11 October 2026 -- and on macOS the daemon is not
+# root, so `mkdir` under `/var/run` (root:daemon) is EPERM. The privileged
+# helper makes the directory, launchd gives no ordering between the two jobs,
+# and a daemon that loses the race would otherwise exit on the failed bind.
+#
+# Waiting here rather than letting launchd restart the job, because launchd
+# cannot tell *why* a job exited: the daemon returns 2 on an invalid config and
+# means it, so `KeepAlive` turned a deliberate refusal into a flapping service.
+# This waits for the one condition that is genuinely transient and nothing else.
+#
+# Thirty seconds because the helper creates the directory as its first act at
+# `RunAtLoad` -- it won the real race by about two seconds -- so this is two
+# orders of magnitude of slack and still bounded. On Linux the daemon is root,
+# creates the directory itself, and never reaches the wait at all.
+_RUNTIME_DIR_WAIT_SECONDS = 30.0
+_RUNTIME_DIR_POLL_SECONDS = 0.25
 
 # Directories the daemon will never take ownership of, however it is invoked.
 # Checked both as given and resolved, so /var/run catches as the /run symlink
@@ -205,10 +225,47 @@ class UnixSocketTransport:
     def address(self) -> str:
         return str(self.path)
 
+    def _ensure_runtime_directory(self) -> None:
+        """Make the socket's directory, or wait for whoever can to make it.
+
+        **Only `PermissionError` waits.** Every other failure is reported at
+        once, because "I am not allowed to create this" is the single reason
+        that someone else might be about to, and treating any other error as
+        transient would turn a real misconfiguration into a thirty-second pause
+        followed by the same message.
+        """
+        directory = self.path.parent
+        deadline = time.monotonic() + _RUNTIME_DIR_WAIT_SECONDS
+        announced = False
+        while True:
+            try:
+                directory.mkdir(parents=True, exist_ok=True, mode=_RUNTIME_DIR_MODE)
+                return
+            except PermissionError:
+                # Checked after the attempt rather than before: the helper may
+                # have created it in between, and then there is nothing to wait
+                # for. `mkdir(exist_ok=True)` does not re-chmod an existing
+                # directory, so the helper's ownership of it stands.
+                if directory.is_dir():
+                    return
+                if time.monotonic() >= deadline:
+                    raise
+                if not announced:
+                    # Once, not every quarter second. A log that says this
+                    # thirty times is a log that hides the one line that matters.
+                    log.info(
+                        "%s does not exist yet and this process may not create "
+                        "it; waiting up to %.0fs for the privileged helper",
+                        directory,
+                        _RUNTIME_DIR_WAIT_SECONDS,
+                    )
+                    announced = True
+                time.sleep(_RUNTIME_DIR_POLL_SECONDS)
+
     # --- lifecycle ---------------------------------------------------------
 
     def bind(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=_RUNTIME_DIR_MODE)
+        self._ensure_runtime_directory()
         self._clear_stale_socket()
 
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
