@@ -49,6 +49,14 @@
 #define DSCL "/usr/bin/dscl"
 #define STATE_DIR "/var/db/smbpal"
 #define CREATED_FILE STATE_DIR "/created"
+#define CONFIG_DIR "/etc/smbpal"
+#define LAUNCHD_DIR "/Library/LaunchDaemons"
+#define HELPER_LABEL "app.smbpal.helper"
+#define DAEMON_LABEL "app.smbpal.daemon"
+#define HELPER_PLIST LAUNCHD_DIR "/" HELPER_LABEL ".plist"
+#define DAEMON_PLIST LAUNCHD_DIR "/" DAEMON_LABEL ".plist"
+#define LAUNCHCTL "/bin/launchctl"
+#define SELF "/usr/local/libexec/smbpal/smbpal-helper"
 
 /* 450 is the preference and not the value. §9: 450-499 is where Apple puts role
  * accounts -- `sysadminctl -addUser -roleAccount` requires it, measured
@@ -218,16 +226,66 @@ static void note_created(const char *kind, const char *name, int id) {
     chmod(CREATED_FILE, 0644);
 }
 
-static int install(int dry_run) {
+/* The plists are written here rather than substituted from a shipped template,
+ * so there is one source of truth for what launchd is told. A `.in` file and
+ * this function would be two, and the one that drifts is always the one nobody
+ * runs. */
+static int write_plist(const char *path, const char *label, const char *const args[],
+                       const char *user) {
+    FILE *fh = fopen(path, "w");
+    if (fh == NULL) return -1;
+    fprintf(fh, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+                "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+                "<!-- Written by smbpal-helper install. Do not edit. -->\n"
+                "<plist version=\"1.0\">\n<dict>\n"
+                "  <key>Label</key><string>%s</string>\n", label);
+    if (user != NULL)
+        fprintf(fh, "  <key>UserName</key><string>%s</string>\n", user);
+    fprintf(fh, "  <key>ProgramArguments</key>\n  <array>\n");
+    for (int i = 0; args[i] != NULL; i++)
+        fprintf(fh, "    <string>%s</string>\n", args[i]);
+    /* No KeepAlive. A component that respawns after refusing something hides
+     * the refusal, and launchd's own log is the record. */
+    fprintf(fh, "  </array>\n"
+                "  <key>RunAtLoad</key><true/>\n"
+                "  <key>StandardErrorPath</key><string>/var/log/%s.log</string>\n"
+                "</dict>\n</plist>\n", label);
+    if (fclose(fh) != 0) return -1;
+    if (chown(path, 0, 0) != 0) return -1;
+    return chmod(path, 0644);
+}
+
+static int bootstrap(const char *path) {
+    char *const argv[] = {(char *)LAUNCHCTL, "bootstrap", "system", (char *)path, NULL};
+    return run_quiet(argv);
+}
+
+static int bootout(const char *label) {
+    char target[128];
+    snprintf(target, sizeof target, "system/%s", label);
+    char *const argv[] = {(char *)LAUNCHCTL, "bootout", target, NULL};
+    return run_quiet(argv);
+}
+
+static int install(int dry_run, const char *daemon_path) {
     struct group *gr = getgrnam(SOCKET_GROUP);
     struct passwd *pw = getpwnam(SERVICE_USER);
     int id = -1;
     char number[16];
 
-    if (gr != NULL && pw != NULL) {
-        printf("already installed: %s uid=%u, %s gid=%u\n", SERVICE_USER,
-               (unsigned)pw->pw_uid, SOCKET_GROUP, (unsigned)gr->gr_gid);
-        return 0;
+    if (gr != NULL && pw != NULL && !dry_run) {
+        /* **Refuse rather than repair.** A second install would have to decide
+         * whether to re-bootstrap, re-chown and rewrite plists it may not have
+         * written, against identities it may not have created -- and the state
+         * file is the only record of which. Removing and installing is two
+         * commands that each do one knowable thing. */
+        fprintf(stderr,
+                "smbpal-helper: already installed (%s uid=%u, %s gid=%u)\n"
+                "  to change it: sudo %s uninstall, then install again\n",
+                SERVICE_USER, (unsigned)pw->pw_uid, SOCKET_GROUP,
+                (unsigned)gr->gr_gid, SELF);
+        return 1;
     }
 
     if (gr == NULL || pw == NULL) {
@@ -306,8 +364,99 @@ static int install(int dry_run) {
                               (char *)"GroupMembership", (char *)SERVICE_USER, NULL};
         run_quiet(argv);
     }
-    printf("installed: %s uid=%u in %s gid=%u\n", SERVICE_USER,
-           (unsigned)pw->pw_uid, SOCKET_GROUP, (unsigned)gr->gr_gid);
+    /* The config tree, owned by the account that writes it. §9: on macOS the
+     * daemon is not root, so root-owned config would be unwritable -- and what
+     * contains an admin rewriting it is the helper validating intents, not the
+     * mode on this directory. */
+    if (mkdir(CONFIG_DIR, 0750) != 0 && errno != EEXIST) fail("mkdir " CONFIG_DIR);
+    if (chown(CONFIG_DIR, pw->pw_uid, gr->gr_gid) != 0) fail("chown " CONFIG_DIR);
+    if (chmod(CONFIG_DIR, 0750) != 0) fail("chmod " CONFIG_DIR);
+
+    {
+        const char *helper_args[] = {SELF, "serve", "--service-user", SERVICE_USER, NULL};
+        /* **The daemon's plist may point into the Homebrew prefix and the
+         * helper's may not**, and the asymmetry is the whole architecture: §0
+         * forbids *root* executing admin-writable code, and the daemon does not
+         * run as root. So this path is checked for being absolute and
+         * executable and is deliberately not checked for being admin-writable,
+         * because it will be. */
+        const char *daemon_args[] = {daemon_path, "--socket",
+                                     RUNTIME_DIR "/smbpald.sock", NULL};
+        if (write_plist(HELPER_PLIST, HELPER_LABEL, helper_args, NULL) != 0)
+            fail("write " HELPER_PLIST);
+        if (write_plist(DAEMON_PLIST, DAEMON_LABEL, daemon_args, SERVICE_USER) != 0)
+            fail("write " DAEMON_PLIST);
+        if (bootstrap(HELPER_PLIST) != 0)
+            fprintf(stderr, "smbpal-helper: warning: bootstrap of " HELPER_LABEL
+                            " did not succeed; see launchctl error\n");
+        if (bootstrap(DAEMON_PLIST) != 0)
+            fprintf(stderr, "smbpal-helper: warning: bootstrap of " DAEMON_LABEL
+                            " did not succeed; see launchctl error\n");
+    }
+
+    /* The uid is named because the scan may not have landed on the preference,
+     * and a service account quietly sitting on 467 is a surprise somebody finds
+     * out about while debugging something else. */
+    printf("installed\n"
+           "  user   %s  uid %u\n"
+           "  group  %s  gid %u\n"
+           "  helper %s\n"
+           "  daemon %s\n",
+           SERVICE_USER, (unsigned)pw->pw_uid, SOCKET_GROUP,
+           (unsigned)gr->gr_gid, HELPER_PLIST, DAEMON_PLIST);
+    return 0;
+}
+
+/* Removes what the install recorded and nothing else -- §10.6. The order is
+ * §4's, learned on 11 October 2026: an ACE outlives the account it names and
+ * orphans to a raw UUID, and ownership does the same, so files go before the
+ * account and the account before the group. */
+static int uninstall(void) {
+    FILE *fh;
+    char kind[32], name[128];
+    int id;
+    int removed = 0;
+
+    if (geteuid() != 0) {
+        fprintf(stderr, "smbpal-helper: uninstall must run as root\n");
+        return 1;
+    }
+
+    bootout(DAEMON_LABEL);
+    bootout(HELPER_LABEL);
+    unlink(DAEMON_PLIST);
+    unlink(HELPER_PLIST);
+    unlink(HELPER_SOCK);
+    unlink(RUNTIME_DIR "/smbpald.sock");
+    rmdir(RUNTIME_DIR);
+
+    if ((fh = fopen(CREATED_FILE, "r")) == NULL) {
+        printf("nothing recorded as created; left the identities alone\n");
+        return 0;
+    }
+    /* Users before groups regardless of the order they were written, because a
+     * group with a member still in it is a group that does not go away. */
+    for (int pass = 0; pass < 2; pass++) {
+        rewind(fh);
+        while (fscanf(fh, "%31s %127s %d", kind, name, &id) == 3) {
+            int want_user = (pass == 0);
+            if ((strcmp(kind, "user") == 0) != want_user) continue;
+            char path[160];
+            snprintf(path, sizeof path, "/%s/%s",
+                     want_user ? "Users" : "Groups", name);
+            char *const argv[] = {(char *)DSCL, ".", "-delete", path, NULL};
+            run_quiet(argv);
+            /* §4: verify the effect, do not trust the exit code. */
+            int gone = want_user ? (getpwnam(name) == NULL) : (getgrnam(name) == NULL);
+            printf("%s %s %s\n", gone ? "removed" : "COULD NOT REMOVE", kind, name);
+            if (gone) removed++;
+        }
+    }
+    fclose(fh);
+    unlink(CREATED_FILE);
+    rmdir(STATE_DIR);
+    printf("removed %d recorded %s\n", removed, removed == 1 ? "identity" : "identities");
+    printf("left alone: " CONFIG_DIR " and anything under it\n");
     return 0;
 }
 
@@ -364,9 +513,10 @@ static void serve_one(int conn) {
 
 static void usage(const char *program) {
     fprintf(stderr,
-            "usage: %s install [--dry-run]\n"
+            "usage: %s install --daemon <path to smbpald> [--dry-run]\n"
+            "       %s uninstall\n"
             "       %s serve --service-user <name> [--check]\n",
-            program, program);
+            program, program, program);
 }
 
 int main(int argc, char **argv) {
@@ -382,15 +532,44 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (strcmp(argv[1], "install") == 0) {
+        const char *daemon_path = NULL;
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--dry-run") == 0) {
                 dry_run = 1;
+            } else if (strcmp(argv[i], "--daemon") == 0 && i + 1 < argc) {
+                daemon_path = argv[++i];
             } else {
                 usage(argv[0]);
                 return 2;
             }
         }
-        return install(dry_run);
+        if (!dry_run) {
+            /* The path comes from the caller because the Homebrew prefix is not
+             * one place: /opt/homebrew on Apple silicon, /usr/local on Intel.
+             * `smbpal setup` knows its own and prints it, which is why that is
+             * the documented front door. */
+            if (daemon_path == NULL) {
+                fprintf(stderr, "smbpal-helper: --daemon <path to smbpald> is required\n");
+                return 2;
+            }
+            if (daemon_path[0] != '/') {
+                fprintf(stderr, "smbpal-helper: --daemon must be an absolute path\n");
+                return 2;
+            }
+            if (access(daemon_path, X_OK) != 0) {
+                fprintf(stderr, "smbpal-helper: --daemon %s is not executable\n",
+                        daemon_path);
+                return 2;
+            }
+        }
+        return install(dry_run, daemon_path);
+    }
+    if (strcmp(argv[1], "uninstall") == 0) {
+        if (argc != 2) {
+            usage(argv[0]);
+            return 2;
+        }
+        return uninstall();
     }
     if (strcmp(argv[1], "serve") != 0) {
         usage(argv[0]);

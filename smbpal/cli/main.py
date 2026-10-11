@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import grp
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -28,7 +30,7 @@ from smbpal.discovery import identity
 from smbpal.discovery.shares import Share, mountable
 from smbpal.errors import DaemonUnreachable, NotFound, SmbpalError
 from smbpal.mounts.probe import server_reachable
-from smbpal.ipc.client import Client
+from smbpal.ipc.client import GROUP, Client
 from smbpal.ipc.server import DEFAULT_SOCKET_PATH
 from smbpal.samba.passwd import posix_user_exists
 
@@ -62,6 +64,9 @@ def build_parser() -> argparse.ArgumentParser:
     commands.required = True
 
     commands.add_parser("status", help="what is configured, and its state")
+    commands.add_parser(
+        "setup", help="what is left to do by hand, and the commands to do it"
+    )
     commands.add_parser("ping", help="check the daemon is answering")
 
     browse = commands.add_parser(
@@ -271,7 +276,18 @@ def _asking_for_authorisation(agent: TtyAgent) -> Callable[[], bool]:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    handler = _COMMANDS[(args.command, getattr(args, "subcommand", None))]
+    key = (args.command, getattr(args, "subcommand", None))
+    # **Before the client, not after.** `setup` reports on an install that may
+    # have no daemon yet -- that is the whole situation it exists for -- so
+    # routing it through `Client` would answer "no daemon is listening" to the
+    # one question whose answer is why.
+    if key in _WITHOUT_DAEMON:
+        try:
+            return _WITHOUT_DAEMON[key](args)
+        except SmbpalError as exc:
+            _fail(exc)
+            return EXIT_ERROR
+    handler = _COMMANDS[key]
     agent = TtyAgent()
     try:
         with Client(args.socket, on_denied=_asking_for_authorisation(agent)) as client:
@@ -1038,6 +1054,93 @@ _COMMANDS: dict[tuple[str, str | None], Handler] = {
     ("connection", "live"): _cmd_connection_live,
     ("teardown", None): _cmd_teardown,
     ("watch", None): _cmd_watch,
+}
+
+
+HELPER_INSTALLED = Path("/usr/local/libexec/smbpal/smbpal-helper")
+
+
+def _cmd_setup(args: argparse.Namespace) -> int:
+    """Say what is left to do by hand, and print the commands that do it.
+
+    **It reports and instructs; it does not act.** On macOS the last steps need
+    root, and `smbpal` is installed in a prefix any member of `admin` can write
+    to -- so a `setup` that elevated would be the escalation the helper exists to
+    avoid (`docs/phase-2/macos-helper-spike.md` §0). Printing a command the
+    person reads before typing is the honest shape, and it is also the one that
+    lets them check the binary first.
+    """
+    if sys.platform != "darwin":
+        print("Nothing to do: the package installs and starts the daemon.")
+        print("  systemctl status smbpald")
+        return 0
+
+    smbpald = shutil.which("smbpald")
+    group_there = _group_exists(GROUP)
+    helper_there = HELPER_INSTALLED.exists()
+
+    print("SMBPal on macOS needs two things that an unprivileged install cannot do:")
+    print("  - a root-owned copy of the helper, which is the only part that runs as root")
+    print("  - launchd jobs for the helper and the daemon")
+    print()
+    print(f"  helper installed   {'yes' if helper_there else 'no'}  {HELPER_INSTALLED}")
+    print(f"  identities created {'yes' if group_there else 'no'}  group {GROUP}")
+    print(f"  smbpald on PATH    {smbpald or 'no'}")
+    print()
+
+    if helper_there and group_there:
+        print("Set up already. To change it, remove it first -- the install")
+        print("refuses to run twice rather than guess which half to repair:")
+        print(f"  sudo {HELPER_INSTALLED} uninstall")
+        return 0
+
+    source = _helper_source()
+    if source is None:
+        print("The helper is not built yet. From a source checkout:")
+        print("  make -C helper")
+        print("then run `smbpal setup` again.")
+        return 1
+
+    if smbpald is None:
+        print("`smbpald` is not on PATH, so the daemon's path cannot be named.")
+        return 1
+
+    print("Run these, in order. Read them before you run them: the first two")
+    print("are system commands, and nothing of SMBPal's runs as root until the")
+    print("third, which by then is a root-owned file:")
+    print()
+    print(f"  sudo install -d -o root -g wheel -m 755 {HELPER_INSTALLED.parent}")
+    print(f"  sudo install -o root -g wheel -m 755 {source} {HELPER_INSTALLED}")
+    print(f"  sudo {HELPER_INSTALLED} install --daemon {smbpald}")
+    print()
+    print("The last one names the uid and gid it chose. It prefers 450 and takes")
+    print("the next free number in 450-499 if something else holds it, so the")
+    print("number it prints is worth reading rather than assuming.")
+    return 0
+
+
+def _group_exists(name: str) -> bool:
+    try:
+        grp.getgrnam(name)
+    except KeyError:
+        return False
+    return True
+
+
+def _helper_source() -> Path | None:
+    """Where an unprivileged copy of the helper can be found to install from.
+
+    The formula does not ship it yet, so a source checkout is the only answer
+    today and saying so beats naming a path that is not there.
+    """
+    candidate = Path(__file__).resolve().parent.parent.parent / "helper" / "smbpal-helper"
+    return candidate if candidate.exists() else None
+
+
+# Commands that must run with no daemon, dispatched before one is contacted.
+# Declared after its handlers, as `_COMMANDS` is.
+_WITHOUT_DAEMON: dict[tuple[str, str | None], Callable[[argparse.Namespace], int]] = {
+    ("setup", None): _cmd_setup,
 }
 
 

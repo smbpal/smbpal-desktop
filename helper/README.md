@@ -61,17 +61,45 @@ when we arrived is somebody else's.
 
 ```sh
 make                                   # -Wall -Wextra -Werror; macOS only
-sudo make install PREFIX=/usr/local    # root-owned storage: the whole point
-
 ./smbpal-helper install --dry-run      # what it would choose; needs no root
-sudo ./smbpal-helper install           # creates the pair, idempotent
 ./smbpal-helper serve --service-user _smbpald --check
-sudo ./smbpal-helper serve --service-user _smbpald
 ```
 
-**`--dry-run` and `--check` both need no root** — between them they answer *what
-will this do* and *is it set up*, which are the two questions somebody has before
+**`smbpal setup` is the front door**, and it prints the rest rather than running
+it. On macOS it reports what is installed and then names three commands:
+
+```sh
+sudo install -d -o root -g wheel -m 755 /usr/local/libexec/smbpal
+sudo install -o root -g wheel -m 755 <built helper> /usr/local/libexec/smbpal/smbpal-helper
+sudo /usr/local/libexec/smbpal/smbpal-helper install --daemon <path to smbpald>
+```
+
+**The order is the property worth having: nothing of SMBPal's runs as root until
+the third command, and by then it is a root-owned file.** The first two are
+`install(1)`, a system binary. A `setup` that elevated by itself, or a one-liner
+that ran the Homebrew copy under `sudo`, would both put admin-writable code
+behind root — once, briefly, but that is the thing §0 is about.
+
+`--daemon` has no default because the Homebrew prefix is not one place —
+`/opt/homebrew` on Apple silicon, `/usr/local` on Intel — and `smbpal setup`
+knows its own, which is why it is the documented route.
+
+**`--dry-run` and `--check` need no root.** Between them they answer *what will
+this do* and *is it set up*, which are the two questions somebody has before
 they are willing to type a password.
+
+## Installing twice, and uninstalling
+
+**`install` refuses to run twice** and points at `uninstall`. Repairing would
+mean deciding whether to re-bootstrap, re-chown and rewrite plists it may not
+have written, against identities it may not have created — and
+`/var/db/smbpal/created` is the only record of which. Remove and install is two
+commands that each do one knowable thing.
+
+`uninstall` removes **what the install recorded and nothing else**, in the order
+the account spike's §4 established: owned files before the account, the account
+before the group, because an ACE outlives the account it names and orphans to a
+raw UUID. `/etc/smbpal` and its contents are left alone and it says so.
 
 ## Not here yet
 

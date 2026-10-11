@@ -13,9 +13,11 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import unittest.mock
 from pathlib import Path
 
+from smbpal.cli import main as cli_main
 from smbpal.cli.main import (
     EXIT_ERROR,
     EXIT_NO_DAEMON,
@@ -926,3 +928,102 @@ class TestSelinuxNotes(unittest.TestCase):
         from smbpal.cli.main import selinux_notes
 
         self.assertEqual(selinux_notes([]), [])
+
+
+class TestSetupSaysWhatIsLeftToDoByHand(unittest.TestCase):
+    """`smbpal setup`, which must work when there is no daemon at all.
+
+    That is the whole situation it exists for -- a macOS install where the
+    launchd jobs have not been created yet -- so it is dispatched before the
+    client is built. A `setup` routed through `Client` would answer *no daemon is
+    listening* to the one question whose answer is why.
+
+    **Both platform branches are exercised wherever this runs.** The macOS path
+    is the interesting one and CI is Linux, so the platform is patched rather
+    than skipped: `config/operations.py`'s `platform_style` takes a platform for
+    the same reason.
+    """
+
+    def run_setup(self) -> tuple[int, str]:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = main(["setup"])
+        return code, out.getvalue()
+
+    def test_on_linux_it_says_the_package_did_it(self) -> None:
+        with mock.patch.object(cli_main.sys, "platform", "linux"):
+            code, out = self.run_setup()
+        self.assertEqual(code, 0)
+        self.assertIn("Nothing to do", out)
+        self.assertIn("systemctl", out)
+
+    def test_it_prints_the_three_commands_in_order(self) -> None:
+        with (
+            mock.patch.object(cli_main.sys, "platform", "darwin"),
+            mock.patch.object(cli_main, "HELPER_INSTALLED", Path("/nope/smbpal-helper")),
+            mock.patch.object(cli_main, "_group_exists", return_value=False),
+            mock.patch.object(cli_main, "_helper_source", return_value=Path("/src/helper")),
+            mock.patch.object(cli_main.shutil, "which", return_value="/opt/hb/bin/smbpald"),
+        ):
+            code, out = self.run_setup()
+        self.assertEqual(code, 0)
+        install_d = out.index("install -d")
+        copy = out.index("/src/helper /nope/smbpal-helper")
+        helper_install = out.index("install --daemon /opt/hb/bin/smbpald")
+        # The order is the point: nothing of ours runs as root until the copy
+        # has landed in root-owned storage.
+        self.assertLess(install_d, copy)
+        self.assertLess(copy, helper_install)
+
+    def test_it_names_the_daemon_path_it_found_rather_than_a_prefix(self) -> None:
+        """The Homebrew prefix is not one place: `/opt/homebrew` on Apple
+        silicon, `/usr/local` on Intel. The helper takes `--daemon` for that
+        reason and this is what fills it in."""
+        with (
+            mock.patch.object(cli_main.sys, "platform", "darwin"),
+            mock.patch.object(cli_main, "HELPER_INSTALLED", Path("/nope/h")),
+            mock.patch.object(cli_main, "_group_exists", return_value=False),
+            mock.patch.object(cli_main, "_helper_source", return_value=Path("/src/h")),
+            mock.patch.object(cli_main.shutil, "which", return_value="/usr/local/bin/smbpald"),
+        ):
+            _, out = self.run_setup()
+        self.assertIn("--daemon /usr/local/bin/smbpald", out)
+
+    def test_when_set_up_it_points_at_uninstall_rather_than_repeating_itself(self) -> None:
+        """The install refuses to run twice, so `setup` must not suggest it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            installed = Path(tmp) / "smbpal-helper"
+            installed.write_text("")
+            with (
+                mock.patch.object(cli_main.sys, "platform", "darwin"),
+                mock.patch.object(cli_main, "HELPER_INSTALLED", installed),
+                mock.patch.object(cli_main, "_group_exists", return_value=True),
+                mock.patch.object(cli_main.shutil, "which", return_value="/x/smbpald"),
+            ):
+                code, out = self.run_setup()
+        self.assertEqual(code, 0)
+        self.assertIn("uninstall", out)
+        self.assertNotIn("--daemon", out)
+
+    def test_it_says_so_when_the_helper_is_not_built(self) -> None:
+        with (
+            mock.patch.object(cli_main.sys, "platform", "darwin"),
+            mock.patch.object(cli_main, "HELPER_INSTALLED", Path("/nope/h")),
+            mock.patch.object(cli_main, "_group_exists", return_value=False),
+            mock.patch.object(cli_main, "_helper_source", return_value=None),
+        ):
+            code, out = self.run_setup()
+        self.assertEqual(code, 1)
+        self.assertIn("make -C helper", out)
+
+    def test_it_says_so_when_smbpald_is_not_on_path(self) -> None:
+        with (
+            mock.patch.object(cli_main.sys, "platform", "darwin"),
+            mock.patch.object(cli_main, "HELPER_INSTALLED", Path("/nope/h")),
+            mock.patch.object(cli_main, "_group_exists", return_value=False),
+            mock.patch.object(cli_main, "_helper_source", return_value=Path("/src/h")),
+            mock.patch.object(cli_main.shutil, "which", return_value=None),
+        ):
+            code, out = self.run_setup()
+        self.assertEqual(code, 1)
+        self.assertIn("not on PATH", out)
