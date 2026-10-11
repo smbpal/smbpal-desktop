@@ -27,6 +27,7 @@ from smbpal.errors import (
     NotFound,
     NeedsAuthorisation,
     NotPermitted,
+    NotSupported,
     SmbpalError,
     UnknownMethod,
 )
@@ -264,11 +265,33 @@ class Authoriser:
 class Dispatcher:
     """Turns framed bytes into framed bytes. Owns nothing it does not need to."""
 
+    # **Everything that ends in Samba.** Serving a share means writing Samba's
+    # configuration, reloading it and verifying what it took; an SMB account
+    # means `pdbedit`. macOS has none of that, and `smbpal setup` installing a
+    # daemon there made these reachable for the first time.
+    #
+    # `share.list` is deliberately absent: it asks Samba what it is serving and
+    # already treats no answer as "unknown" rather than an error, so it degrades
+    # instead of failing. `connection.*` is absent because mounting needs no
+    # Samba at all -- on macOS it is the user's own agent (D13).
+    SERVING_METHODS = frozenset(
+        {
+            "share.add",
+            "share.remove",
+            "share.make_writable",
+            "apply",
+            "teardown",
+            "credential.set",
+            "credential.remove",
+        }
+    )
+
     def __init__(
         self,
         store: ConfigStore,
         *,
         authoriser: Authoriser | None = None,
+        serving: bool = True,
         applier: Applier | None = None,
         mounter: Mounter | None = None,
         monitor: StateMonitor | None = None,
@@ -280,6 +303,7 @@ class Dispatcher:
         # depend on the host's Avahi or its network interfaces.
         self.identity = identity
         self.authoriser = authoriser or Authoriser()
+        self.serving = serving
         # None means config-only: useful on a development machine with no
         # Samba, and the reason --no-apply exists.
         self.applier = applier
@@ -303,6 +327,20 @@ class Dispatcher:
             method = _METHODS.get(request.method)
             if method is None:
                 raise UnknownMethod(f"no such method: {request.method}")
+            # **Unsupported before permission**, for the same reason as
+            # existence before permission above: prompting someone for an
+            # administrator password and then telling them the platform cannot
+            # do it is worse than either answer on its own.
+            if not self.serving and request.method in self.SERVING_METHODS:
+                raise NotSupported(
+                    f"{request.method} is not supported on this platform yet",
+                    detail=(
+                        "serving a folder over SMB means writing Samba's "
+                        "configuration, which this platform does not use. "
+                        "Connecting to shares other machines serve does work: "
+                        "see `smbpal browse` and `smbpal connection add`."
+                    ),
+                )
             self.authoriser.check(connection.peer, request.method, request.auth)
             result = method(self, request, connection.peer)
             return encode_success(request.id, result)

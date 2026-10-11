@@ -26,6 +26,7 @@ from smbpal.errors import (
     BadRequest,
     DaemonUnreachable,
     NotPermitted,
+    NotSupported,
     UnknownMethod,
     UnsupportedVersion,
 )
@@ -48,7 +49,7 @@ class ServerTestCase(unittest.TestCase):
         root = Path(self._dir.name)
         self.socket_path = root / "s.sock"
         self.store = ConfigStore(root / "config.json")
-        self.dispatcher = Dispatcher(self.store)
+        self.dispatcher = self.make_dispatcher()
         # No group: tests do not run as root and must not need to.
         self.transport = UnixSocketTransport(self.socket_path, group=None)
         self.transport.bind()
@@ -59,6 +60,14 @@ class ServerTestCase(unittest.TestCase):
         )
         self.thread.start()
         self.addCleanup(self._stop)
+
+    def make_dispatcher(self) -> Dispatcher:
+        """Overridden by cases that need a differently configured daemon.
+
+        A hook rather than a copy of `setUp`: the binding, the thread and the
+        cleanup are the fiddly part and are the same every time.
+        """
+        return Dispatcher(self.store)
 
     def _stop(self) -> None:
         self.transport.shutdown()
@@ -949,3 +958,87 @@ class TestWaitingForTheRuntimeDirectory(unittest.TestCase):
                     with mock.patch("smbpal.ipc.server.time.sleep"):
                         with self.assertRaises(PermissionError):
                             transport._ensure_runtime_directory()
+
+
+
+class TestAPlatformThatCannotServe(ServerTestCase):
+    """What a macOS user saw when they tried to share a folder.
+
+    ```
+    smbpal: cannot write /etc/samba/smbpal.conf
+      [Errno 13] Permission denied: '/etc/samba'
+    ```
+
+    A path that has never existed on their machine, naming a program they do
+    not have, suggesting a `chmod` that would not help -- and reached **after**
+    an administrator password prompt, because the write is deep inside the
+    handler and authorisation happens before the handler runs.
+
+    `smbpal setup` installing a daemon on macOS is what made these methods
+    reachable at all. D12 is why there is no partial answer to offer instead:
+    `_commit` is save-then-apply because "a config edit that the daemon has not
+    applied is a lie", so no define-but-do-not-serve state exists.
+    """
+
+    def make_dispatcher(self) -> Dispatcher:
+        return Dispatcher(self.store, serving=False)
+
+    def test_every_serving_method_is_refused_by_name(self) -> None:
+        client = self.client()
+        for method in sorted(Dispatcher.SERVING_METHODS):
+            with self.subTest(method=method):
+                with self.assertRaises(NotSupported) as caught:
+                    client.call(method, {})
+                self.assertIn(method, caught.exception.message)
+
+    def test_the_refusal_names_nothing_this_platform_lacks(self) -> None:
+        """The whole point. A permission error about `/etc/samba` sends someone
+        looking for a permission to grant."""
+        with self.assertRaises(NotSupported) as caught:
+            self.client().call("share.add", {})
+        blob = f"{caught.exception.message} {caught.exception.detail}"
+        self.assertNotIn("/etc/samba", blob)
+        self.assertNotIn("Permission denied", blob)
+        # And it points at the half that does work.
+        self.assertIn("connection add", blob)
+
+    def test_reading_still_works(self) -> None:
+        """`share.list` asks Samba what it is serving and already treats no
+        answer as unknown, so it degrades rather than failing. Refusing it would
+        remove the one thing still able to say what is configured."""
+        self.assertNotIn("share.list", Dispatcher.SERVING_METHODS)
+        self.assertEqual(self.client().call("share.list"), [])
+
+    def test_connections_are_untouched(self) -> None:
+        """Mounting needs no Samba at all -- on macOS it is the user's own
+        agent (D13), which is the half that works."""
+        for method in ("connection.add", "connection.remove", "connection.connect"):
+            with self.subTest(method=method):
+                self.assertNotIn(method, Dispatcher.SERVING_METHODS)
+
+
+class TestItIsRefusedBeforeAuthorisation(ServerTestCase):
+    """Prompting for an administrator password and *then* saying the platform
+    cannot do it is worse than either answer on its own.
+
+    Same family as the existing existence-before-permission rule, and the
+    reason the guard sits beside it in `handle` rather than inside `_commit`.
+    """
+
+    def make_dispatcher(self) -> Dispatcher:
+        self.checker = RecordingChecker(answer=True)
+        return Dispatcher(
+            self.store,
+            authoriser=Authoriser(policy="polkit", checker=self.checker),
+            serving=False,
+        )
+
+    def test_the_authoriser_is_never_asked(self) -> None:
+        with self.assertRaises(NotSupported):
+            self.client().call("share.add", {})
+        self.assertEqual(self.checker.calls, [])
+
+
+class TestServingIsTheDefault(ServerTestCase):
+    def test_so_linux_is_unaffected(self) -> None:
+        self.assertTrue(self.dispatcher.serving)

@@ -88,6 +88,19 @@ class NeedsAuthorisation(SmbpalError):
         return wire
 
 
+class NotSupported(SmbpalError):
+    """The platform cannot do this yet, and saying so is the whole point.
+
+    **Not `NotPermitted`.** A permission error sends someone looking for a
+    permission to grant. The first thing a macOS user who tried to share a
+    folder saw was `cannot write /etc/samba/smbpal.conf: Permission denied` --
+    a path that has never existed on their machine, naming a program they do
+    not have, suggesting a `chmod` that would not help.
+    """
+
+    code = "not_supported"
+
+
 class NotFound(SmbpalError):
     """No share or connection by that id or name."""
 
