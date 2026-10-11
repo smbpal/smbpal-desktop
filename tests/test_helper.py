@@ -183,12 +183,49 @@ class TestTheInstallChoosesIdentities(TestTheHelperBuildsAndRefuses):
             with self.assertRaises(KeyError):
                 grp.getgrgid(int(chosen))
 
-    def test_install_without_dry_run_refuses_unprivileged(self) -> None:
+    def test_install_needs_the_daemon_path(self) -> None:
+        """A usage error, and reported before privilege is considered.
+
+        The Homebrew prefix is not one place -- `/opt/homebrew` on Apple
+        silicon, `/usr/local` on Intel -- so there is no default to fall back
+        on and `smbpal setup` is what fills it in.
+        """
+        done = self.run_helper("install")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("--daemon", done.stderr)
+
+    def test_install_rejects_a_relative_daemon_path(self) -> None:
+        done = self.run_helper("install", "--daemon", "bin/smbpald")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("absolute", done.stderr)
+
+    def test_install_rejects_a_daemon_path_that_is_not_executable(self) -> None:
+        done = self.run_helper("install", "--daemon", "/etc/hosts")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("not executable", done.stderr)
+
+    def test_install_refuses_unprivileged_once_the_arguments_are_good(self) -> None:
+        """Exit 2 is a usage error and exit 1 is a refusal, and the order
+        matters: somebody told to run `sudo` should be told why, not told to
+        elevate and then told their arguments were wrong."""
         if __import__("os").geteuid() == 0:
             self.skipTest("this asserts the refusal, so it needs a non-root runner")
-        done = self.run_helper("install")
+        done = self.run_helper("install", "--daemon", "/bin/sh")
         self.assertEqual(done.returncode, 1)
         self.assertIn("must run as root", done.stderr)
+
+    def test_uninstall_refuses_unprivileged(self) -> None:
+        if __import__("os").geteuid() == 0:
+            self.skipTest("this asserts the refusal, so it needs a non-root runner")
+        done = self.run_helper("uninstall")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("must run as root", done.stderr)
+
+    def test_uninstall_takes_no_arguments(self) -> None:
+        """Nothing to parameterise: it removes what the install recorded."""
+        done = self.run_helper("uninstall", "--all")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("usage", done.stderr)
 
 
 @unittest.skipUnless(sys.platform == "darwin", "the helper is macOS-only by design")
