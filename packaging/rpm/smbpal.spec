@@ -10,7 +10,7 @@
 # no second removal step.
 
 Name:           smbpal
-Version:        0.2.8
+Version:        0.2.9
 Release:        1%{?dist}
 Summary:        Share folders over SMB, and connect to shares on other machines
 
@@ -261,6 +261,14 @@ fi
 %{_datadir}/icons/hicolor/scalable/status/smbpal-attention.svg
 
 %changelog
+* Sun Oct 11 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.9-1
+- A connection you have just added appears in the file manager straight away.
+  Opening the share yourself within a few seconds of adding it meant no icon
+  in the sidebar or on the desktop until the next reboot.
+- On macOS, smbpal finds its own daemon. It looked for a socket in /run, which
+  macOS does not have and will not let anything create. Nothing changes on
+  Linux, where that path is correct.
+
 * Sat Oct 10 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.8-1
 - Macs appear under their real names. Any character outside plain ASCII was
   mangled, and macOS names a machine "<Name>'s MacBook Air" by default.

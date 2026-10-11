@@ -1,3 +1,18 @@
+smbpal (0.2.9) trixie; urgency=medium
+
+  * A connection you have just added now appears in your file manager
+    straight away. It could be missed altogether: if you opened the share
+    yourself within a few seconds of adding it -- which is the natural thing
+    to do -- no icon appeared in the sidebar or on the desktop, and nothing
+    brought it back until the next reboot. The faster you were, the more
+    likely you were to lose it.
+  * On macOS, `smbpal` finds its own daemon. It was looking for a socket in
+    `/run`, a directory macOS does not have and will not let anything create,
+    so every command answered that no daemon was listening. Nothing changes
+    on Linux, where that path is correct.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Sun, 11 Oct 2026 10:20:00 +0100
+
 smbpal (0.2.8) trixie; urgency=medium
 
   * Macs now appear under their real names. A name with any character outside
