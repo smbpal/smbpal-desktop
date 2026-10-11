@@ -26,6 +26,7 @@ from smbpal.errors import (
     InvalidParams,
     NeedsAuthorisation,
     NotPermitted,
+    NotSupported,
     SmbpalError,
     UnknownMethod,
     UnsupportedVersion,
@@ -146,6 +147,7 @@ _ERROR_CLASSES: dict[str, type[SmbpalError]] = {
         InvalidParams,
         NeedsAuthorisation,
         NotPermitted,
+        NotSupported,
         UnknownMethod,
         UnsupportedVersion,
     )

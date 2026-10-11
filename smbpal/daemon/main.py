@@ -129,6 +129,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--serve-shares",
+        choices=("auto", "yes", "no"),
+        default="auto",
+        help="whether this daemon can serve folders over SMB. 'auto' (default) "
+        "picks by platform: everywhere except macOS, which has no Samba to "
+        "write a configuration for. The other two force it, which is for "
+        "development. A daemon that cannot serve says so at startup and "
+        "refuses those methods by name rather than failing partway through "
+        "writing a file.",
+    )
+    parser.add_argument(
         "--authorisation",
         default=None,
         choices=Authoriser.POLICIES,
@@ -236,9 +247,21 @@ def main(argv: list[str] | None = None) -> int:
             "they install it with `smbpal-agent --install`"
         )
 
+    # The same shape as `--mount-via auto` above: the platform decision in one
+    # place rather than a `sys.platform` test inside the handlers.
+    serving = args.serve_shares == "yes" or (
+        args.serve_shares == "auto" and sys.platform != "darwin"
+    )
+    if not serving:
+        log.info(
+            "serving folders over SMB is not supported on this platform yet; "
+            "connecting to shares other machines serve does work"
+        )
+
     dispatcher = Dispatcher(
         store,
         authoriser=Authoriser(policy=_policy(args.authorisation)),
+        serving=serving,
         applier=applier,
         mounter=mounter,
         monitor=monitor,
