@@ -21,7 +21,7 @@ performs whatever it is asked is a root-escalation service with a socket on it.*
 Spike §9 sets three rules and they are requirements, not preferences:
 
 1. **A fixed vocabulary of verbs.** No pass-through exec, no caller-supplied
-   command. Job A has exactly one verb and it takes no arguments.
+   command. Two verbs now, and arguments are validated at the point of parsing.
 2. **Arguments validated against what the helper owns**, never relayed.
 3. **Never a shell.** `execv` with a vector the helper built itself.
 
@@ -35,7 +35,42 @@ properties of the code and the running process needs root to reach.
 | `/var/run/smbpal` | created `root:smbpal 0750` — the daemon cannot, since it is not root |
 | `/var/run/smbpal/helper.sock` | owned by the service account, `0600`. **Not group-guarded**: `smbpal` answers *may this person ask the daemon*, never *may this person ask root* |
 | peer check | `getpeereid`, refusing any uid but the service account's — defence in depth behind the `0600`, not instead of it |
-| `share.list` | runs `sharing -l -f json`. Read-only on purpose: the first verb should have nothing to undo |
+| `share.list` | runs `sharing -l -f json`. Read-only on purpose: the first verb should have nothing to undo. **Refuses a request that carries a grant** — a read needs none, so one that offers it is confused about what it is asking |
+| `auth.check <right>` | verifies an `AuthorizationExternalForm` against a registered right. What every later mutation will call, and the daemon's way of asking about its own config writes |
+| `verify <right>` | the same evaluation as a subcommand, form on stdin. How §12.2 was measured |
+| `rights install\|remove` | registers or removes the rights. Separate from `install`, which refuses to run twice: accounts and jobs are the half with state to get wrong, and the rights have none |
+
+## The protocol
+
+A request is lines until `END`; a response is `OK` or `ERR <token>` on one line,
+then an optional payload to half-close.
+
+```
+VERB auth.check
+AUTH <64 hex characters>
+ARG app.smbpal.manage-shares
+END
+```
+
+**Hex and not base64** for the 32 bytes: no alphabet, no padding, no variant to
+pick wrong, and the component that runs as root should prefer the boring option.
+
+**Line framing makes one validation structural.** A newline cannot occur inside
+an argument because it ends the line, so the newline `config/schema.py` rejects
+in a path cannot reach a verb here at all — and that does not depend on the
+daemon having checked. A line without its terminator is a malformed frame rather
+than a short argument, which is what stops a truncated read being taken for a
+complete request.
+
+**Every argument is checked once, at parsing**: printable ASCII, bounded,
+non-empty, and never a leading `-`. There is no shell, so option-smuggling is
+the only injection the fixed vocabulary leaves open — `sharing` would read `-g`
+as a flag wherever it appeared. Checking it in one place means a verb added
+later cannot forget.
+
+`helper/parse-test.c` tests all of that. It includes the source and renames its
+`main` with `-Dmain=`, so the shipped file knows nothing about being tested, and
+the cases live in the C and nowhere else.
 
 ## Identities
 
@@ -129,9 +164,10 @@ raw UUID. `/etc/smbpal` and its contents are left alone and it says so.
 - **Identity creation.** The install scans 450–499, creates the pair, reads back
   what it landed on and records it. The recipe is the account spike's §4 minus
   the `SMB-NT` step; no number is compiled in anywhere.
-- **Job B**, the privileged operations for sharing and accounts, which need real
-  request framing. One verb with no arguments does not, and inventing a protocol
-  before there is a second verb would be guessing at its shape.
+- **The mutating verbs**, sharepoints and the SMB-NT account. The framing is
+  here and the path policy is decided (spike §13), but `samba/apply.py` is Samba
+  top to bottom, so there is no macOS `apply` for them to belong to yet. That is
+  the next piece, and it is larger than the protocol was.
 - **The socket's own behaviour under test.** Binding, the `0600` ownership and
   the peer check need root and a `smbpal` group, so they are a runbook step
   rather than an assertion. Overridable paths would have made them testable and

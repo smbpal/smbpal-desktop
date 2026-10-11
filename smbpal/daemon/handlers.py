@@ -25,11 +25,13 @@ from smbpal.errors import (
     AlreadyExists,
     InvalidParams,
     NotFound,
+    NeedsAuthorisation,
     NotPermitted,
     SmbpalError,
     UnknownMethod,
 )
 from smbpal.daemon import polkit
+from smbpal.system import authorization as macos_auth
 from smbpal.mounts import inventory, systemd, units
 from smbpal.mounts.apply import Mounter
 from smbpal.samba import control, passwd
@@ -132,7 +134,28 @@ class Authoriser:
         "connection.disconnect": polkit.USE_CONNECTIONS,
     }
 
-    POLICIES = ("polkit", "root", "group")
+    # `helper` is macOS's, and it is the only policy where the daemon is not
+    # the authority: §10 put the verify in the privileged helper because §9
+    # established that `smbpald` is admin-writable code, so a helper that
+    # trusted this process would be a root-escalation service with a socket on
+    # it. Here the daemon relays 32 bytes and asks; the answer is not its own.
+    POLICIES = ("polkit", "root", "group", "helper")
+
+    # polkit action to macOS right. Two tables rather than one because the
+    # platforms register different things: `use-connections` has no macOS right
+    # at all, since the mount is the user's own agent acting as itself and there
+    # is no privilege to ask for. A test asserts every action has a mapping, so
+    # the `None` branch in `check` is a backstop and not the plan.
+    MACOS_RIGHTS = {
+        polkit.MANAGE_SHARES: macos_auth.MANAGE_SHARES,
+        polkit.MANAGE_CONNECTIONS: macos_auth.MANAGE_CONNECTIONS,
+        polkit.USE_CONNECTIONS: macos_auth.USE_CONNECTIONS,
+    }
+
+    # What each platform gets when nothing is asked for. Named rather than
+    # chosen by a chain of `if`s, because "which rules are in force" is the one
+    # thing this class exists to make legible.
+    DEFAULT_POLICY = {"darwin": "helper"}
 
     def __init__(
         self,
@@ -143,9 +166,28 @@ class Authoriser:
         if policy not in self.POLICIES:
             raise ValueError(f"unknown authorisation policy: {policy}")
         self.policy = policy
-        self.checker = checker if checker is not None else polkit.Polkit()
+        if checker is not None:
+            self.checker = checker
+        elif policy == "helper":
+            from smbpal.system.helper import Helper
+
+            self.checker = Helper()
+        else:
+            self.checker = polkit.Polkit()
 
     def policy_note(self) -> str:
+        if self.policy == "helper":
+            if not getattr(self.checker, "available", lambda: False)():
+                return (
+                    "authorisation: the privileged helper, which is NOT RUNNING — "
+                    "every mutation will be refused. Run `smbpal setup`"
+                )
+            # `getattr` for the path too, not just for `available`: guarding one
+            # and not the other is the inconsistency that makes a startup note
+            # crash a daemon that would otherwise have run.
+            return "authorisation: the privileged helper, via " + getattr(
+                self.checker, "path", "an unnamed socket"
+            )
         if self.policy == "polkit":
             where = self.checker.executable() if hasattr(self.checker, "executable") else None
             found = where or "NOT FOUND — every mutation will be refused"
@@ -157,7 +199,9 @@ class Authoriser:
             "mutate. Development only; polkit is not being asked"
         )
 
-    def check(self, peer: PeerCredentials, method: str) -> None:
+    def check(
+        self, peer: PeerCredentials, method: str, auth: bytes | None = None
+    ) -> None:
         if method in self.READ_ONLY:
             return
         # root can already do all of this with an editor, and the package's own
@@ -173,11 +217,37 @@ class Authoriser:
         action = self.ACTIONS.get(method)
         if action is None:
             log.error(
-                "%s mutates and has no polkit action; refusing it. Add it to "
-                "Authoriser.ACTIONS.",
+                "%s mutates and has no authorisation action; refusing it. Add it "
+                "to Authoriser.ACTIONS.",
                 method,
             )
             raise self._refusal(peer, method)
+        if self.policy == "helper":
+            right = self.MACOS_RIGHTS.get(action)
+            if right is None:
+                # Unreachable while ACTIONS and the map agree, which a test
+                # asserts. Refusing rather than falling through, because the
+                # alternative to an answer is not a yes.
+                log.error("%s has no macOS right; refusing %s", action, method)
+                raise self._refusal(peer, method, action=action)
+            if right in macos_auth.UNPROMPTED:
+                # `allow_active yes` on Linux, and nothing to ask for here: the
+                # mount is the user's own agent acting as itself, so there is no
+                # privilege involved and no right registered to check against.
+                return
+            if auth is None:
+                # **Not a plain refusal: the client is told what to acquire.**
+                # The mapping from a method to a right lives here, and a client
+                # that kept its own copy would be a second table free to drift
+                # from this one. So the refusal is self-describing and the
+                # client prompts and retries.
+                raise NeedsAuthorisation(
+                    f"{method} needs authorisation on macOS", right=right
+                )
+            if self.checker.check_grant(right, auth):
+                audit.info("the helper allowed %s for %s", right, peer.describe())
+                return
+            raise self._refusal(peer, method, action=right)
         if self.checker.check(peer, action):
             return
         raise self._refusal(peer, method, action=action)
@@ -233,7 +303,7 @@ class Dispatcher:
             method = _METHODS.get(request.method)
             if method is None:
                 raise UnknownMethod(f"no such method: {request.method}")
-            self.authoriser.check(connection.peer, request.method)
+            self.authoriser.check(connection.peer, request.method, request.auth)
             result = method(self, request, connection.peer)
             return encode_success(request.id, result)
         except SmbpalError as exc:

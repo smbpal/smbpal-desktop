@@ -24,6 +24,7 @@ from smbpal.errors import (
     ConfigIOError,
     DaemonUnreachable,
     InvalidParams,
+    NeedsAuthorisation,
     NotPermitted,
     SmbpalError,
     UnknownMethod,
@@ -143,6 +144,7 @@ _ERROR_CLASSES: dict[str, type[SmbpalError]] = {
         ConfigInvalid,
         ConfigIOError,
         InvalidParams,
+        NeedsAuthorisation,
         NotPermitted,
         UnknownMethod,
         UnsupportedVersion,
@@ -286,12 +288,55 @@ class Client:
         """
         try:
             return self._call_once(method, params)
+        except NeedsAuthorisation as needed:
+            # macOS. The daemon named the right rather than just refusing, so
+            # the mapping from method to right stays in one place -- the daemon
+            # -- and a method added later needs no change here.
+            held = self._acquire(needed)
+            if held is None:
+                raise
+            # **Held open across the call.** The external form is only
+            # importable while the reference behind it lives, measured on
+            # 11 October 2026, so closing it before the helper verifies would
+            # send 32 bytes that cannot work.
+            with held:
+                return self._call_once(method, params, auth=held.form)
         except NotPermitted:
             if self.on_denied is None or not self.on_denied():
                 raise
         return self._call_once(method, params)
 
-    def _call_once(self, method: str, params: dict[str, Any] | None = None) -> Any:
+    def _acquire(self, needed: NeedsAuthorisation) -> Any:
+        """A grant for what the daemon asked for, or `None` to give up.
+
+        `None` rather than an exception for the ordinary cases -- no right
+        named, not macOS, nothing to prompt for -- because the caller's next
+        move is to re-raise the daemon's own refusal, which says more than a
+        second error about why we could not ask would.
+        """
+        if not needed.right:
+            return None
+        from smbpal.system import authorization
+
+        if not authorization.available():
+            return None
+        try:
+            return authorization.grant_for(needed.right)
+        except authorization.AuthorizationError as exc:
+            # A dismissed dialog, or no session to show one in. Either way the
+            # daemon's refusal is the honest thing to report, with this as the
+            # reason attached to it.
+            log.info("could not acquire %s: %s", needed.right, exc)
+            needed.detail = str(exc.detail or exc)
+            return None
+
+    def _call_once(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        auth: bytes | None = None,
+    ) -> Any:
         with self._lock:
             sock = self._require_socket()
             self._counter += 1
@@ -303,6 +348,10 @@ class Client:
                         "id": request_id,
                         "method": method,
                         "params": params or {},
+                        # Omitted entirely when there is none, so a Linux
+                        # request is byte-for-byte what it was before this
+                        # field existed.
+                        **({"auth": auth.hex()} if auth is not None else {}),
                     },
                     separators=(",", ":"),
                 )
@@ -380,7 +429,14 @@ class Client:
         error = message.get("error") or {}
         code = error.get("code", "internal")
         cls = _ERROR_CLASSES.get(code, SmbpalError)
-        raised = cls(error.get("message", "the daemon reported an error"))
+        text = error.get("message", "the daemon reported an error")
+        if cls is NeedsAuthorisation:
+            # It carries the right to acquire, so it cannot be built like the
+            # others. An absent right is kept as empty rather than invented:
+            # `call` treats it as nothing to ask for and re-raises.
+            raised: SmbpalError = cls(text, right=str(error.get("right", "")))
+        else:
+            raised = cls(text)
         raised.code = code  # keep an unknown code intact rather than flattening it
         raised.detail = error.get("detail")
         raise raised

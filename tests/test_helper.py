@@ -391,3 +391,248 @@ class TestTheVocabularyIsFixed(unittest.TestCase):
         code = re.sub(r"#define ID_(?:PREFERRED|MIN|MAX) \d+", "", code)
         for number in re.findall(r"\b(4[5-9]\d)\b", code):
             self.fail(f"{number} looks like a compiled-in service id")
+
+
+@unittest.skipUnless(sys.platform == "darwin", "the helper is macOS-only by design")
+class TestTheVerifyRefuses(TestTheHelperBuildsAndRefuses):
+    """§10's verify, exercised through every path that needs no privilege.
+
+    The verify is the whole authorisation scheme on macOS, so its refusals are
+    worth more than its grant: a grant needs a real prompt and an administrator
+    standing at the machine, and the refusals are reachable here.
+    """
+
+    def verify(self, right: str, form: bytes) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [str(self.binary), "verify", right], input=form, capture_output=True, timeout=10
+        )
+
+    def test_a_right_the_helper_does_not_register_is_not_asked_about(self) -> None:
+        """Exit 2, not 1: a typo and a refusal are different answers.
+
+        Asking the database about an unregistered right would get an answer --
+        the fallback `default` rule -- about something SMBPal never registered.
+        """
+        done = self.verify("app.smbpal.nope", b"x" * 32)
+        self.assertEqual(done.returncode, 2)
+        self.assertIn(b"not a right this helper registers", done.stderr)
+
+    def test_a_short_form_is_refused_rather_than_padded(self) -> None:
+        done = self.verify("app.smbpal.manage-shares", b"x")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn(b"read 1", done.stderr)
+
+    def test_a_forged_form_does_not_import(self) -> None:
+        """**Measured, 11 October 2026.** 32 zero bytes are rejected by
+        `AuthorizationCreateFromExternalForm` itself, which is the property §10
+        relies on when it says the scheme survives a replaced daemon: the
+        privileged side does not have to trust the relay, because a form the
+        relay invented does not import."""
+        done = self.verify("app.smbpal.manage-shares", bytes(32))
+        self.assertEqual(done.returncode, 1)
+        self.assertIn(b"did not import", done.stderr)
+
+
+@unittest.skipUnless(sys.platform == "darwin", "the helper is macOS-only by design")
+class TestOneClientCannotTakeTheHelperDown(unittest.TestCase):
+    """Two ways a peer could stop the gate working, found reviewing job B.
+
+    Both are about the helper being **one accept loop with no `KeepAlive`**: it
+    serves one conversation at a time, and if it dies it stays dead for the rest
+    of the boot. Neither is an escalation; what they make unavailable is
+    authorisation, which is worse than it sounds -- a gate that is down refuses
+    everything, and the person whose share will not save has no idea why.
+
+    Asserted against the source because the running socket needs root, which is
+    this file's standing position on the bind.
+    """
+
+    def setUp(self) -> None:
+        self.code = _without_comments(
+            (HELPER_DIR / "smbpal-helper.c").read_text(encoding="utf-8")
+        )
+
+    def test_sigpipe_cannot_kill_it(self) -> None:
+        """**This was reachable, not theoretical.** `write` to a peer that has
+        closed raises SIGPIPE, which terminates by default. `system/helper.py`
+        has a read timeout and closes the socket when it expires, so a slow
+        `sharing -l -f json` would have killed the root authorisation component
+        by accident. Job A was never exposed because job A had no client.
+        """
+        self.assertIn("signal(SIGPIPE, SIG_IGN)", self.code)
+
+    def test_a_peer_that_says_nothing_is_bounded(self) -> None:
+        """Otherwise a connect with no `END` blocks the only loop for ever."""
+        self.assertIn("SO_RCVTIMEO", self.code)
+        self.assertIn("SO_SNDTIMEO", self.code)
+        self.assertIn("PEER_TIMEOUT_SECONDS", self.code)
+
+    def test_every_socket_write_checks_its_return(self) -> None:
+        """Ignoring SIGPIPE turns a fatal signal into `EPIPE`, which is only an
+        improvement if the writes look at what they got back."""
+        for function in ("static void respond(", "static void serve_one("):
+            body = self.code[self.code.index(function) :]
+            body = body[: body.index("\nstatic ")]
+            with self.subTest(function=function):
+                self.assertIn("write(", body)
+                self.assertIn("w <= 0", body)
+
+
+@unittest.skipUnless(sys.platform == "darwin", "the helper is macOS-only by design")
+class TestTheFrameParser(unittest.TestCase):
+    """`helper/parse-test.c`, run as part of this suite.
+
+    **The parser is the new attack surface and needed testing before the
+    runbook.** The socket needs root and the helper's paths are fixed on
+    purpose, so `serve_one` cannot be exercised here -- that remains a runbook
+    step. But `parse_frame`, `copy_token` and `unhex` are pure, and the harness
+    reaches them by including the source with `-Dmain=` renaming its entry
+    point, so the shipped file knows nothing about being tested.
+
+    The cases live in the C and nowhere else. A Python copy of the expectations
+    would be a second table to drift from the first.
+    """
+
+    def test_every_case_passes(self) -> None:
+        done = subprocess.run(
+            ["make", "-C", str(HELPER_DIR), "check"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if "no working compiler" in done.stderr:
+            raise unittest.SkipTest("no compiler")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        # The count is asserted loosely: it must not silently become zero, which
+        # is what a harness that stops compiling its cases looks like.
+        self.assertRegex(done.stdout, r"\b(2[0-9]|[3-9][0-9]) cases, 0 failures")
+
+    def tearDown(self) -> None:
+        subprocess.run(["make", "-C", str(HELPER_DIR), "clean"], capture_output=True)
+
+
+@unittest.skipUnless(sys.platform == "darwin", "the helper is macOS-only by design")
+class TestTheRightsAreRepairableAlone(TestTheHelperBuildsAndRefuses):
+    """`install` refuses to run twice; the rights have to be repairable anyway.
+
+    **The hole was found by measuring §12.4.** Removing a right to learn whether
+    its `cdhash` requirement was enforced left the install half-registered, and
+    the only way back was tearing down the service account and the launchd jobs
+    to rebuild something that was never broken.
+
+    The asymmetry is justified: accounts and jobs are the half with state to get
+    wrong, and `install` is right to refuse to guess which of them to repair.
+    `AuthorizationRightSet` overwrites and a removal is idempotent, so the rights
+    have no such state.
+    """
+
+    def test_it_refuses_unprivileged(self) -> None:
+        done = self.run_helper("rights", "install")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("must run as root", done.stderr)
+
+    def test_an_unknown_verb_is_answered_with_the_usage(self) -> None:
+        """Not "must run as root", which would name a problem the caller does
+        not have. The verb is checked before the privilege for that reason."""
+        done = self.run_helper("rights", "sideways")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("usage", done.stderr)
+        self.assertNotIn("must run as root", done.stderr)
+
+    def test_it_takes_exactly_one_verb(self) -> None:
+        for args in (("rights",), ("rights", "install", "remove")):
+            with self.subTest(args=args):
+                done = self.run_helper(*args)
+                self.assertEqual(done.returncode, 2)
+                self.assertIn("usage", done.stderr)
+
+    def test_the_usage_names_it(self) -> None:
+        done = self.run_helper()
+        self.assertIn("rights install|remove", done.stderr)
+
+
+@unittest.skipUnless(sys.platform == "darwin", "the helper is macOS-only by design")
+class TestTheRightsMatchTheClient(unittest.TestCase):
+    """The names are in two files because the two halves are in two languages.
+
+    Same necessity as the polkit action ids, which live in XML and in Python and
+    are pinned by a test that parses the policy file. This is that test for
+    macOS.
+    """
+
+    def setUp(self) -> None:
+        self.code = (HELPER_DIR / "smbpal-helper.c").read_text()
+
+    def test_the_verify_never_asks_for_interaction(self) -> None:
+        """§11 measured that a process with no Aqua session cannot prompt
+        (-60007), and the helper is such a process. A verify that passed the
+        interaction flag would be asking a question that cannot be answered.
+
+        Read with the comments stripped, because the sentence above names the
+        flag it forbids -- the third time a rule in this file would have been
+        broken by the comment stating it.
+        """
+        code = _without_comments(self.code)
+        body = code[code.index("static int verify_form(") :]
+        body = body[: body.index("\nstatic ") if "\nstatic " in body else len(body)]
+        self.assertIn("kAuthorizationFlagExtendRights", body)
+        self.assertNotIn("kAuthorizationFlagInteractionAllowed", body)
+
+    def test_a_grant_is_evaluated_in_exactly_one_place(self) -> None:
+        """The `verify` subcommand and the socket's `auth.check` share it.
+
+        Two copies of the evaluation is how one of them ends up with the
+        interaction flag, or with a right it never checked was registered.
+        """
+        code = _without_comments(self.code)
+        self.assertEqual(code.count("AuthorizationCopyRights("), 1)
+        self.assertEqual(code.count("AuthorizationCreateFromExternalForm("), 1)
+
+    def test_the_helper_registers_exactly_what_the_client_prompts_for(self) -> None:
+        from smbpal.system import authorization
+
+        import re
+
+        table = self.code[self.code.index("static const struct right_rule RIGHTS[]") :]
+        table = table[: table.index("};")]
+        in_c = tuple(re.findall(r'"(app\.smbpal\.[a-z-]+)"', table))
+        self.assertEqual(in_c, authorization.RIGHTS)
+
+    def test_use_connections_is_registered_nowhere(self) -> None:
+        """It is `allow_active yes` on Linux and needs no privilege here, so
+        there is no right for it -- and a right in the system's database that no
+        component checks would read like live policy while being dead."""
+        from smbpal.system import authorization
+
+        self.assertNotIn("app.smbpal.use-connections", self.code)
+        self.assertNotIn(authorization.USE_CONNECTIONS, authorization.RIGHTS)
+        self.assertIn(authorization.USE_CONNECTIONS, authorization.UNPROMPTED)
+
+    def test_the_external_form_length_is_pinned_to_the_sdk(self) -> None:
+        """The Python constant is a number in a file; the C makes the compiler
+        check it against the struct the system defines."""
+        from smbpal.system import authorization
+
+        self.assertEqual(authorization.EXTERNAL_FORM_LENGTH, 32)
+        self.assertIn(
+            "_Static_assert(sizeof(AuthorizationExternalForm) == 32", self.code
+        )
+
+    def test_the_rule_does_not_let_root_satisfy_it(self) -> None:
+        """**The one that matters.** The process calling `AuthorizationCopyRights`
+        on the verify side is the helper, and it is root. If `allow-root` were
+        true and honoured for the verifying process, every imported form would
+        verify whatever it held and the gate would be off while looking on.
+
+        `false` can never disable the gate, and matches the `default` rule Apple
+        ships. It is not free: it costs §11's headless `sudo` route, which needs
+        `true`. That trade is deliberate and recorded -- the flip waits on spike
+        §12.3 measuring whether an imported form honours the flag.
+        """
+        rule = self.code[self.code.index("static CFDictionaryRef rule_for(") :]
+        rule = rule[: rule.index("\n}")]
+        self.assertIn('CFSTR("allow-root"), kCFBooleanFalse', rule)
+        self.assertNotIn('CFSTR("allow-root"), kCFBooleanTrue', rule)
+        # Unshared is the one field this rule changes from the fallback, so it
+        # is the one field whose loss the install has to warn about.
+        self.assertIn('CFSTR("shared"), kCFBooleanFalse', rule)

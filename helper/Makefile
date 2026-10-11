@@ -8,20 +8,35 @@
 # reader comparing the binary to the source should not have to account for it.
 CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Werror -fstack-protector-strong -D_DARWIN_C_SOURCE
+# Security for Authorization Services (§10's rights and the verify), and
+# CoreFoundation for the dictionary a right's rule is expressed as. Linked
+# rather than dlopened: this is the component that must not be able to run with
+# its authorisation code missing.
+LDFLAGS ?= -framework Security -framework CoreFoundation
 PREFIX ?= /usr/local
 LIBEXEC = $(PREFIX)/libexec/smbpal
 
 all: smbpal-helper
 
 smbpal-helper: smbpal-helper.c
-	$(CC) $(CFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 # Root-owned storage, which is the whole point: see the spike's §0.
 install: smbpal-helper
 	install -d -o root -g wheel -m 755 $(LIBEXEC)
 	install -o root -g wheel -m 755 smbpal-helper $(LIBEXEC)/smbpal-helper
 
-clean:
-	rm -f smbpal-helper
+# `-Dmain=` renames the helper's entry point so the test can have its own,
+# which is how the parser is tested without the shipped file knowing about it.
+# -Wno-unused-function because the test exercises the parser, not every verb.
+parse-test: parse-test.c smbpal-helper.c
+	$(CC) $(CFLAGS) -Wno-unused-function -Dmain=smbpal_helper_main -I. \
+	    -o $@ parse-test.c $(LDFLAGS)
 
-.PHONY: all install clean
+check: parse-test
+	./parse-test
+
+clean:
+	rm -f smbpal-helper parse-test
+
+.PHONY: all install clean check

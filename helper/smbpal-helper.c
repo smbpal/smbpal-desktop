@@ -28,8 +28,13 @@
  * because there is nothing to undo if it is wrong.
  */
 
+#include <Security/Authorization.h>
+#include <Security/AuthorizationDB.h>
+#include <CoreFoundation/CoreFoundation.h>
+
 #include <errno.h>
 #include <grp.h>
+#include <signal.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,9 +86,24 @@
 #define ID_MIN 450
 #define ID_MAX 499
 
-/* A request is one line naming a verb. Bounded, because an unbounded read from
- * a socket is a denial of service with extra steps. */
-#define REQUEST_MAX 64
+/* A request is a short sequence of lines ending in `END`. Bounded, because an
+ * unbounded read from a socket is a denial of service with extra steps: 1 KiB
+ * holds a verb, a 64-character form and four arguments with room to spare, and
+ * anything larger is not a request this vocabulary can express. */
+#define REQUEST_MAX 1024
+/* Four is what the longest planned verb needs (a path, a name and two flags)
+ * and is a limit rather than a target. */
+#define ARGS_MAX 4
+/* Not `ARG_MAX`: that is `sys/syslimits.h`'s, and -Werror caught the shadowing.
+ * The prefix is the fix and also the honest name -- this bounds one argument of
+ * ours, not the system's exec limit. */
+#define REQUEST_ARG_MAX 256
+/* Nothing at the far end waits for a person -- §11 measured that the helper
+ * cannot prompt even if it wanted to -- so a peer that has not finished a
+ * request in this long is not thinking about it. Comfortably longer than
+ * `system/helper.py`'s own timeout, so the client gives up first and the
+ * helper's limit is the backstop rather than the thing normally hit. */
+#define PEER_TIMEOUT_SECONDS 30
 /* `sharing -l -f json` on a machine with a plausible number of shares. The read
  * loop stops at the limit rather than growing, so a surprising amount of output
  * truncates instead of becoming an allocation this file has to reason about. */
@@ -307,6 +327,270 @@ static int bootout(const char *label) {
     return run_quiet(argv);
 }
 
+/* ---------------------------------------------------------------------------
+ * Authorization Services: the rights, their rules, and the verify.
+ *
+ * §10 chose this over polkit because polkit cannot work here at all --
+ * `getpeereid` gives no pid, so no subject exists to look up -- and
+ * Authorization Services passes the grant instead of an identity.
+ *
+ * **The verify lives in this file and not in the daemon.** §9 established that
+ * `smbpald` is admin-writable code, so a helper that trusted the daemon's
+ * verdict would be a root-escalation service with a socket on it: an admin who
+ * replaced the daemon could simply not verify. Here it survives a replaced
+ * daemon, because a forged external form either fails to import or imports to a
+ * reference holding no rights.
+ *
+ * The rules are written here rather than shipped as a plist for the same reason
+ * the launchd plists are, and the rights' names are duplicated in
+ * `smbpal/system/authorization.py` by necessity -- one side prompts, one side
+ * verifies -- with a test pinning the two together.
+ * ------------------------------------------------------------------------- */
+
+/* Pins the 32 in `smbpal/system/authorization.py` to the struct the system
+ * actually defines, so the Python constant cannot drift from the C reality. */
+_Static_assert(sizeof(AuthorizationExternalForm) == 32,
+               "AuthorizationExternalForm is not 32 bytes on this SDK");
+
+struct right_rule {
+    const char *name;
+    /* Shown in the dialog. macOS renders it as "<app> is trying to <text>", so
+     * these are verb phrases and are the `<description>` strings from
+     * packaging/polkit/org.smbpal.policy, which is where the wording was
+     * argued. §10's second measurement asks whether the prompt is attributed to
+     * something a person recognises rather than to `python3.14`; this is the
+     * part of that we control. */
+    const char *description;
+};
+
+/* **Two rights, not the three polkit actions.** `use-connections` is
+ * `allow_active yes` on Linux, and the policy file argues why: a configured
+ * connection is already reachable without a prompt, so prompting on the button
+ * that does the same thing protects nothing. On macOS the mount is the user's
+ * own agent acting as themselves (D13), so there is no privilege to ask for
+ * either -- and a right in the system database that no component ever checks is
+ * dead policy that reads like live policy. */
+static const struct right_rule RIGHTS[] = {
+    {"app.smbpal.manage-shares", "change the folders this computer shares"},
+    {"app.smbpal.manage-connections",
+     "change the network shares this computer connects to"},
+};
+static const size_t RIGHTS_COUNT = sizeof RIGHTS / sizeof RIGHTS[0];
+
+/* Long enough that add / set a password / apply is one authentication rather
+ * than three -- the problem `auth_admin_keep` solves on Linux, and the policy
+ * file's note on it applies unchanged: three prompts for one intention is how
+ * people learn to type their password without reading the box. Short enough
+ * that a replayable grant is a five-minute window and not a login session.
+ *
+ * This number is the security parameter §10 said SMBPal has to choose rather
+ * than inherit, because a grant can be replayed for as long as it stays
+ * authorised. It happens to equal the `default` rule's 300, measured on this
+ * machine -- so the whole value of registering these rights is `shared false`
+ * plus a description a person can recognise in the dialog. Worth knowing before
+ * anyone concludes the registration is decorative: `shared true` would let a
+ * credential obtained elsewhere, for anything, satisfy these rights. */
+#define RIGHT_TIMEOUT 300
+
+/* **The rule keys are string literals because this SDK has no macros for
+ * them.** `AuthorizationDB.h` defines `kAuthorizationRightRule`,
+ * `kAuthorizationRuleClassAllow` and `kAuthorizationRuleClassDeny` and stops
+ * there: `kAuthorizationRuleParameterCredentialShared` and
+ * `...CredentialTimeout` do not exist here and a build against them fails to
+ * parse. Same shape as §4's DirectoryService constant, and the same rule --
+ * read the header on the machine, do not trust the memory of a header. */
+static CFDictionaryRef rule_for(void) {
+    CFMutableDictionaryRef rule = CFDictionaryCreateMutable(
+        NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (rule == NULL) return NULL;
+    /* `user` + `group admin` is `auth_admin`, which is what all three polkit
+     * actions chose for a non-active session. `authenticate-session-owner`
+     * would ask for the person at the machine instead of an administrator, and
+     * §10 is right that those are different products: changing what a computer
+     * shares with the network is an administrator's decision. */
+    CFDictionarySetValue(rule, CFSTR("class"), CFSTR("user"));
+    CFDictionarySetValue(rule, CFSTR("group"), CFSTR("admin"));
+    /* Explicit, because it is the bit that makes this a prompt at all. */
+    CFDictionarySetValue(rule, CFSTR("authenticate-user"), kCFBooleanTrue);
+    CFDictionarySetValue(rule, CFSTR("shared"), kCFBooleanFalse);
+    /* **`allow-root` is false, and the earlier intent to set it true was
+     * wrong.** The reasoning that produced `true` was about the *client*: a
+     * `sudo` client is genuinely uid 0, so `allow-root` would make headless
+     * macOS mean "mutations need sudo". But the process that calls
+     * `AuthorizationCopyRights` here is *this helper*, and it is root. If
+     * `allow-root` is honoured for the verifying process, every imported form
+     * would verify no matter what it held, and the gate would be off while
+     * appearing to be on.
+     *
+     * **This is the safe default and not a free one, and §11's route is what it
+     * costs.** §11 found that a `sudo` client over `ssh` could acquire the
+     * right with no prompt and no window server if `allow-root` were true,
+     * which turns headless macOS from "cannot mutate" into "mutations need
+     * `sudo`". That route needs `true`, and `true` is only safe if an
+     * *imported* form ignores `allow-root` -- which nobody has measured. Note
+     * that the daemon's own uid-0 shortcut does not substitute for it: this
+     * helper sees the daemon's uid on the socket and never the client's, so it
+     * cannot exempt root even when root is who is asking.
+     *
+     * So `false` until that measurement exists (spike §12.3). It can never
+     * silently disable the gate; `true` on an unmeasured behaviour can, and
+     * would do it while looking correct. If the measurement says imported forms
+     * ignore the flag, this becomes `true` and the headless route returns -- one
+     * line, once it is knowledge.
+     *
+     * **Apple agrees.** `security authorizationdb read default` on this machine
+     * (11 October 2026) has `allow-root false` on the rule that catches every
+     * unregistered right, so this is the system's own choice for the same
+     * situation and not a reading of ours against the grain. */
+    CFDictionarySetValue(rule, CFSTR("allow-root"), kCFBooleanFalse);
+    int timeout = RIGHT_TIMEOUT;
+    CFNumberRef seconds = CFNumberCreate(NULL, kCFNumberIntType, &timeout);
+    if (seconds != NULL) {
+        CFDictionarySetValue(rule, CFSTR("timeout"), seconds);
+        CFRelease(seconds);
+    }
+    return rule;
+}
+
+/* §10.6 applies to the authorization database like everything else: the install
+ * registers what it needs and the uninstall removes exactly that. */
+static int rights_install(void) {
+    AuthorizationRef ref = NULL;
+    if (AuthorizationCreate(NULL, NULL, kAuthorizationFlagDefaults, &ref) !=
+        errAuthorizationSuccess) {
+        fprintf(stderr, "smbpal-helper: could not open the authorization database\n");
+        return -1;
+    }
+    CFDictionaryRef rule = rule_for();
+    if (rule == NULL) {
+        AuthorizationFree(ref, kAuthorizationFlagDefaults);
+        return -1;
+    }
+    int failures = 0;
+    for (size_t i = 0; i < RIGHTS_COUNT; i++) {
+        CFStringRef description = CFStringCreateWithCString(
+            NULL, RIGHTS[i].description, kCFStringEncodingUTF8);
+        OSStatus st = AuthorizationRightSet(ref, RIGHTS[i].name, rule, description,
+                                            NULL, NULL);
+        if (description != NULL) CFRelease(description);
+        if (st != errAuthorizationSuccess) {
+            /* **Named, and the warning does not claim this fails closed,
+             * because it does not.** An unregistered right is not an absent
+             * right: the database falls back to the `default` rule, and
+             * `security authorizationdb read default` on this machine
+             * (11 October 2026) is `class user`, `group admin`,
+             * `authenticate-user true`, `allow-root false`, `timeout 300` --
+             * and `shared true`.
+             *
+             * So a failed registration still prompts an administrator; what it
+             * loses is `shared false`, which is the one field our rule changes.
+             * `shared true` means a credential obtained by any other client for
+             * anything can satisfy this right with no prompt. That is a real
+             * weakening and worth a warning, and it is not the same sentence as
+             * "mutations will be refused". */
+            fprintf(stderr,
+                    "smbpal-helper: could not register %s (OSStatus %d); the "
+                    "database's `default` rule applies instead, so the grant "
+                    "will be shared with other clients\n",
+                    RIGHTS[i].name, (int)st);
+            failures++;
+        }
+    }
+    CFRelease(rule);
+    AuthorizationFree(ref, kAuthorizationFlagDefaults);
+    return failures == 0 ? 0 : -1;
+}
+
+static void rights_remove(void) {
+    AuthorizationRef ref = NULL;
+    if (AuthorizationCreate(NULL, NULL, kAuthorizationFlagDefaults, &ref) !=
+        errAuthorizationSuccess) {
+        fprintf(stderr, "smbpal-helper: COULD NOT REMOVE the rights: "
+                        "no handle on the authorization database\n");
+        return;
+    }
+    for (size_t i = 0; i < RIGHTS_COUNT; i++) {
+        OSStatus st = AuthorizationRightRemove(ref, RIGHTS[i].name);
+        /* `errAuthorizationDenied` is what a right that is not there reports,
+         * so it is not an error for a teardown that is meant to be idempotent. */
+        if (st != errAuthorizationSuccess && st != errAuthorizationDenied)
+            fprintf(stderr, "smbpal-helper: COULD NOT REMOVE right %s (OSStatus %d)\n",
+                    RIGHTS[i].name, (int)st);
+    }
+    AuthorizationFree(ref, kAuthorizationFlagDefaults);
+}
+
+static int is_registered_right(const char *right) {
+    for (size_t i = 0; i < RIGHTS_COUNT; i++)
+        if (strcmp(right, RIGHTS[i].name) == 0) return 1;
+    return 0;
+}
+
+/* **The one place a grant is evaluated**, shared by the `verify` subcommand and
+ * the socket's `auth.check`, so there is no second copy to get subtly wrong.
+ * Returns 0 for authorised and non-zero otherwise, and the non-zero values are
+ * for the log only: "refused", "malformed" and "expired" are the same answer to
+ * the question that was asked, and a caller that could tell them apart would be
+ * tempted to treat one of them as a yes. */
+static int verify_form(const char *right, const AuthorizationExternalForm *form) {
+    AuthorizationRef ref = NULL;
+    if (AuthorizationCreateFromExternalForm(form, &ref) != errAuthorizationSuccess) {
+        fprintf(stderr, "smbpal-helper: refused %s: the form did not import\n", right);
+        return -1;
+    }
+    AuthorizationItem item = {right, 0, NULL, 0};
+    AuthorizationRights rights = {1, &item};
+    /* `kAuthorizationFlagExtendRights` and **no**
+     * `kAuthorizationFlagInteractionAllowed`: this is a check, not a prompt.
+     * The helper has no session to prompt in, §11 measured what happens to
+     * anything that tries -- `InteractionNotAllowed`, -60007 -- and §12.2
+     * measured that the check itself succeeds there. */
+    OSStatus st = AuthorizationCopyRights(ref, &rights, NULL,
+                                          kAuthorizationFlagExtendRights, NULL);
+    AuthorizationFree(ref, kAuthorizationFlagDefaults);
+    if (st == errAuthorizationSuccess) {
+        /* A grant leaves a trace for the same reason polkit.py's does: a gate
+         * whose successes are silent cannot be told apart from a gate that is
+         * not running. */
+        fprintf(stderr, "smbpal-helper: allowed %s\n", right);
+        return 0;
+    }
+    fprintf(stderr, "smbpal-helper: refused %s (OSStatus %d)\n", right, (int)st);
+    return (int)st;
+}
+
+/* Reads an `AuthorizationExternalForm` on stdin and answers whether it carries
+ * `right`. Exit 0 is authorised and every other exit is not, because "refused",
+ * "malformed" and "expired" are the same answer to the question asked and a
+ * caller that could tell them apart would be tempted to treat one as a yes.
+ *
+ * A subcommand rather than a private function because job B's framed protocol
+ * will call this code path, and because it is how §10's first measurement gets
+ * taken: does a no-interaction verify work inside a root LaunchDaemon with no
+ * session? §8 asked that of `sysadminctl` and the answer was yes, which is not
+ * the same as knowing. */
+static int verify(const char *right) {
+    if (!is_registered_right(right)) {
+        fprintf(stderr, "smbpal-helper: %s is not a right this helper registers\n", right);
+        return 2;
+    }
+
+    AuthorizationExternalForm form;
+    size_t got = 0;
+    while (got < sizeof form) {
+        ssize_t n = read(STDIN_FILENO, ((char *)&form) + got, sizeof form - got);
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    if (got != sizeof form) {
+        fprintf(stderr, "smbpal-helper: expected %zu bytes of external form, read %zu\n",
+                sizeof form, got);
+        return 1;
+    }
+
+    return verify_form(right, &form) == 0 ? 0 : 1;
+}
+
 static int install(int dry_run, const char *daemon_path) {
     struct group *gr = getgrnam(SOCKET_GROUP);
     struct passwd *pw = getpwnam(SERVICE_USER);
@@ -462,6 +746,13 @@ static int install(int dry_run, const char *daemon_path) {
                             " did not succeed; see launchctl error\n");
     }
 
+    /* After the jobs, because a registered right with nothing to use it is
+     * inert, while a running daemon with no rights registered refuses
+     * mutations -- which is the safe order to be caught halfway through. */
+    if (rights_install() != 0)
+        fprintf(stderr, "smbpal-helper: warning: not every right was registered; "
+                        "run uninstall and install again\n");
+
     /* The uid is named because the scan may not have landed on the preference,
      * and a service account quietly sitting on 467 is a surprise somebody finds
      * out about while debugging something else. */
@@ -493,6 +784,10 @@ static int uninstall(void) {
 
     bootout(DAEMON_LABEL);
     bootout(HELPER_LABEL);
+    /* Before the plists are unlinked, so a teardown interrupted here leaves
+     * jobs that cannot authorise anything rather than rights with nothing left
+     * to check them. */
+    rights_remove();
     unlink(DAEMON_PLIST);
     unlink(HELPER_PLIST);
     unlink(HELPER_SOCK);
@@ -543,12 +838,154 @@ static int uninstall(void) {
     return 0;
 }
 
-/* Rule 1: the whole vocabulary, and it is one verb. Anything else is refused
- * without being echoed back -- a helper that repeats what it was asked is a
- * helper that can be used to probe it. */
+/* ---------------------------------------------------------------------------
+ * The framed protocol -- job B.
+ *
+ * A request is lines until `END`:
+ *
+ *     VERB share.list
+ *     END
+ *
+ *     VERB auth.check
+ *     AUTH <64 hex characters>
+ *     ARG app.smbpal.manage-shares
+ *     END
+ *
+ * A response is `OK` or `ERR <token>` on one line, then an optional payload to
+ * half-close. That keeps `share.list`'s shape -- read to EOF -- while giving
+ * errors somewhere to live that is not the payload.
+ *
+ * **Hex and not base64** for the 32 bytes. The decoder below is obvious on
+ * sight, with no alphabet, no padding and no variant to pick wrong, and the
+ * component that runs as root should prefer the boring option. 64 characters
+ * against 44 is not a cost at this size.
+ *
+ * **Line framing makes one validation structural.** A newline cannot occur
+ * inside an argument, because it ends the line -- so the newline that
+ * `config/schema.py` rejects in a path cannot reach a verb here at all, and
+ * that does not depend on the daemon having checked. A line without its
+ * terminator is a malformed frame rather than a short argument, which is what
+ * stops a truncated read from being read as a complete request.
+ * ------------------------------------------------------------------------- */
+
+struct request {
+    char verb[64];
+    int has_auth;
+    AuthorizationExternalForm auth;
+    char args[ARGS_MAX][REQUEST_ARG_MAX];
+    int argc;
+};
+
+static void respond(int conn, const char *line) {
+    size_t len = strlen(line);
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(conn, line + off, len - off);
+        if (w <= 0) return;
+        off += (size_t)w;
+    }
+}
+
+/* Errors are a fixed token and never an echo of the request. A helper that
+ * repeats what it was asked is a helper that can be used to probe it. */
+static void respond_err(int conn, const char *token) {
+    char line[32];
+    snprintf(line, sizeof line, "ERR %s\n", token);
+    respond(conn, line);
+}
+
+static int unhex_digit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Exactly `len` bytes from exactly `2 * len` characters. A short, long or
+ * non-hex field is a malformed frame, never a partially decoded form. */
+static int unhex(const char *text, unsigned char *out, size_t len) {
+    if (strlen(text) != len * 2) return -1;
+    for (size_t i = 0; i < len; i++) {
+        int hi = unhex_digit(text[i * 2]), lo = unhex_digit(text[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        out[i] = (unsigned char)((hi << 4) | lo);
+    }
+    return 0;
+}
+
+/* §13 rule 7, applied to every argument at the point of parsing rather than in
+ * each verb: printable ASCII only, bounded, non-empty, and **never a leading
+ * `-`**. There is no shell here, so option-smuggling is the only injection the
+ * fixed vocabulary leaves open -- `sharing` would read `-g` as a flag wherever
+ * it appeared. Checking it once, for everything, means a verb added later
+ * cannot forget. */
+static int copy_token(char *dst, size_t cap, const char *src) {
+    size_t len = strlen(src);
+    if (len == 0 || len >= cap) return -1;
+    if (src[0] == '-') return -1;
+    for (size_t i = 0; i < len; i++)
+        if ((unsigned char)src[i] < 0x20 || (unsigned char)src[i] > 0x7e) return -1;
+    memcpy(dst, src, len + 1);
+    return 0;
+}
+
+static int read_frame(int conn, char *buf, size_t cap) {
+    size_t got = 0;
+    for (;;) {
+        if (got >= cap) return -1; /* no `END` within the bound */
+        ssize_t n = read(conn, buf + got, cap - got);
+        if (n < 0) return -1;
+        if (n == 0) break; /* peer half-closed without `END` */
+        got += (size_t)n;
+        buf[got] = '\0';
+        /* A NUL in the request would make every `str` call below read a
+         * different request than the one that arrived. */
+        if (memchr(buf, '\0', got) != NULL) return -1;
+        if (strstr(buf, "\nEND\n") != NULL || strncmp(buf, "END\n", 4) == 0) break;
+    }
+    buf[got] = '\0';
+    return (int)got;
+}
+
+static int parse_frame(char *buf, struct request *req) {
+    memset(req, 0, sizeof *req);
+    int ended = 0;
+    char *line = buf;
+    while (*line != '\0') {
+        char *nl = strchr(line, '\n');
+        if (nl == NULL) return -1; /* a line with no terminator is truncation */
+        *nl = '\0';
+        char *next = nl + 1;
+        if (strcmp(line, "END") == 0) {
+            ended = 1;
+            break;
+        }
+        if (strncmp(line, "VERB ", 5) == 0) {
+            if (req->verb[0] != '\0') return -1; /* said twice */
+            if (copy_token(req->verb, sizeof req->verb, line + 5) != 0) return -1;
+        } else if (strncmp(line, "AUTH ", 5) == 0) {
+            if (req->has_auth) return -1;
+            if (unhex(line + 5, (unsigned char *)&req->auth, sizeof req->auth) != 0)
+                return -1;
+            req->has_auth = 1;
+        } else if (strncmp(line, "ARG ", 4) == 0) {
+            if (req->argc >= ARGS_MAX) return -1;
+            if (copy_token(req->args[req->argc], REQUEST_ARG_MAX, line + 4) != 0) return -1;
+            req->argc++;
+        } else {
+            return -1; /* an unknown key is a different protocol, not a hint */
+        }
+        line = next;
+    }
+    if (!ended || req->verb[0] == '\0') return -1;
+    return 0;
+}
+
+/* The whole vocabulary. Two verbs: one read that must not be authorised, and
+ * one authorisation that reads nothing. */
 static void serve_one(int conn) {
-    char request[REQUEST_MAX + 1];
-    ssize_t n = read(conn, request, REQUEST_MAX);
+    char buf[REQUEST_MAX + 1];
+    struct request req;
     uid_t uid;
     gid_t gid;
 
@@ -557,49 +994,91 @@ static void serve_one(int conn) {
          * and no pid, which is why `daemon/polkit.py` records that no subject
          * can be identified to polkit here. Defence in depth behind the 0600,
          * not instead of it. */
-        write(conn, "ERR peer\n", 9);
+        respond_err(conn, "peer");
         return;
     }
     if (uid != expected_peer) {
         fprintf(stderr, "smbpal-helper: refused uid %u\n", (unsigned)uid);
-        write(conn, "ERR refused\n", 12);
+        respond_err(conn, "refused");
         return;
     }
-    if (n <= 0) return;
-    request[n] = '\0';
-    char *nl = strchr(request, '\n');
-    if (nl) *nl = '\0';
 
-    if (strcmp(request, "share.list") == 0) {
+    int got = read_frame(conn, buf, REQUEST_MAX);
+    if (got <= 0) {
+        respond_err(conn, "frame");
+        return;
+    }
+    if (parse_frame(buf, &req) != 0) {
+        respond_err(conn, "frame");
+        return;
+    }
+
+    if (strcmp(req.verb, "share.list") == 0) {
+        /* **A form is refused rather than ignored.** A read needs no
+         * authorisation, so a request that carries one is confused about what
+         * it is asking, and quietly accepting it would make a grant look like
+         * it had been consumed when nothing checked it. */
+        if (req.has_auth || req.argc != 0) {
+            respond_err(conn, "args");
+            return;
+        }
         static char out[OUTPUT_MAX];
         size_t len = 0;
         char *const argv[] = {(char *)SHARING, "-l", "-f", "json", NULL};
-        int rc = run_captured(argv, out, sizeof out, &len);
-        if (rc != 0) {
-            write(conn, "ERR sharing\n", 12);
+        if (run_captured(argv, out, sizeof out, &len) != 0) {
+            respond_err(conn, "sharing");
             return;
         }
-        /* The response is the payload and then a half-close, so the caller
-         * reads to EOF. Job B needs real framing for arguments and errors; one
-         * verb with no arguments does not, and inventing a protocol before
-         * there is a second verb would be guessing at its shape. */
+        respond(conn, "OK\n");
         size_t off = 0;
         while (off < len) {
             ssize_t w = write(conn, out + off, len - off);
             if (w <= 0) break;
             off += (size_t)w;
         }
-    } else {
-        write(conn, "ERR verb\n", 9);
+        return;
     }
+
+    if (strcmp(req.verb, "auth.check") == 0) {
+        /* **What every later mutation will call, and it has a consumer now.**
+         * §9 gave the config tree to the service account, so the daemon
+         * performs its own config writes -- and still needs the authority's
+         * answer about whether a grant covers them. This is that question, and
+         * the daemon never inspects the bytes it relays.
+         *
+         * A replaced daemon could decline to ask. It could also have written
+         * the config file by hand, so nothing is escalated by the asking being
+         * voluntary; what matters is that the *answer* comes from here. */
+        if (!req.has_auth || req.argc != 1) {
+            respond_err(conn, "args");
+            return;
+        }
+        if (!is_registered_right(req.args[0])) {
+            /* Not passed to the system. An unregistered right would be answered
+             * by the database's fallback `default` rule, which is an answer
+             * about something SMBPal never registered. */
+            respond_err(conn, "right");
+            return;
+        }
+        if (verify_form(req.args[0], &req.auth) != 0) {
+            respond_err(conn, "denied");
+            return;
+        }
+        respond(conn, "OK\n");
+        return;
+    }
+
+    respond_err(conn, "verb");
 }
 
 static void usage(const char *program) {
     fprintf(stderr,
             "usage: %s install --daemon <path to smbpald> [--dry-run]\n"
             "       %s uninstall\n"
-            "       %s serve --service-user <name> [--check]\n",
-            program, program, program);
+            "       %s serve --service-user <name> [--check]\n"
+            "       %s rights install|remove\n"
+            "       %s verify <right>   (external form on stdin)\n",
+            program, program, program, program, program);
 }
 
 int main(int argc, char **argv) {
@@ -654,6 +1133,49 @@ int main(int argc, char **argv) {
         }
         return uninstall();
     }
+    if (strcmp(argv[1], "rights") == 0) {
+        /* **The rights are repairable on their own, and the install is not.**
+         * `install` refuses to run twice rather than guess which half to
+         * repair, which is right for accounts and jobs -- they are the half
+         * with state to get wrong. The rights have none: `AuthorizationRightSet`
+         * overwrites, and a removal is idempotent.
+         *
+         * The hole this fills was found by measuring §12.4. Removing a right to
+         * learn whether its `cdhash` requirement was enforced left the install
+         * half-registered, and the only way back was tearing down the service
+         * account and the launchd jobs to rebuild something that was never
+         * broken. A root component should be able to repair the part that is
+         * cheap to repair. */
+        if (argc != 3) {
+            usage(argv[0]);
+            return 2;
+        }
+        /* The verb before the privilege check, so a typo is answered with the
+         * usage and not with "must run as root" -- which would be a refusal
+         * naming a problem the caller does not have. */
+        int installing = strcmp(argv[2], "install") == 0;
+        if (!installing && strcmp(argv[2], "remove") != 0) {
+            usage(argv[0]);
+            return 2;
+        }
+        if (geteuid() != 0) {
+            fprintf(stderr, "smbpal-helper: rights must run as root\n");
+            return 1;
+        }
+        if (installing) return rights_install() == 0 ? 0 : 1;
+        rights_remove();
+        return 0;
+    }
+    if (strcmp(argv[1], "verify") == 0) {
+        if (argc != 3) {
+            usage(argv[0]);
+            return 2;
+        }
+        /* Needs no privilege: it asks the system about a grant it was handed,
+         * and the answer does not depend on who is asking. Job B calls it as
+         * root because that is where it runs, not because it must. */
+        return verify(argv[2]);
+    }
     if (strcmp(argv[1], "serve") != 0) {
         usage(argv[0]);
         return 2;
@@ -703,6 +1225,21 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* **Without this a client that hangs up mid-response kills the helper.**
+     * `write` to a peer that has closed raises SIGPIPE, whose default action is
+     * to terminate -- and this component deliberately has no `KeepAlive`, so it
+     * would stay down for the rest of the boot and nothing could be authorised
+     * until a reboot.
+     *
+     * Not a theoretical client either: `system/helper.py` has a read timeout
+     * and closes the socket when it expires, so a slow `sharing -l -f json`
+     * would have killed the authorisation gate by accident rather than by
+     * attack. Job A was never exposed to it because job A had no client.
+     *
+     * Every `write` here already checks its return, so ignoring the signal
+     * turns a fatal signal into the `EPIPE` the loops were written for. */
+    signal(SIGPIPE, SIG_IGN);
+
     ensure_runtime_dir(pw->pw_uid, gr->gr_gid);
     listener = listen_on_socket();
     fprintf(stderr, "smbpal-helper: listening on %s for uid %u\n", HELPER_SOCK,
@@ -714,6 +1251,17 @@ int main(int argc, char **argv) {
             if (errno == EINTR) continue;
             fail("accept");
         }
+        /* **One conversation at a time, so one client must not be able to
+         * stop the clock.** A peer that connects and sends nothing, or trickles
+         * bytes, would otherwise block the only accept loop for ever and the
+         * helper would serve nobody -- availability rather than escalation, but
+         * the thing it stops being available for is authorisation.
+         *
+         * Set on the accepted socket rather than the listener, because these
+         * are not reliably inherited. */
+        struct timeval limit = {.tv_sec = PEER_TIMEOUT_SECONDS, .tv_usec = 0};
+        setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &limit, sizeof limit);
+        setsockopt(conn, SOL_SOCKET, SO_SNDTIMEO, &limit, sizeof limit);
         serve_one(conn);
         shutdown(conn, SHUT_WR);
         close(conn);
