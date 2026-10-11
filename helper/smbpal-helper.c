@@ -85,9 +85,18 @@
 #define ID_MIN 450
 #define ID_MAX 499
 
-/* A request is one line naming a verb. Bounded, because an unbounded read from
- * a socket is a denial of service with extra steps. */
-#define REQUEST_MAX 64
+/* A request is a short sequence of lines ending in `END`. Bounded, because an
+ * unbounded read from a socket is a denial of service with extra steps: 1 KiB
+ * holds a verb, a 64-character form and four arguments with room to spare, and
+ * anything larger is not a request this vocabulary can express. */
+#define REQUEST_MAX 1024
+/* Four is what the longest planned verb needs (a path, a name and two flags)
+ * and is a limit rather than a target. */
+#define ARGS_MAX 4
+/* Not `ARG_MAX`: that is `sys/syslimits.h`'s, and -Werror caught the shadowing.
+ * The prefix is the fix and also the honest name -- this bounds one argument of
+ * ours, not the system's exec limit. */
+#define REQUEST_ARG_MAX 256
 /* `sharing -l -f json` on a machine with a plausible number of shares. The read
  * loop stops at the limit rather than growing, so a surprising amount of output
  * truncates instead of becoming an allocation this file has to reason about. */
@@ -500,6 +509,45 @@ static void rights_remove(void) {
     AuthorizationFree(ref, kAuthorizationFlagDefaults);
 }
 
+static int is_registered_right(const char *right) {
+    for (size_t i = 0; i < RIGHTS_COUNT; i++)
+        if (strcmp(right, RIGHTS[i].name) == 0) return 1;
+    return 0;
+}
+
+/* **The one place a grant is evaluated**, shared by the `verify` subcommand and
+ * the socket's `auth.check`, so there is no second copy to get subtly wrong.
+ * Returns 0 for authorised and non-zero otherwise, and the non-zero values are
+ * for the log only: "refused", "malformed" and "expired" are the same answer to
+ * the question that was asked, and a caller that could tell them apart would be
+ * tempted to treat one of them as a yes. */
+static int verify_form(const char *right, const AuthorizationExternalForm *form) {
+    AuthorizationRef ref = NULL;
+    if (AuthorizationCreateFromExternalForm(form, &ref) != errAuthorizationSuccess) {
+        fprintf(stderr, "smbpal-helper: refused %s: the form did not import\n", right);
+        return -1;
+    }
+    AuthorizationItem item = {right, 0, NULL, 0};
+    AuthorizationRights rights = {1, &item};
+    /* `kAuthorizationFlagExtendRights` and **no**
+     * `kAuthorizationFlagInteractionAllowed`: this is a check, not a prompt.
+     * The helper has no session to prompt in, §11 measured what happens to
+     * anything that tries -- `InteractionNotAllowed`, -60007 -- and §12.2
+     * measured that the check itself succeeds there. */
+    OSStatus st = AuthorizationCopyRights(ref, &rights, NULL,
+                                          kAuthorizationFlagExtendRights, NULL);
+    AuthorizationFree(ref, kAuthorizationFlagDefaults);
+    if (st == errAuthorizationSuccess) {
+        /* A grant leaves a trace for the same reason polkit.py's does: a gate
+         * whose successes are silent cannot be told apart from a gate that is
+         * not running. */
+        fprintf(stderr, "smbpal-helper: allowed %s\n", right);
+        return 0;
+    }
+    fprintf(stderr, "smbpal-helper: refused %s (OSStatus %d)\n", right, (int)st);
+    return (int)st;
+}
+
 /* Reads an `AuthorizationExternalForm` on stdin and answers whether it carries
  * `right`. Exit 0 is authorised and every other exit is not, because "refused",
  * "malformed" and "expired" are the same answer to the question asked and a
@@ -511,10 +559,7 @@ static void rights_remove(void) {
  * session? §8 asked that of `sysadminctl` and the answer was yes, which is not
  * the same as knowing. */
 static int verify(const char *right) {
-    size_t known = 0;
-    for (size_t i = 0; i < RIGHTS_COUNT; i++)
-        if (strcmp(right, RIGHTS[i].name) == 0) known = 1;
-    if (!known) {
+    if (!is_registered_right(right)) {
         fprintf(stderr, "smbpal-helper: %s is not a right this helper registers\n", right);
         return 2;
     }
@@ -532,30 +577,7 @@ static int verify(const char *right) {
         return 1;
     }
 
-    AuthorizationRef ref = NULL;
-    if (AuthorizationCreateFromExternalForm(&form, &ref) != errAuthorizationSuccess) {
-        fprintf(stderr, "smbpal-helper: refused %s: the form did not import\n", right);
-        return 1;
-    }
-    AuthorizationItem item = {right, 0, NULL, 0};
-    AuthorizationRights rights = {1, &item};
-    /* `kAuthorizationFlagExtendRights` and **no**
-     * `kAuthorizationFlagInteractionAllowed`: this is a check, not a prompt.
-     * The helper has no session to prompt in and §11 measured what happens to
-     * anything that tries -- `InteractionNotAllowed`, -60007 -- so a helper that
-     * asked would hang nothing and authorise nothing. */
-    OSStatus st = AuthorizationCopyRights(ref, &rights, NULL,
-                                          kAuthorizationFlagExtendRights, NULL);
-    AuthorizationFree(ref, kAuthorizationFlagDefaults);
-    if (st == errAuthorizationSuccess) {
-        /* A grant leaves a trace for the same reason polkit.py's does: a gate
-         * whose successes are silent cannot be told from a gate that is not
-         * running. */
-        fprintf(stderr, "smbpal-helper: allowed %s\n", right);
-        return 0;
-    }
-    fprintf(stderr, "smbpal-helper: refused %s (OSStatus %d)\n", right, (int)st);
-    return 1;
+    return verify_form(right, &form) == 0 ? 0 : 1;
 }
 
 static int install(int dry_run, const char *daemon_path) {
@@ -804,12 +826,154 @@ static int uninstall(void) {
     return 0;
 }
 
-/* Rule 1: the whole vocabulary, and it is one verb. Anything else is refused
- * without being echoed back -- a helper that repeats what it was asked is a
- * helper that can be used to probe it. */
+/* ---------------------------------------------------------------------------
+ * The framed protocol -- job B.
+ *
+ * A request is lines until `END`:
+ *
+ *     VERB share.list
+ *     END
+ *
+ *     VERB auth.check
+ *     AUTH <64 hex characters>
+ *     ARG app.smbpal.manage-shares
+ *     END
+ *
+ * A response is `OK` or `ERR <token>` on one line, then an optional payload to
+ * half-close. That keeps `share.list`'s shape -- read to EOF -- while giving
+ * errors somewhere to live that is not the payload.
+ *
+ * **Hex and not base64** for the 32 bytes. The decoder below is obvious on
+ * sight, with no alphabet, no padding and no variant to pick wrong, and the
+ * component that runs as root should prefer the boring option. 64 characters
+ * against 44 is not a cost at this size.
+ *
+ * **Line framing makes one validation structural.** A newline cannot occur
+ * inside an argument, because it ends the line -- so the newline that
+ * `config/schema.py` rejects in a path cannot reach a verb here at all, and
+ * that does not depend on the daemon having checked. A line without its
+ * terminator is a malformed frame rather than a short argument, which is what
+ * stops a truncated read from being read as a complete request.
+ * ------------------------------------------------------------------------- */
+
+struct request {
+    char verb[64];
+    int has_auth;
+    AuthorizationExternalForm auth;
+    char args[ARGS_MAX][REQUEST_ARG_MAX];
+    int argc;
+};
+
+static void respond(int conn, const char *line) {
+    size_t len = strlen(line);
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(conn, line + off, len - off);
+        if (w <= 0) return;
+        off += (size_t)w;
+    }
+}
+
+/* Errors are a fixed token and never an echo of the request. A helper that
+ * repeats what it was asked is a helper that can be used to probe it. */
+static void respond_err(int conn, const char *token) {
+    char line[32];
+    snprintf(line, sizeof line, "ERR %s\n", token);
+    respond(conn, line);
+}
+
+static int unhex_digit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Exactly `len` bytes from exactly `2 * len` characters. A short, long or
+ * non-hex field is a malformed frame, never a partially decoded form. */
+static int unhex(const char *text, unsigned char *out, size_t len) {
+    if (strlen(text) != len * 2) return -1;
+    for (size_t i = 0; i < len; i++) {
+        int hi = unhex_digit(text[i * 2]), lo = unhex_digit(text[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        out[i] = (unsigned char)((hi << 4) | lo);
+    }
+    return 0;
+}
+
+/* §13 rule 7, applied to every argument at the point of parsing rather than in
+ * each verb: printable ASCII only, bounded, non-empty, and **never a leading
+ * `-`**. There is no shell here, so option-smuggling is the only injection the
+ * fixed vocabulary leaves open -- `sharing` would read `-g` as a flag wherever
+ * it appeared. Checking it once, for everything, means a verb added later
+ * cannot forget. */
+static int copy_token(char *dst, size_t cap, const char *src) {
+    size_t len = strlen(src);
+    if (len == 0 || len >= cap) return -1;
+    if (src[0] == '-') return -1;
+    for (size_t i = 0; i < len; i++)
+        if ((unsigned char)src[i] < 0x20 || (unsigned char)src[i] > 0x7e) return -1;
+    memcpy(dst, src, len + 1);
+    return 0;
+}
+
+static int read_frame(int conn, char *buf, size_t cap) {
+    size_t got = 0;
+    for (;;) {
+        if (got >= cap) return -1; /* no `END` within the bound */
+        ssize_t n = read(conn, buf + got, cap - got);
+        if (n < 0) return -1;
+        if (n == 0) break; /* peer half-closed without `END` */
+        got += (size_t)n;
+        buf[got] = '\0';
+        /* A NUL in the request would make every `str` call below read a
+         * different request than the one that arrived. */
+        if (memchr(buf, '\0', got) != NULL) return -1;
+        if (strstr(buf, "\nEND\n") != NULL || strncmp(buf, "END\n", 4) == 0) break;
+    }
+    buf[got] = '\0';
+    return (int)got;
+}
+
+static int parse_frame(char *buf, struct request *req) {
+    memset(req, 0, sizeof *req);
+    int ended = 0;
+    char *line = buf;
+    while (*line != '\0') {
+        char *nl = strchr(line, '\n');
+        if (nl == NULL) return -1; /* a line with no terminator is truncation */
+        *nl = '\0';
+        char *next = nl + 1;
+        if (strcmp(line, "END") == 0) {
+            ended = 1;
+            break;
+        }
+        if (strncmp(line, "VERB ", 5) == 0) {
+            if (req->verb[0] != '\0') return -1; /* said twice */
+            if (copy_token(req->verb, sizeof req->verb, line + 5) != 0) return -1;
+        } else if (strncmp(line, "AUTH ", 5) == 0) {
+            if (req->has_auth) return -1;
+            if (unhex(line + 5, (unsigned char *)&req->auth, sizeof req->auth) != 0)
+                return -1;
+            req->has_auth = 1;
+        } else if (strncmp(line, "ARG ", 4) == 0) {
+            if (req->argc >= ARGS_MAX) return -1;
+            if (copy_token(req->args[req->argc], REQUEST_ARG_MAX, line + 4) != 0) return -1;
+            req->argc++;
+        } else {
+            return -1; /* an unknown key is a different protocol, not a hint */
+        }
+        line = next;
+    }
+    if (!ended || req->verb[0] == '\0') return -1;
+    return 0;
+}
+
+/* The whole vocabulary. Two verbs: one read that must not be authorised, and
+ * one authorisation that reads nothing. */
 static void serve_one(int conn) {
-    char request[REQUEST_MAX + 1];
-    ssize_t n = read(conn, request, REQUEST_MAX);
+    char buf[REQUEST_MAX + 1];
+    struct request req;
     uid_t uid;
     gid_t gid;
 
@@ -818,41 +982,81 @@ static void serve_one(int conn) {
          * and no pid, which is why `daemon/polkit.py` records that no subject
          * can be identified to polkit here. Defence in depth behind the 0600,
          * not instead of it. */
-        write(conn, "ERR peer\n", 9);
+        respond_err(conn, "peer");
         return;
     }
     if (uid != expected_peer) {
         fprintf(stderr, "smbpal-helper: refused uid %u\n", (unsigned)uid);
-        write(conn, "ERR refused\n", 12);
+        respond_err(conn, "refused");
         return;
     }
-    if (n <= 0) return;
-    request[n] = '\0';
-    char *nl = strchr(request, '\n');
-    if (nl) *nl = '\0';
 
-    if (strcmp(request, "share.list") == 0) {
+    int got = read_frame(conn, buf, REQUEST_MAX);
+    if (got <= 0) {
+        respond_err(conn, "frame");
+        return;
+    }
+    if (parse_frame(buf, &req) != 0) {
+        respond_err(conn, "frame");
+        return;
+    }
+
+    if (strcmp(req.verb, "share.list") == 0) {
+        /* **A form is refused rather than ignored.** A read needs no
+         * authorisation, so a request that carries one is confused about what
+         * it is asking, and quietly accepting it would make a grant look like
+         * it had been consumed when nothing checked it. */
+        if (req.has_auth || req.argc != 0) {
+            respond_err(conn, "args");
+            return;
+        }
         static char out[OUTPUT_MAX];
         size_t len = 0;
         char *const argv[] = {(char *)SHARING, "-l", "-f", "json", NULL};
-        int rc = run_captured(argv, out, sizeof out, &len);
-        if (rc != 0) {
-            write(conn, "ERR sharing\n", 12);
+        if (run_captured(argv, out, sizeof out, &len) != 0) {
+            respond_err(conn, "sharing");
             return;
         }
-        /* The response is the payload and then a half-close, so the caller
-         * reads to EOF. Job B needs real framing for arguments and errors; one
-         * verb with no arguments does not, and inventing a protocol before
-         * there is a second verb would be guessing at its shape. */
+        respond(conn, "OK\n");
         size_t off = 0;
         while (off < len) {
             ssize_t w = write(conn, out + off, len - off);
             if (w <= 0) break;
             off += (size_t)w;
         }
-    } else {
-        write(conn, "ERR verb\n", 9);
+        return;
     }
+
+    if (strcmp(req.verb, "auth.check") == 0) {
+        /* **What every later mutation will call, and it has a consumer now.**
+         * §9 gave the config tree to the service account, so the daemon
+         * performs its own config writes -- and still needs the authority's
+         * answer about whether a grant covers them. This is that question, and
+         * the daemon never inspects the bytes it relays.
+         *
+         * A replaced daemon could decline to ask. It could also have written
+         * the config file by hand, so nothing is escalated by the asking being
+         * voluntary; what matters is that the *answer* comes from here. */
+        if (!req.has_auth || req.argc != 1) {
+            respond_err(conn, "args");
+            return;
+        }
+        if (!is_registered_right(req.args[0])) {
+            /* Not passed to the system. An unregistered right would be answered
+             * by the database's fallback `default` rule, which is an answer
+             * about something SMBPal never registered. */
+            respond_err(conn, "right");
+            return;
+        }
+        if (verify_form(req.args[0], &req.auth) != 0) {
+            respond_err(conn, "denied");
+            return;
+        }
+        respond(conn, "OK\n");
+        return;
+    }
+
+    respond_err(conn, "verb");
 }
 
 static void usage(const char *program) {

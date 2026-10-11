@@ -453,6 +453,39 @@ class TestTheVerifyRefuses(TestTheHelperBuildsAndRefuses):
 
 
 @unittest.skipUnless(sys.platform == "darwin", "the helper is macOS-only by design")
+class TestTheFrameParser(unittest.TestCase):
+    """`helper/parse-test.c`, run as part of this suite.
+
+    **The parser is the new attack surface and needed testing before the
+    runbook.** The socket needs root and the helper's paths are fixed on
+    purpose, so `serve_one` cannot be exercised here -- that remains a runbook
+    step. But `parse_frame`, `copy_token` and `unhex` are pure, and the harness
+    reaches them by including the source with `-Dmain=` renaming its entry
+    point, so the shipped file knows nothing about being tested.
+
+    The cases live in the C and nowhere else. A Python copy of the expectations
+    would be a second table to drift from the first.
+    """
+
+    def test_every_case_passes(self) -> None:
+        done = subprocess.run(
+            ["make", "-C", str(HELPER_DIR), "check"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if "no working compiler" in done.stderr:
+            raise unittest.SkipTest("no compiler")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        # The count is asserted loosely: it must not silently become zero, which
+        # is what a harness that stops compiling its cases looks like.
+        self.assertRegex(done.stdout, r"\b(2[0-9]|[3-9][0-9]) cases, 0 failures")
+
+    def tearDown(self) -> None:
+        subprocess.run(["make", "-C", str(HELPER_DIR), "clean"], capture_output=True)
+
+
+@unittest.skipUnless(sys.platform == "darwin", "the helper is macOS-only by design")
 class TestTheRightsAreRepairableAlone(TestTheHelperBuildsAndRefuses):
     """`install` refuses to run twice; the rights have to be repairable anyway.
 
@@ -514,10 +547,20 @@ class TestTheRightsMatchTheClient(unittest.TestCase):
         broken by the comment stating it.
         """
         code = _without_comments(self.code)
-        body = code[code.index("static int verify(") :]
+        body = code[code.index("static int verify_form(") :]
         body = body[: body.index("\nstatic ") if "\nstatic " in body else len(body)]
         self.assertIn("kAuthorizationFlagExtendRights", body)
         self.assertNotIn("kAuthorizationFlagInteractionAllowed", body)
+
+    def test_a_grant_is_evaluated_in_exactly_one_place(self) -> None:
+        """The `verify` subcommand and the socket's `auth.check` share it.
+
+        Two copies of the evaluation is how one of them ends up with the
+        interaction flag, or with a right it never checked was registered.
+        """
+        code = _without_comments(self.code)
+        self.assertEqual(code.count("AuthorizationCopyRights("), 1)
+        self.assertEqual(code.count("AuthorizationCreateFromExternalForm("), 1)
 
     def test_the_helper_registers_exactly_what_the_client_prompts_for(self) -> None:
         from smbpal.system import authorization

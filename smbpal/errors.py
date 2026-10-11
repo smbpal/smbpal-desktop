@@ -63,6 +63,31 @@ class NotPermitted(SmbpalError):
     code = "not_permitted"
 
 
+class NeedsAuthorisation(SmbpalError):
+    """A mutation that could be authorised, and has not been yet.
+
+    **Distinct from `NotPermitted` on purpose.** "You may not do this" and "ask
+    the person first" are different answers, and a client that could not tell
+    them apart would either prompt after a genuine refusal or refuse without
+    ever prompting.
+
+    It carries the right to acquire, so the method-to-right mapping stays in the
+    daemon. A client with its own copy would be a second table free to drift
+    from the first, and the drift would show up as a prompt for the wrong thing.
+    """
+
+    code = "needs_authorisation"
+
+    def __init__(self, message: str, *, detail: str | None = None, right: str) -> None:
+        super().__init__(message, detail=detail)
+        self.right = right
+
+    def to_wire(self) -> dict[str, object]:
+        wire = super().to_wire()
+        wire["right"] = self.right
+        return wire
+
+
 class NotFound(SmbpalError):
     """No share or connection by that id or name."""
 

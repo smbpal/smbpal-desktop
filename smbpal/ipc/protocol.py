@@ -31,11 +31,25 @@ from smbpal.errors import BadRequest, SmbpalError, UnsupportedVersion
 MAX_FRAME_BYTES = 1024 * 1024
 
 
+# `kAuthorizationExternalFormLength`. Stated here rather than imported from
+# `smbpal.system.authorization`, because that module is macOS-only and this one
+# parses every request on every platform.
+AUTH_FORM_BYTES = 32
+
+
 @dataclass(frozen=True)
 class Request:
     id: str
     method: str
     params: dict[str, Any] = field(default_factory=dict)
+    # macOS only, and `None` everywhere else. The 32 bytes of an
+    # `AuthorizationExternalForm`, relayed to the privileged helper untouched:
+    # §10 put the verify in the helper because the daemon is admin-writable
+    # code, so this field is carriage and the daemon forms no opinion about it.
+    # Not in `params`, because it is not a parameter of any method -- every
+    # mutating method would have to declare it, and one that forgot would look
+    # like a method that needed no authorisation.
+    auth: bytes | None = None
 
 
 def parse_request(line: bytes) -> Request:
@@ -78,7 +92,26 @@ def parse_request(line: bytes) -> Request:
     if not isinstance(params, dict):
         raise BadRequest("'params' must be an object when present")
 
-    return Request(id=request_id, method=method, params=params)
+    auth = doc.get("auth")
+    if auth is None:
+        form = None
+    elif not isinstance(auth, str):
+        raise BadRequest("'auth' must be a hex string when present")
+    else:
+        # Checked here as well as in the helper. The helper does not trust this
+        # side and re-decodes the hex itself, but a malformed field should be
+        # named by whoever can name it rather than travelling on to come back
+        # as an opaque refusal.
+        try:
+            form = bytes.fromhex(auth)
+        except ValueError as exc:
+            raise BadRequest("'auth' is not valid hex", detail=str(exc)) from exc
+        if len(form) != AUTH_FORM_BYTES:
+            raise BadRequest(
+                f"'auth' must be {AUTH_FORM_BYTES} bytes as hex, got {len(form)}"
+            )
+
+    return Request(id=request_id, method=method, params=params, auth=form)
 
 
 def encode_success(request_id: str, result: Any) -> bytes:

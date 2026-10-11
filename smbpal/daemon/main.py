@@ -39,6 +39,20 @@ from smbpal.ipc.server import (
 log = logging.getLogger("smbpald")
 
 
+def _policy(chosen: str | None) -> str:
+    """The flag if it was given, otherwise the platform's.
+
+    **A named default rather than a silent fallback.** `--authorisation` used to
+    default to `polkit` on every platform, which on macOS meant the daemon came
+    up announcing `polkit, via NOT FOUND -- every mutation will be refused`:
+    honest, and the wrong default rather than no default. The policy in force is
+    still logged at startup, which is the property that mattered.
+    """
+    if chosen is not None:
+        return chosen
+    return Authoriser.DEFAULT_POLICY.get(sys.platform, "polkit")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="smbpald",
@@ -116,13 +130,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--authorisation",
-        default="polkit",
+        default=None,
         choices=Authoriser.POLICIES,
-        help="who may perform a mutating method. 'polkit' (default) asks polkit "
-        "for the peer, which is what the package ships. 'root' allows uid 0 and "
-        "refuses everyone else. 'group' allows anyone the socket let through, "
-        "which is no authorisation at all and exists for development on a "
-        "machine with no polkit; the daemon says so at startup.",
+        help="who may perform a mutating method. The default follows the "
+        "platform: 'polkit' on Linux, which asks polkit about the peer, and "
+        "'helper' on macOS, where polkit cannot work at all because the peer "
+        "has no pid and the privileged helper verifies a grant instead. 'root' "
+        "allows uid 0 and refuses everyone else. 'group' allows anyone the "
+        "socket let through, which is no authorisation at all and exists for "
+        "development; the daemon says which is in force at startup.",
     )
     parser.add_argument(
         "--version", action="version", version=version_banner("smbpald")
@@ -222,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
 
     dispatcher = Dispatcher(
         store,
-        authoriser=Authoriser(policy=args.authorisation),
+        authoriser=Authoriser(policy=_policy(args.authorisation)),
         applier=applier,
         mounter=mounter,
         monitor=monitor,
@@ -233,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
     # are the weak ones, because then nobody has ever seen it and nobody reads
     # for its absence.
     log.info("%s", dispatcher.authoriser.policy_note())
-    if args.authorisation == "group":
+    if _policy(args.authorisation) == "group":
         log.warning(
             "authorisation is disabled: any process that can open the socket "
             "can change what this machine shares. Do not run this on a machine "

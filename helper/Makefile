@@ -26,7 +26,17 @@ install: smbpal-helper
 	install -d -o root -g wheel -m 755 $(LIBEXEC)
 	install -o root -g wheel -m 755 smbpal-helper $(LIBEXEC)/smbpal-helper
 
-clean:
-	rm -f smbpal-helper
+# `-Dmain=` renames the helper's entry point so the test can have its own,
+# which is how the parser is tested without the shipped file knowing about it.
+# -Wno-unused-function because the test exercises the parser, not every verb.
+parse-test: parse-test.c smbpal-helper.c
+	$(CC) $(CFLAGS) -Wno-unused-function -Dmain=smbpal_helper_main -I. \
+	    -o $@ parse-test.c $(LDFLAGS)
 
-.PHONY: all install clean
+check: parse-test
+	./parse-test
+
+clean:
+	rm -f smbpal-helper parse-test
+
+.PHONY: all install clean check
