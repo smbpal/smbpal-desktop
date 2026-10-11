@@ -1,3 +1,29 @@
+smbpal (0.2.10) trixie; urgency=medium
+
+  * On macOS, SMBPal can ask for permission, so it no longer refuses
+    everything. The daemon was asking polkit -- which macOS does not have and
+    never will -- and said so in its own startup log: every change to a share
+    or a connection was refused, whoever you were. There is now a small
+    privileged helper, installed once with `smbpal setup`, and changing
+    anything asks for an administrator password the way the rest of the system
+    does. Nothing changes on Linux, where polkit is still what answers.
+  * On macOS, the daemon starts reliably when the machine does. Its socket
+    lives in a directory only the privileged helper can create, and `/var/run`
+    does not survive a reboot -- so if the daemon got there first it failed to
+    start, and nothing brought it back for the rest of that boot. It now waits
+    for that directory, and only for that: a daemon refusing to start because
+    its configuration is broken still refuses, which is the point of it.
+  * On macOS, being added to the `smbpal` group needs a new login session, and
+    SMBPal says so now instead of telling you it does not. A shell that was
+    already open keeps the groups it started with, and nothing you can ask
+    from inside it will say otherwise.
+
+  Defining a share on macOS is not the same as serving one yet: the part that
+  tells macOS to serve it does not exist. Linux is unaffected by all of the
+  above.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Sun, 11 Oct 2026 22:00:00 +0100
+
 smbpal (0.2.9) trixie; urgency=medium
 
   * A connection you have just added now appears in your file manager

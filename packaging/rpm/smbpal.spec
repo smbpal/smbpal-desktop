@@ -10,7 +10,7 @@
 # no second removal step.
 
 Name:           smbpal
-Version:        0.2.9
+Version:        0.2.10
 Release:        1%{?dist}
 Summary:        Share folders over SMB, and connect to shares on other machines
 
@@ -261,6 +261,20 @@ fi
 %{_datadir}/icons/hicolor/scalable/status/smbpal-attention.svg
 
 %changelog
+* Sun Oct 11 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.10-1
+- macOS: SMBPal can ask for permission instead of refusing everything. The
+  daemon was asking polkit, which macOS does not have, so every change to a
+  share or a connection was refused. A small privileged helper, installed once
+  with `smbpal setup`, now asks for an administrator password. Nothing changes
+  on Linux, where polkit is still what answers.
+- macOS: the daemon starts reliably when the machine does. Its socket lives in
+  a directory only the helper can create, /var/run does not survive a reboot,
+  and a daemon that got there first failed to start with nothing to bring it
+  back for the rest of that boot.
+- macOS: being added to the smbpal group needs a new login session, and SMBPal
+  says so now instead of saying it does not.
+- Defining a share on macOS is not yet serving one: the part that tells macOS
+  to serve it does not exist yet.
 * Sun Oct 11 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.9-1
 - A connection you have just added appears in the file manager straight away.
   Opening the share yourself within a few seconds of adding it meant no icon
