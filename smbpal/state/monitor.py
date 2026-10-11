@@ -45,6 +45,12 @@ it sees it armed and idle:
   automount stays armed, so the next access mounts it as it always did.
   Changing where a connection points counts as a new connection, and so does
   removing one and adding it back — see `forget`.
+- **A config change is polled at once, not on the next tick.** The daemon calls
+  `forget` whenever a connection is added or removed, and that now wakes the
+  loop (`nudge`). Waiting up to the 5 s interval left a race the person won by
+  being quick: opening a just-added share triggers the automount yourself, the
+  poll then finds it mounted and rightly declines to prime, and **the icon
+  priming exists to produce never appeared**. Found on the Pi, 11 October 2026.
 - **A decision not to prime is logged**, once, with the reason, and again when
   the reason changes. Every branch below used to return in silence, which reads
   from outside as the monitor never having run: two OS runs were spent
@@ -119,6 +125,8 @@ class StateMonitor:
         self._latched_because: dict[str, str] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        # Set to poll before the interval is up. See `nudge`.
+        self._wake = threading.Event()
         self._thread: threading.Thread | None = None
 
     # --- lifecycle ---------------------------------------------------------
@@ -150,20 +158,62 @@ class StateMonitor:
             self._declined.pop(connection_id, None)
             self._attempted.pop(connection_id, None)
             self._latched_because.pop(connection_id, None)
+        # Forgetting is not the whole job: the connection has just changed, and
+        # the next poll is what acts on it. See `nudge`.
+        self.nudge()
+
+    def nudge(self) -> None:
+        """Poll now rather than when the interval is up.
+
+        **This closes a race that cost the file manager's icon.** Priming is
+        what puts a connection in the sidebar and on the desktop — `autofs` is
+        on GIO's system-internal list, so an armed-but-unmounted connection is
+        invisible however healthy — and priming only acts on a connection that
+        is **idle and armed**. `connection add` applies the units and then had
+        to wait up to `interval` (5 s) for the monitor to notice. Open the share
+        inside those five seconds, which is what adding a connection is *for*,
+        and your own access triggers the automount: the next poll finds it
+        `CONNECTED`, rightly concludes there is nothing to prime, and latches.
+        The icon then never appeared for the life of the daemon run, and a
+        restart was the only cure. **Found on the Pi, 11 October 2026**, and
+        confirmed by restarting the daemon and watching both icons come back.
+
+        **The branch that declined was never wrong** — the connection really was
+        mounted — so nothing here changes what `_maybe_prime` decides. It
+        changes only *when* it is asked, which is the whole of the defect: the
+        icon is a side effect of the monitor doing the mounting, so whoever beat
+        it to the share lost the icon. **A race won by the attentive user is
+        the worst kind to leave in**, because whether it bites depends on how
+        quickly somebody reaches for the file manager.
+
+        Safe to call from any thread and at any time: the loop re-evaluates
+        from the config and the kernel on every pass, so an extra poll can only
+        tell the truth sooner.
+        """
+        self._wake.set()
 
     def stop(self) -> None:
         self._stop.set()
+        # The loop waits on `_wake`, not on `_stop`, so stopping has to set it
+        # too or shutdown would take an interval longer than it used to.
+        self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=self.interval + 2)
             self._thread = None
 
     def _loop(self) -> None:
         while not self._stop.is_set():
+            # Cleared **before** the poll, never after the wait. A nudge that
+            # arrives while `poll()` is running has to survive into the next
+            # pass, and clearing after the wait would discard exactly those —
+            # the ones sent by a config change that landed mid-poll, which is
+            # when a config change is most likely to land.
+            self._wake.clear()
             try:
                 self.poll()
             except Exception:  # noqa: BLE001 - a monitor that dies is worse
                 log.exception("state poll failed; continuing")
-            self._stop.wait(self.interval)
+            self._wake.wait(self.interval)
 
     # --- polling -----------------------------------------------------------
 

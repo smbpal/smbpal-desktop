@@ -1186,3 +1186,107 @@ class TestAddingAConnectionClearsWhatPrimingRemembers(MonitorTestCase):
         # which is exactly the case `gone` cannot catch.
         self.monitor.poll()
         self.assertEqual(len(self.starts()), 2)
+
+
+class TestPollingWithoutWaitingForTheInterval(MonitorTestCase):
+    """The race that cost the icon on the Pi, 11 October 2026.
+
+    `connection add` applies the units and the monitor primes the connection,
+    which is what puts it in the file manager's sidebar and on the desktop. The
+    loop used to sleep the whole interval before noticing, so anybody who
+    opened the share inside that window mounted it themselves — and the next
+    poll then rightly declined to prime something already mounted, leaving no
+    icon for the life of the daemon run.
+
+    Five seconds is the shipped interval, so these use a long one and assert the
+    poll happens anyway. A test that waited out an interval would be asserting
+    the opposite of the fix.
+    """
+
+    def monitor_with_a_long_interval(self) -> tuple[StateMonitor, threading.Event]:
+        polled = threading.Event()
+        monitor = StateMonitor(
+            self.store, self.mounter, interval=60.0, runner=self.samba
+        )
+        real_poll = monitor.poll
+
+        def counting_poll() -> None:
+            real_poll()
+            polled.set()
+
+        monitor.poll = counting_poll  # type: ignore[method-assign]
+        return monitor, polled
+
+    def test_forgetting_a_connection_polls_before_the_interval_is_up(self) -> None:
+        monitor, polled = self.monitor_with_a_long_interval()
+        monitor.start()
+        self.addCleanup(monitor.stop)
+        # The first poll happens immediately; this is about the second.
+        self.assertTrue(polled.wait(2.0), "the loop never polled at all")
+        polled.clear()
+
+        monitor.forget(self.connection["id"])
+
+        self.assertTrue(
+            polled.wait(2.0),
+            "forget did not wake the loop, so a config change waits out the "
+            "interval and the add-time race is still open",
+        )
+
+    def test_nudge_polls_before_the_interval_is_up(self) -> None:
+        monitor, polled = self.monitor_with_a_long_interval()
+        monitor.start()
+        self.addCleanup(monitor.stop)
+        self.assertTrue(polled.wait(2.0))
+        polled.clear()
+
+        monitor.nudge()
+
+        self.assertTrue(polled.wait(2.0), "nudge did not wake the loop")
+
+    def test_a_nudge_during_a_poll_is_not_lost(self) -> None:
+        """The clear is before the poll for this reason.
+
+        A config change is most likely to land *while* a poll is running, and
+        clearing the event after the wait rather than before the poll would
+        discard exactly those nudges.
+        """
+        polls: list[int] = []
+        monitor = StateMonitor(
+            self.store, self.mounter, interval=60.0, runner=self.samba
+        )
+        real_poll = monitor.poll
+        third = threading.Event()
+
+        def poll_and_nudge_itself() -> None:
+            polls.append(1)
+            if len(polls) == 1:
+                # Mid-poll, exactly like a handler committing a change.
+                monitor.nudge()
+            if len(polls) >= 3:
+                third.set()
+            real_poll()
+
+        monitor.poll = poll_and_nudge_itself  # type: ignore[method-assign]
+        monitor.start()
+        self.addCleanup(monitor.stop)
+
+        # Two polls, not three: the nudge from inside the first is honoured, and
+        # the second does not nudge again, so the loop then waits out its 60 s.
+        self.assertFalse(third.wait(1.0), "the loop is spinning rather than waiting")
+        self.assertEqual(len(polls), 2)
+
+    def test_stopping_still_returns_promptly(self) -> None:
+        """The loop waits on the wake event now, so `stop` has to set it.
+
+        Setting only `_stop` would leave shutdown waiting out a full interval —
+        5 s in the shipped daemon, and `stop` is on the path of every daemon
+        restart.
+        """
+        monitor, polled = self.monitor_with_a_long_interval()
+        monitor.start()
+        self.assertTrue(polled.wait(2.0))
+
+        monitor.stop()
+
+        self.assertIsNone(monitor._thread)
