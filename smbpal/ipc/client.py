@@ -88,25 +88,41 @@ def why_refused(
             f"guards it: ls -ld {guarded.parent} {guarded}"
         )
     if sys.platform == "darwin":
-        # **Both of the sentences below are wrong here, and were given on a Mac
-        # on 11 October 2026.** `usermod` does not exist, and macOS resolves
-        # group membership live through `membershipd` rather than fixing it when
-        # a session starts — measured in the helper spike's §4, where a shell
-        # started *before the group existed* could use it without restarting.
-        # So the instruction named a command that is not there and a remedy
-        # that is not needed, which is D14 with a platform attached.
+        # `usermod` does not exist here, so the Linux sentences below cannot be
+        # used as they are.
+        #
+        # **And this branch said "no need to log out", which was wrong.** It
+        # followed the helper spike's §4, where a shell started before the group
+        # existed could write a `root:smbpal 0660` file — so §4 concluded that
+        # the macOS install needs no re-login. Measured again on 11 October 2026
+        # against a real daemon, the opposite happened: a pre-existing session
+        # was refused *search* on a `0750` directory while `id`,
+        # `os.getgroups()` **and** `dsmemberutil checkmembership` all said it was
+        # a member, and a brand new terminal worked at once. §4's write and this
+        # refusal are not reconciled, and the doc records that rather than
+        # guessing.
+        #
+        # **The part that matters for a message: on macOS, nothing we can ask
+        # reflects what the kernel will enforce for a process that is already
+        # running.** `held` is therefore not evidence here the way it is on
+        # Linux, so this must not claim to have ruled the session out. It names
+        # the cheap fix first and the socket second, in that order, because the
+        # cheap fix is the one that worked.
+        guarded = Path(socket_path) if socket_path else DEFAULT_SOCKET_PATH
         if member:
-            guarded = Path(socket_path) if socket_path else DEFAULT_SOCKET_PATH
             return (
-                f"You are in the '{group_name}' group, and macOS resolves "
-                f"membership live, so there is nothing to log out of. That "
-                f"makes this about the socket rather than about you: "
-                f"ls -ld {guarded.parent} {guarded}"
+                f"You look like a member of '{group_name}', but on macOS that "
+                f"is not proof this session has it — id, getgroups and "
+                f"dsmemberutil can all answer from OpenDirectory rather than "
+                f"from the credential the kernel enforces. **Open a new "
+                f"terminal and try again.** If it still refuses, the socket is "
+                f"the problem: ls -ld {guarded.parent} {guarded}"
             )
         return (
             f"Membership of the '{group_name}' group is required. Add yourself "
             f"with: sudo dscl . -append /Groups/{group_name} GroupMembership "
-            f"{user} — it takes effect at once, with no need to log out."
+            f"{user} — then open a new terminal, because this session will not "
+            f"pick it up."
         )
     if member:
         return (
