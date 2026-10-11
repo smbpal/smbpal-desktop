@@ -50,6 +50,19 @@
 #define STATE_DIR "/var/db/smbpal"
 #define CREATED_FILE STATE_DIR "/created"
 #define CONFIG_DIR "/etc/smbpal"
+/* **The daemon needs a log directory it owns, and that is not cosmetic.**
+ * launchd opens `StandardErrorPath` *as the job's user* before it execs the
+ * program, so a non-root job pointed at root-owned `/var/log` fails its own
+ * configuration with EX_CONFIG and the program never runs -- with no log,
+ * because the log is what could not be created. Measured 11 October 2026 on the
+ * first real start.
+ *
+ * The helper's log deliberately stays outside this directory. It records
+ * refused uids, and the unprivileged component must not be able to edit the
+ * root component's account of what it refused. */
+#define LOG_DIR "/var/log/smbpal"
+#define DAEMON_LOG LOG_DIR "/daemon.log"
+#define HELPER_LOG "/var/log/" HELPER_LABEL ".log"
 #define LAUNCHD_DIR "/Library/LaunchDaemons"
 #define HELPER_LABEL "app.smbpal.helper"
 #define DAEMON_LABEL "app.smbpal.daemon"
@@ -231,7 +244,7 @@ static void note_created(const char *kind, const char *name, int id) {
  * this function would be two, and the one that drifts is always the one nobody
  * runs. */
 static int write_plist(const char *path, const char *label, const char *const args[],
-                       const char *user) {
+                       const char *user, const char *stderr_path) {
     FILE *fh = fopen(path, "w");
     if (fh == NULL) return -1;
     fprintf(fh, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
@@ -249,8 +262,8 @@ static int write_plist(const char *path, const char *label, const char *const ar
      * the refusal, and launchd's own log is the record. */
     fprintf(fh, "  </array>\n"
                 "  <key>RunAtLoad</key><true/>\n"
-                "  <key>StandardErrorPath</key><string>/var/log/%s.log</string>\n"
-                "</dict>\n</plist>\n", label);
+                "  <key>StandardErrorPath</key><string>%s</string>\n"
+                "</dict>\n</plist>\n", stderr_path);
     if (fclose(fh) != 0) return -1;
     if (chown(path, 0, 0) != 0) return -1;
     return chmod(path, 0644);
@@ -372,6 +385,12 @@ static int install(int dry_run, const char *daemon_path) {
     if (chown(CONFIG_DIR, pw->pw_uid, gr->gr_gid) != 0) fail("chown " CONFIG_DIR);
     if (chmod(CONFIG_DIR, 0750) != 0) fail("chmod " CONFIG_DIR);
 
+    /* Before the plists, because launchd will try to open the file the moment
+     * the job is bootstrapped. */
+    if (mkdir(LOG_DIR, 0750) != 0 && errno != EEXIST) fail("mkdir " LOG_DIR);
+    if (chown(LOG_DIR, pw->pw_uid, gr->gr_gid) != 0) fail("chown " LOG_DIR);
+    if (chmod(LOG_DIR, 0750) != 0) fail("chmod " LOG_DIR);
+
     {
         const char *helper_args[] = {SELF, "serve", "--service-user", SERVICE_USER, NULL};
         /* **The daemon's plist may point into the Homebrew prefix and the
@@ -382,9 +401,10 @@ static int install(int dry_run, const char *daemon_path) {
          * because it will be. */
         const char *daemon_args[] = {daemon_path, "--socket",
                                      RUNTIME_DIR "/smbpald.sock", NULL};
-        if (write_plist(HELPER_PLIST, HELPER_LABEL, helper_args, NULL) != 0)
+        if (write_plist(HELPER_PLIST, HELPER_LABEL, helper_args, NULL, HELPER_LOG) != 0)
             fail("write " HELPER_PLIST);
-        if (write_plist(DAEMON_PLIST, DAEMON_LABEL, daemon_args, SERVICE_USER) != 0)
+        if (write_plist(DAEMON_PLIST, DAEMON_LABEL, daemon_args, SERVICE_USER,
+                        DAEMON_LOG) != 0)
             fail("write " DAEMON_PLIST);
         if (bootstrap(HELPER_PLIST) != 0)
             fprintf(stderr, "smbpal-helper: warning: bootstrap of " HELPER_LABEL
@@ -401,9 +421,10 @@ static int install(int dry_run, const char *daemon_path) {
            "  user   %s  uid %u\n"
            "  group  %s  gid %u\n"
            "  helper %s\n"
-           "  daemon %s\n",
+           "  daemon %s\n"
+           "  logs   %s and %s\n",
            SERVICE_USER, (unsigned)pw->pw_uid, SOCKET_GROUP,
-           (unsigned)gr->gr_gid, HELPER_PLIST, DAEMON_PLIST);
+           (unsigned)gr->gr_gid, HELPER_PLIST, DAEMON_PLIST, HELPER_LOG, DAEMON_LOG);
     return 0;
 }
 
@@ -429,6 +450,12 @@ static int uninstall(void) {
     unlink(HELPER_SOCK);
     unlink(RUNTIME_DIR "/smbpald.sock");
     rmdir(RUNTIME_DIR);
+    /* The logs go, because SMBPal made them and §10.6 says it leaves nothing.
+     * Said out loud, so anybody uninstalling after a problem knows to copy the
+     * log first rather than discovering it afterwards. */
+    unlink(DAEMON_LOG);
+    rmdir(LOG_DIR);
+    printf("removed " LOG_DIR " and its log; " HELPER_LOG " is left for launchd\n");
 
     if ((fh = fopen(CREATED_FILE, "r")) == NULL) {
         printf("nothing recorded as created; left the identities alone\n");

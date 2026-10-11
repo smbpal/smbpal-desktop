@@ -260,6 +260,30 @@ class TestTheVocabularyIsFixed(unittest.TestCase):
         self.assertIn('"Password", "*"', self.code)
         self.assertNotIn("SMB-NT", self.code)
 
+    def test_the_daemon_logs_somewhere_its_own_user_can_write(self) -> None:
+        """launchd opens `StandardErrorPath` as the job's user, before exec.
+
+        **This was a real failure, not a hypothetical.** The daemon's plist
+        pointed at root-owned `/var/log`, so launchd could not create the file,
+        failed the job's configuration with `EX_CONFIG` and never ran the
+        program -- leaving no log, because the log was what could not be made.
+        Measured on the first real start, 11 October 2026.
+
+        So the daemon's log lives in a directory the install gives to the
+        service account, and the **helper's** stays outside it: the helper
+        records refused uids, and the unprivileged component must not be able to
+        edit the root component's account of what it refused.
+        """
+        self.assertIn('#define LOG_DIR "/var/log/smbpal"', self.code)
+        self.assertIn('#define DAEMON_LOG LOG_DIR "/daemon.log"', self.code)
+        # The helper's log is NOT under LOG_DIR.
+        self.assertIn('#define HELPER_LOG "/var/log/" HELPER_LABEL ".log"', self.code)
+        # And the directory is chowned to the service account before the plists
+        # are written, since launchd opens the file at bootstrap.
+        log_dir = self.code.index('mkdir(LOG_DIR')
+        plists = self.code.index("write_plist(HELPER_PLIST")
+        self.assertLess(log_dir, plists)
+
     def test_no_identity_number_is_compiled_in(self) -> None:
         """§9: the install scans 450-499 and records what it landed on."""
         import re
