@@ -87,6 +87,27 @@ def why_refused(
             f"refusal is about the socket rather than about you. Check what "
             f"guards it: ls -ld {guarded.parent} {guarded}"
         )
+    if sys.platform == "darwin":
+        # **Both of the sentences below are wrong here, and were given on a Mac
+        # on 11 October 2026.** `usermod` does not exist, and macOS resolves
+        # group membership live through `membershipd` rather than fixing it when
+        # a session starts — measured in the helper spike's §4, where a shell
+        # started *before the group existed* could use it without restarting.
+        # So the instruction named a command that is not there and a remedy
+        # that is not needed, which is D14 with a platform attached.
+        if member:
+            guarded = Path(socket_path) if socket_path else DEFAULT_SOCKET_PATH
+            return (
+                f"You are in the '{group_name}' group, and macOS resolves "
+                f"membership live, so there is nothing to log out of. That "
+                f"makes this about the socket rather than about you: "
+                f"ls -ld {guarded.parent} {guarded}"
+            )
+        return (
+            f"Membership of the '{group_name}' group is required. Add yourself "
+            f"with: sudo dscl . -append /Groups/{group_name} GroupMembership "
+            f"{user} — it takes effect at once, with no need to log out."
+        )
     if member:
         return (
             f"You are in the '{group_name}' group, but this session started "

@@ -666,8 +666,18 @@ class TestWhyTheSocketRefusedUs(unittest.TestCase):
         held: tuple[int, ...] = (),
         user: str = "someone",
         socket_path: str | None = None,
+        platform: str = "linux",
     ) -> str:
-        with mock.patch.object(client_module.grp, "getgrnam", return_value=group), \
+        """**The platform is pinned, and these tests needed it pinned.**
+
+        They assert the Linux wording and passed on a Mac only because the code
+        was platform-blind. The moment `why_refused` learned that `usermod` does
+        not exist on macOS, three of them failed on a Mac while being perfectly
+        correct about Linux -- a test that depends on the host has to say so.
+        `TestTheGroupAdviceFitsThePlatform` covers the darwin branch.
+        """
+        with mock.patch.object(client_module.sys, "platform", platform), \
+             mock.patch.object(client_module.grp, "getgrnam", return_value=group), \
              mock.patch.object(client_module.os, "getgroups", return_value=list(held)), \
              mock.patch.object(client_module.os, "getgid", return_value=1000), \
              mock.patch.object(client_module.getpass, "getuser", return_value=user):
@@ -794,3 +804,56 @@ class TestADirectoryThatIsAlreadyCorrect(unittest.TestCase):
         self.assertNotIn("root service", message)
         self.assertIn("0750", message)
         self.assertIn("smbpal setup", message)
+
+
+class TestTheGroupAdviceFitsThePlatform(unittest.TestCase):
+    """`why_refused` named a Linux command on a Mac, and a remedy it does not need.
+
+    Reported from a Mac on 11 October 2026, the first time the daemon listened
+    there: *"Add yourself with: sudo usermod -aG smbpal luke — then log out and
+    back in."* **`usermod` does not exist on macOS**, and macOS resolves group
+    membership **live** through `membershipd` rather than fixing it when a
+    session starts -- the helper spike's §4 measured a shell started *before the
+    group existed* using it without restarting.
+
+    So the message named a command that is not there and a remedy that is not
+    needed. D14 with a platform attached: true somewhere, and presented as true
+    here.
+    """
+
+    def advice(self, platform: str, *, member: bool) -> str:
+        fake = type("G", (), {"gr_gid": 4242, "gr_mem": ["someone"] if not member else ["me"]})
+        with (
+            mock.patch.object(client_module.sys, "platform", platform),
+            mock.patch.object(client_module.grp, "getgrnam", return_value=fake),
+            mock.patch.object(client_module.getpass, "getuser", return_value="me"),
+            mock.patch.object(client_module.os, "getgroups", return_value=[20]),
+            mock.patch.object(client_module.os, "getgid", return_value=20),
+        ):
+            return client_module.why_refused("smbpal")
+
+    def test_macos_is_told_dscl_and_not_usermod(self) -> None:
+        said = self.advice("darwin", member=False)
+        self.assertIn("dscl . -append /Groups/smbpal GroupMembership me", said)
+        self.assertNotIn("usermod", said)
+
+    def test_macos_is_not_told_to_log_out(self) -> None:
+        said = self.advice("darwin", member=False)
+        self.assertIn("no need to log out", said)
+
+    def test_linux_keeps_usermod_and_the_re_login(self) -> None:
+        said = self.advice("linux", member=False)
+        self.assertIn("usermod -aG smbpal me", said)
+        self.assertIn("log out and back in", said)
+        self.assertNotIn("dscl", said)
+
+    def test_a_macos_member_is_sent_to_the_socket_not_to_a_re_login(self) -> None:
+        """If the record says you are a member, macOS already honours it, so a
+        refusal cannot be about the session."""
+        said = self.advice("darwin", member=True)
+        self.assertIn("ls -ld", said)
+        self.assertNotIn("log out of", said.replace("nothing to log out of", ""))
+
+    def test_a_linux_member_is_told_about_the_session(self) -> None:
+        said = self.advice("linux", member=True)
+        self.assertIn("Log out and back in", said)
