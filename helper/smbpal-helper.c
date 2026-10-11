@@ -98,10 +98,23 @@ static void fail(const char *what) {
 
 /* The runtime directory, which the daemon cannot create for itself because on
  * macOS it does not run as root (§9). `/var/run` is root:daemon and `/run`
- * cannot exist at all -- the Signed System Volume, §6.20. */
-static void ensure_runtime_dir(gid_t gid) {
+ * cannot exist at all -- the Signed System Volume, §6.20.
+ *
+ * **Owned by the service account, not by root, and that was a bug the first
+ * time.** §9 specified `root:smbpal 0750` by copying Linux, where the daemon is
+ * root and the write bit on this directory is irrelevant. On macOS the daemon
+ * binds its socket here as the service account, and **creating a file needs
+ * write on the directory** -- group `smbpal` has `r-x`. So the daemon failed
+ * with `cannot bind /var/run/smbpal/smbpald.sock: [Errno 13] Permission
+ * denied`, measured 11 October 2026.
+ *
+ * `0750` with the service account as owner is the narrowest thing that works:
+ * the daemon writes its socket, members of `smbpal` traverse to reach it, and
+ * nobody else gets in. `0770 root:smbpal` would also have worked and would have
+ * let every human in the group delete the socket. */
+static void ensure_runtime_dir(uid_t uid, gid_t gid) {
     if (mkdir(RUNTIME_DIR, 0750) != 0 && errno != EEXIST) fail("mkdir " RUNTIME_DIR);
-    if (chown(RUNTIME_DIR, 0, gid) != 0) fail("chown " RUNTIME_DIR);
+    if (chown(RUNTIME_DIR, uid, gid) != 0) fail("chown " RUNTIME_DIR);
     /* After chown, because chown clears set-id bits and we want the mode we
      * asked for rather than the mode mkdir was allowed by the umask. */
     if (chmod(RUNTIME_DIR, 0750) != 0) fail("chmod " RUNTIME_DIR);
@@ -385,6 +398,14 @@ static int install(int dry_run, const char *daemon_path) {
     if (chown(CONFIG_DIR, pw->pw_uid, gr->gr_gid) != 0) fail("chown " CONFIG_DIR);
     if (chmod(CONFIG_DIR, 0750) != 0) fail("chmod " CONFIG_DIR);
 
+    /* Created here as well as in `serve`, because launchd gives no ordering
+     * between two jobs and the daemon cannot make this directory itself. If the
+     * daemon won the race it would fail to bind and, having no KeepAlive, stay
+     * down. **This closes the install-time race and not the boot-time one**:
+     * whether `/var/run` survives a reboot on macOS has not been measured, and
+     * if it does not then the ordering question is real and open. */
+    ensure_runtime_dir(pw->pw_uid, gr->gr_gid);
+
     /* Before the plists, because launchd will try to open the file the moment
      * the job is bootstrapped. */
     if (mkdir(LOG_DIR, 0750) != 0 && errno != EEXIST) fail("mkdir " LOG_DIR);
@@ -473,8 +494,16 @@ static int uninstall(void) {
                      want_user ? "Users" : "Groups", name);
             char *const argv[] = {(char *)DSCL, ".", "-delete", path, NULL};
             run_quiet(argv);
-            /* §4: verify the effect, do not trust the exit code. */
-            int gone = want_user ? (getpwnam(name) == NULL) : (getgrnam(name) == NULL);
+            /* §4 says verify the effect rather than the exit code. **Verify it
+             * through the interface that wrote it**, which this did not do the
+             * first time: `getgrnam` answers from opendirectoryd's cache, and
+             * on 11 October 2026 it still reported the group one instruction
+             * after `dscl` had deleted it -- so uninstall said
+             * `COULD NOT REMOVE group smbpal` about a group that was gone, and
+             * the install a moment later created it afresh. `dscl -read` asks
+             * the node the write went to. */
+            char *const check[] = {(char *)DSCL, ".", "-read", path, "RecordName", NULL};
+            int gone = run_quiet(check) != 0;
             printf("%s %s %s\n", gone ? "removed" : "COULD NOT REMOVE", kind, name);
             if (gone) removed++;
         }
@@ -647,7 +676,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    ensure_runtime_dir(gr->gr_gid);
+    ensure_runtime_dir(pw->pw_uid, gr->gr_gid);
     listener = listen_on_socket();
     fprintf(stderr, "smbpal-helper: listening on %s for uid %u\n", HELPER_SOCK,
             (unsigned)expected_peer);
