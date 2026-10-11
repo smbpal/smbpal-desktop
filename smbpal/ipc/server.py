@@ -157,6 +157,11 @@ class UnixSocketConnection:
                     yield line
 
 
+def _describe_mode(info: os.stat_result) -> str:
+    """For the one error where the numbers are the whole of the diagnosis."""
+    return f"group {info.st_gid} with mode {stat.S_IMODE(info.st_mode):04o}"
+
+
 class UnixSocketTransport:
     """Binds the socket, accepts clients, and can push to all of them."""
 
@@ -285,24 +290,45 @@ class UnixSocketTransport:
         would change the daemon's primary gid and put that group on every file
         it writes into /etc/samba. So the daemon owns the problem, which also
         covers the directory it makes for itself when systemd is not involved.
+
+        **Already-correct is not a failure, and on macOS it is the normal
+        case.** Changing a directory's group needs root, or ownership of it; the
+        daemon has neither on macOS, where it runs as a service account and the
+        compiled helper creates the directory for it (the spike's §9). So the
+        state is checked before it is changed, and a directory that already has
+        the group and mode this wants is left alone.
+
+        **The docstring this replaces said "the daemon is a root service", and
+        that was the whole of the bug.** §9 recorded that *nothing in
+        `ipc/server.py` asserts the uid is 0* -- true of the assertions and
+        false of the behaviour, because an unconditional `chown` requires root
+        whether or not anything says so, and the error message asserted it in
+        prose instead. Found 11 October 2026 by reading this before the daemon
+        was first run as a non-root user, which is the only reason it was not
+        found by the daemon refusing to start.
         """
         directory = self.path.parent
         shared = {directory, directory.resolve()} & _SHARED_DIRS
-        world_writable = directory.stat().st_mode & stat.S_IWOTH
-        if shared or world_writable:
+        info = directory.stat()
+        if shared or info.st_mode & stat.S_IWOTH:
             raise OSError(
                 f"refusing to give group {self.group!r} ownership of {directory} — "
                 "a group-guarded socket needs a directory of its own, not a "
                 "shared or world-writable one. Pass --socket-group '' for a "
                 "socket in a shared directory."
             )
+        if info.st_gid == gid and stat.S_IMODE(info.st_mode) == _RUNTIME_DIR_MODE:
+            return
         try:
             os.chown(directory, -1, gid)
             os.chmod(directory, _RUNTIME_DIR_MODE)
         except PermissionError:
             raise OSError(
-                f"cannot set group {self.group!r} on {directory} — "
-                "the daemon is a root service (see the plan's daemon lifecycle)"
+                f"cannot set group {self.group!r} on {directory} — it is "
+                f"{_describe_mode(info)} and this needs group {gid} with mode "
+                f"{_RUNTIME_DIR_MODE:04o}. Whatever creates the directory has "
+                "to set them: the package does on Linux, and `smbpal setup` "
+                "does on macOS."
             ) from None
 
     def serve_forever(self, handler: Handler) -> None:
