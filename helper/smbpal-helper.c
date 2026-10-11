@@ -271,8 +271,21 @@ static int write_plist(const char *path, const char *label, const char *const ar
     fprintf(fh, "  <key>ProgramArguments</key>\n  <array>\n");
     for (int i = 0; args[i] != NULL; i++)
         fprintf(fh, "    <string>%s</string>\n", args[i]);
-    /* No KeepAlive. A component that respawns after refusing something hides
-     * the refusal, and launchd's own log is the record. */
+    /* **No KeepAlive, for either job.** A component that respawns after
+     * refusing something hides the refusal, and launchd's own log is the
+     * record.
+     *
+     * `SuccessfulExit false` on the daemon was tried and taken back out, and
+     * the reason is worth keeping: launchd cannot tell *why* a job exited
+     * non-zero. The daemon returns 2 on an invalid config and means it --
+     * "starting with an empty config looks exactly like all your shares are
+     * gone, and the next save would make that true" -- so retrying turned a
+     * deliberate refusal into a flapping service writing the same three lines
+     * into an unrotated log every ten seconds for ever.
+     *
+     * The boot race it was there for is closed where it actually happens
+     * instead: `ipc/server.py` waits a bounded time for the runtime directory,
+     * which is the one condition that is genuinely transient. */
     fprintf(fh, "  </array>\n"
                 "  <key>RunAtLoad</key><true/>\n"
                 "  <key>StandardErrorPath</key><string>%s</string>\n"
@@ -399,11 +412,25 @@ static int install(int dry_run, const char *daemon_path) {
     if (chmod(CONFIG_DIR, 0750) != 0) fail("chmod " CONFIG_DIR);
 
     /* Created here as well as in `serve`, because launchd gives no ordering
-     * between two jobs and the daemon cannot make this directory itself. If the
-     * daemon won the race it would fail to bind and, having no KeepAlive, stay
-     * down. **This closes the install-time race and not the boot-time one**:
-     * whether `/var/run` survives a reboot on macOS has not been measured, and
-     * if it does not then the ordering question is real and open. */
+     * between two jobs and the daemon cannot make this directory itself: as the
+     * service account, `mkdir` under `/var/run` (root:daemon) is EPERM.
+     *
+     * **The boot-time race is real, measured.** `/var/run` does not survive a
+     * reboot on macOS: after one, `/var/run/smbpal` had a birth time of
+     * 19:34:32 against a `kern.boottime` of 19:34:26, so it was created six
+     * seconds into the boot and not carried over. The helper happened to win by
+     * about two seconds, and nothing made it win. So this call closes the
+     * install-time race, and the boot-time one is closed in `ipc/server.py`:
+     * the daemon waits a bounded time for this directory to appear, because
+     * that is the one condition in its startup that is genuinely transient.
+     * `KeepAlive` was tried here first and taken out -- launchd cannot tell a
+     * lost race from a config the daemon refused to start on, and the daemon
+     * means that refusal.
+     *
+     * Socket activation would remove the race rather than retry it -- launchd
+     * would own the socket and the directory would not need to exist when the
+     * daemon starts -- but it needs `launch_activate_socket` and a daemon that
+     * accepts an inherited fd, so it is the later answer, not this one. */
     ensure_runtime_dir(pw->pw_uid, gr->gr_gid);
 
     /* Before the plists, because launchd will try to open the file the moment
