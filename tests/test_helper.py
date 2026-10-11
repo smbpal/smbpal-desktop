@@ -334,47 +334,28 @@ class TestTheVocabularyIsFixed(unittest.TestCase):
         exits. This closes the race at install time."""
         self.assertIn("ensure_runtime_dir(", self.function("static int install("))
 
-    def test_only_the_daemon_is_brought_back_after_a_failed_exit(self) -> None:
+    def test_neither_job_respawns_after_a_failure(self) -> None:
         """`/var/run` does not survive a reboot on macOS -- measured.
 
         After one, `/var/run/smbpal` had a birth time six seconds later than
         `kern.boottime` (19:34:32 against 19:34:26, 11 October 2026), so the
         directory was made during the boot and not carried over. The helper won
         by about two seconds and nothing made it win, so the boot-time race is
-        real and the losing daemon would stay down for the whole boot.
+        real and the losing daemon would exit on the failed bind.
 
-        The asymmetry is the point. The daemon is brought back because the
-        thing it loses to is transient. The **helper** is not: a component that
-        respawns after refusing something hides the refusal. And it is
-        `SuccessfulExit false` rather than a bare `KeepAlive`, so a clean
-        shutdown stays final for both.
+        **`KeepAlive`/`SuccessfulExit false` on the daemon was the first answer
+        and was taken back out.** launchd cannot tell *why* a job exited
+        non-zero, and the daemon returns 2 on an invalid config and means it --
+        so retrying turned a deliberate refusal into a flapping service writing
+        the same three lines into an unrotated log every ten seconds for ever.
+
+        The race is closed in `ipc/server.py` instead, which waits for the one
+        condition that is genuinely transient. So neither job respawns, and the
+        rule the helper's comment states applies to both of them.
         """
-        body = self.function("static int write_plist(")
-        self.assertIn("<key>SuccessfulExit</key><false/>", body)
-        self.assertIn("if (retry_on_failure)", body)
-        # Unconditional KeepAlive would respawn the helper too.
-        self.assertNotIn("<key>KeepAlive</key></dict>", body)
-
-        install = self.function("static int install(")
-        helper_call = install.index("write_plist(HELPER_PLIST")
-        daemon_call = install.index("write_plist(DAEMON_PLIST")
-        self.assertIn("HELPER_LOG,\n                        0)", install[helper_call:])
-        self.assertIn("DAEMON_LOG, 1)", install[daemon_call:])
-
-    def test_a_delete_is_verified_through_the_tool_that_wrote_it(self) -> None:
-        """`getgrnam` answers from opendirectoryd's cache.
-
-        It reported the group one instruction after `dscl` had deleted it, so
-        uninstall said `COULD NOT REMOVE` about something that was gone --
-        measured 11 October 2026. §4's rule needs the sharper form: verify the
-        effect *through the interface that made it*.
-        """
-        body = self.function("static int uninstall(")
-        self.assertIn('"-read"', body)
-        # Not anywhere in the file: `main` resolves identities with these to
-        # serve, which is correct. Only the delete must not trust the cache.
-        self.assertNotIn("getgrnam", body)
-        self.assertNotIn("getpwnam", body)
+        self.assertNotIn("KeepAlive", self.code)
+        self.assertNotIn("ThrottleInterval", self.code)
+        self.assertNotIn("SuccessfulExit", self.code)
 
     def test_the_daemon_logs_somewhere_its_own_user_can_write(self) -> None:
         """launchd opens `StandardErrorPath` as the job's user, before exec.
