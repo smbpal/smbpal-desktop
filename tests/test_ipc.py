@@ -837,9 +837,17 @@ class TestTheGroupAdviceFitsThePlatform(unittest.TestCase):
         self.assertIn("dscl . -append /Groups/smbpal GroupMembership me", said)
         self.assertNotIn("usermod", said)
 
-    def test_macos_is_not_told_to_log_out(self) -> None:
+    def test_macos_is_told_to_open_a_new_terminal(self) -> None:
+        """**This assertion is the reverse of what it said four hours ago.**
+
+        It asserted *no need to log out*, following the helper spike's §4. Then
+        a real daemon refused a pre-existing session on 11 October 2026 while
+        every membership query said member, and a new terminal worked at once.
+        The message that shipped in between was wrong.
+        """
         said = self.advice("darwin", member=False)
-        self.assertIn("no need to log out", said)
+        self.assertIn("open a new terminal", said)
+        self.assertNotIn("no need to log out", said)
 
     def test_linux_keeps_usermod_and_the_re_login(self) -> None:
         said = self.advice("linux", member=False)
@@ -847,12 +855,19 @@ class TestTheGroupAdviceFitsThePlatform(unittest.TestCase):
         self.assertIn("log out and back in", said)
         self.assertNotIn("dscl", said)
 
-    def test_a_macos_member_is_sent_to_the_socket_not_to_a_re_login(self) -> None:
-        """If the record says you are a member, macOS already honours it, so a
-        refusal cannot be about the session."""
+    def test_a_macos_member_is_not_told_the_session_is_ruled_out(self) -> None:
+        """On macOS nothing queryable reflects the running credential.
+
+        `held` was true -- `os.getgroups()` contained the gid -- and the kernel
+        refused anyway. So this branch must not say *the refusal is about the
+        socket rather than about you*: it offers the new terminal first, because
+        that is what worked, and the socket second.
+        """
         said = self.advice("darwin", member=True)
+        self.assertIn("Open a new", said)
         self.assertIn("ls -ld", said)
-        self.assertNotIn("log out of", said.replace("nothing to log out of", ""))
+        self.assertLess(said.index("new terminal"), said.index("ls -ld"))
+        self.assertNotIn("rather than about you", said)
 
     def test_a_linux_member_is_told_about_the_session(self) -> None:
         said = self.advice("linux", member=True)
