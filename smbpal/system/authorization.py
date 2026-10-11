@@ -10,6 +10,13 @@ instead of being looked up from an identity.** The client prompts, serialises th
 grant it was given, and the privileged side asks the system whether that grant
 covers the right. Nobody has to work out who is calling.
 
+**A grant does not outlive the reference it came from**, which is the one thing
+here that had to be measured rather than read: `AuthorizationFree` on the
+creating reference makes the 32 bytes unimportable on the other side, with no
+`kAuthorizationFlagDestroyRights` and without the process exiting. So `grant`
+returns a context manager, and the caller holds it open until the verify has
+answered. See `Grant`.
+
 **This module is the client half only, and it prompts.** The verifying half is
 `helper/smbpal-helper.c`, in C, and §10 is emphatic about why it is not the
 daemon: §9 established that `smbpald` is admin-writable code, so a helper that
@@ -182,18 +189,76 @@ def _message(status: int) -> str:
     return _MESSAGES.get(status, f"Authorization Services returned {status}")
 
 
-def grant(right: str, *, interaction: bool = True) -> bytes:
-    """Prompt for `right` and return the external form, `EXTERNAL_FORM_LENGTH` bytes.
+class Grant:
+    """A live authorisation, and the bytes that refer to it.
 
-    The reference is freed before returning and the bytes outlive it on purpose:
-    an `AuthorizationExternalForm` is what the grant is *for*, and holding the
-    reference open would keep a live authorisation in a process that has already
-    finished asking for one.
+    **The form is only meaningful while this object is open, measured rather
+    than assumed.** `AuthorizationFree` on the creating reference -- without
+    `kAuthorizationFlagDestroyRights`, without the process exiting -- is enough
+    to make `AuthorizationCreateFromExternalForm` reject the 32 bytes on the
+    other side. Measured on 11 October 2026: with the reference alive the verify
+    returned 0 and `allowed`, and one `AuthorizationFree` later the same bytes
+    `did not import`.
+
+    So this is a context manager and not a `bytes` return. The first version of
+    this module freed the reference in a `finally` and returned the form, which
+    handed every caller a grant that was already dead -- and the comment above
+    the `finally` correctly said the grant had to outlive the call, which is
+    what makes it a good example of why that is a measurement and not a
+    deduction.
+
+    **Replay is bounded by this object rather than by the right's timeout**,
+    which is tighter than §10 assumed when it called replay "a parameter rather
+    than a flaw". A captured blob is useless once the client that made it has
+    closed the grant.
+
+    Freeing does *not* clear the cached credential: a later `grant` inside the
+    right's `timeout` window succeeds without prompting, which is the property
+    the timeout exists for -- add, set a password, apply is one authentication.
+    """
+
+    def __init__(self, right: str, ref: Any, form: bytes) -> None:
+        self.right = right
+        self._ref = ref
+        self._form = form
+
+    @property
+    def form(self) -> bytes:
+        """The external form, `EXTERNAL_FORM_LENGTH` bytes, to relay as-is."""
+        if self._ref is None:
+            raise AuthorizationError(
+                f"the grant for {self.right} has been closed",
+                detail="an external form does not outlive the reference it came from",
+            )
+        return self._form
+
+    def close(self) -> None:
+        if self._ref is None:
+            return
+        ref, self._ref = self._ref, None
+        # Not `kAuthorizationFlagDestroyRights`. Destroying would clear the
+        # cached credential and make the next mutation in the same intention
+        # prompt again, which is the thing the right's timeout is for.
+        _security().AuthorizationFree(ref, 0)
+
+    def __enter__(self) -> "Grant":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
+
+
+def grant(right: str, *, interaction: bool = True) -> Grant:
+    """Prompt for `right` and return a live `Grant`.
+
+    The caller must hold it open until whoever verifies the form has answered,
+    because the form is only importable while the reference behind it lives.
     """
     if right not in RIGHTS:
         # Not a lookup failure to pass on to the system. A right this module has
         # never heard of cannot have been registered by our install, so asking
-        # about it would get an answer about nothing.
+        # about it would get an answer about the fallback `default` rule and not
+        # about anything of SMBPal's.
         raise AuthorizationError(
             f"unknown right: {right}",
             detail=f"the rights SMBPal registers are {', '.join(RIGHTS)}",
@@ -229,16 +294,16 @@ def grant(right: str, *, interaction: bool = True) -> bytes:
         # Read by address and length, not through `.bytes`: that is a
         # fixed-size char array, and ctypes truncates one at the first NUL. The
         # form is binary and a NUL in it is an ordinary byte.
-        return ctypes.string_at(ctypes.byref(form), EXTERNAL_FORM_LENGTH)
-    finally:
-        # Not `kAuthorizationFlagDestroyRights`: the grant has to survive this
-        # process for the helper to verify it, and destroying the rights here
-        # would hand over 32 bytes that import to nothing.
+        return Grant(right, ref, ctypes.string_at(ctypes.byref(form), EXTERNAL_FORM_LENGTH))
+    except BaseException:
+        # Only on the failure paths. The success path hands the reference to the
+        # `Grant`, which is the whole point.
         sec.AuthorizationFree(ref, 0)
+        raise
 
 
-def grant_for(right: str) -> bytes | None:
-    """`grant`, except that root gets `None` and prompts for nothing.
+def grant_for(right: str) -> Grant | None:
+    """`grant`, except that root and the unprompted rights get `None`.
 
     `handlers.py` lets uid 0 past before a checker is consulted, so a client
     under `sudo` has nothing to ask for and a dialog there would be a question

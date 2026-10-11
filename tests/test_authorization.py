@@ -49,12 +49,68 @@ class TestNothingPromptsWhenItShouldNot(unittest.TestCase):
     def test_an_ordinary_user_is_not_short_circuited(self) -> None:
         """The mirror of the test above: if `grant_for` returned `None` for
         everyone, every mutation would be unauthorised and look authorised."""
+        sentinel = object()
         with mock.patch("os.geteuid", return_value=501):
-            with mock.patch.object(authorization, "grant", return_value=b"\x01" * 32) as asked:
-                self.assertEqual(
-                    authorization.grant_for(authorization.MANAGE_SHARES), b"\x01" * 32
+            with mock.patch.object(authorization, "grant", return_value=sentinel) as asked:
+                self.assertIs(
+                    authorization.grant_for(authorization.MANAGE_SHARES), sentinel
                 )
             asked.assert_called_once_with(authorization.MANAGE_SHARES)
+
+
+class TestAGrantDiesWithItsReference(unittest.TestCase):
+    """**Measured, 11 October 2026, and it was a bug in this module.**
+
+    `AuthorizationFree` on the creating reference is enough to make
+    `AuthorizationCreateFromExternalForm` reject the form: verify returned 0 and
+    `allowed` with the reference alive, and `did not import` one `Free` later,
+    same bytes, same process. The first version of `grant` freed in a `finally`
+    and returned the form, so every grant it issued was already dead.
+
+    These tests hold the invariant without needing a prompt: a closed grant must
+    refuse to hand out bytes rather than hand out bytes that cannot work.
+    """
+
+    def grant(self) -> authorization.Grant:
+        return authorization.Grant(authorization.MANAGE_SHARES, object(), b"\x01" * 32)
+
+    def test_an_open_grant_hands_over_the_form(self) -> None:
+        self.assertEqual(len(self.grant().form), authorization.EXTERNAL_FORM_LENGTH)
+
+    def test_a_closed_grant_refuses_rather_than_returning_dead_bytes(self) -> None:
+        held = self.grant()
+        with mock.patch.object(authorization, "_security"):
+            held.close()
+        with self.assertRaises(authorization.AuthorizationError) as caught:
+            held.form
+        self.assertIn("does not outlive", str(caught.exception.detail))
+
+    def test_closing_twice_frees_once(self) -> None:
+        """A double free in the one component whose job is authorisation is not
+        a tidy-up question."""
+        held = self.grant()
+        with mock.patch.object(authorization, "_security") as sec:
+            held.close()
+            held.close()
+        self.assertEqual(sec.return_value.AuthorizationFree.call_count, 1)
+
+    def test_closing_does_not_destroy_the_cached_credential(self) -> None:
+        """Flag 0, not `kAuthorizationFlagDestroyRights`. Destroying would make
+        the next mutation in one intention prompt again, which is exactly what
+        the right's timeout exists to prevent."""
+        held = self.grant()
+        with mock.patch.object(authorization, "_security") as sec:
+            held.close()
+        _ref, flags = sec.return_value.AuthorizationFree.call_args.args
+        self.assertEqual(flags, 0)
+
+    def test_it_is_a_context_manager(self) -> None:
+        held = self.grant()
+        with mock.patch.object(authorization, "_security"):
+            with held as inner:
+                self.assertIs(inner, held)
+        with self.assertRaises(authorization.AuthorizationError):
+            held.form
 
 
 class TestItIsMacOsOnly(unittest.TestCase):
