@@ -28,6 +28,10 @@
  * because there is nothing to undo if it is wrong.
  */
 
+#include <Security/Authorization.h>
+#include <Security/AuthorizationDB.h>
+#include <CoreFoundation/CoreFoundation.h>
+
 #include <errno.h>
 #include <grp.h>
 #include <pwd.h>
@@ -303,6 +307,257 @@ static int bootout(const char *label) {
     return run_quiet(argv);
 }
 
+/* ---------------------------------------------------------------------------
+ * Authorization Services: the rights, their rules, and the verify.
+ *
+ * §10 chose this over polkit because polkit cannot work here at all --
+ * `getpeereid` gives no pid, so no subject exists to look up -- and
+ * Authorization Services passes the grant instead of an identity.
+ *
+ * **The verify lives in this file and not in the daemon.** §9 established that
+ * `smbpald` is admin-writable code, so a helper that trusted the daemon's
+ * verdict would be a root-escalation service with a socket on it: an admin who
+ * replaced the daemon could simply not verify. Here it survives a replaced
+ * daemon, because a forged external form either fails to import or imports to a
+ * reference holding no rights.
+ *
+ * The rules are written here rather than shipped as a plist for the same reason
+ * the launchd plists are, and the rights' names are duplicated in
+ * `smbpal/system/authorization.py` by necessity -- one side prompts, one side
+ * verifies -- with a test pinning the two together.
+ * ------------------------------------------------------------------------- */
+
+/* Pins the 32 in `smbpal/system/authorization.py` to the struct the system
+ * actually defines, so the Python constant cannot drift from the C reality. */
+_Static_assert(sizeof(AuthorizationExternalForm) == 32,
+               "AuthorizationExternalForm is not 32 bytes on this SDK");
+
+struct right_rule {
+    const char *name;
+    /* Shown in the dialog. macOS renders it as "<app> is trying to <text>", so
+     * these are verb phrases and are the `<description>` strings from
+     * packaging/polkit/org.smbpal.policy, which is where the wording was
+     * argued. §10's second measurement asks whether the prompt is attributed to
+     * something a person recognises rather than to `python3.14`; this is the
+     * part of that we control. */
+    const char *description;
+};
+
+/* **Two rights, not the three polkit actions.** `use-connections` is
+ * `allow_active yes` on Linux, and the policy file argues why: a configured
+ * connection is already reachable without a prompt, so prompting on the button
+ * that does the same thing protects nothing. On macOS the mount is the user's
+ * own agent acting as themselves (D13), so there is no privilege to ask for
+ * either -- and a right in the system database that no component ever checks is
+ * dead policy that reads like live policy. */
+static const struct right_rule RIGHTS[] = {
+    {"app.smbpal.manage-shares", "change the folders this computer shares"},
+    {"app.smbpal.manage-connections",
+     "change the network shares this computer connects to"},
+};
+static const size_t RIGHTS_COUNT = sizeof RIGHTS / sizeof RIGHTS[0];
+
+/* Long enough that add / set a password / apply is one authentication rather
+ * than three -- the problem `auth_admin_keep` solves on Linux, and the policy
+ * file's note on it applies unchanged: three prompts for one intention is how
+ * people learn to type their password without reading the box. Short enough
+ * that a replayable grant is a five-minute window and not a login session.
+ *
+ * This number is the security parameter §10 said SMBPal has to choose rather
+ * than inherit, because a grant can be replayed for as long as it stays
+ * authorised. It happens to equal the `default` rule's 300, measured on this
+ * machine -- so the whole value of registering these rights is `shared false`
+ * plus a description a person can recognise in the dialog. Worth knowing before
+ * anyone concludes the registration is decorative: `shared true` would let a
+ * credential obtained elsewhere, for anything, satisfy these rights. */
+#define RIGHT_TIMEOUT 300
+
+/* **The rule keys are string literals because this SDK has no macros for
+ * them.** `AuthorizationDB.h` defines `kAuthorizationRightRule`,
+ * `kAuthorizationRuleClassAllow` and `kAuthorizationRuleClassDeny` and stops
+ * there: `kAuthorizationRuleParameterCredentialShared` and
+ * `...CredentialTimeout` do not exist here and a build against them fails to
+ * parse. Same shape as §4's DirectoryService constant, and the same rule --
+ * read the header on the machine, do not trust the memory of a header. */
+static CFDictionaryRef rule_for(void) {
+    CFMutableDictionaryRef rule = CFDictionaryCreateMutable(
+        NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (rule == NULL) return NULL;
+    /* `user` + `group admin` is `auth_admin`, which is what all three polkit
+     * actions chose for a non-active session. `authenticate-session-owner`
+     * would ask for the person at the machine instead of an administrator, and
+     * §10 is right that those are different products: changing what a computer
+     * shares with the network is an administrator's decision. */
+    CFDictionarySetValue(rule, CFSTR("class"), CFSTR("user"));
+    CFDictionarySetValue(rule, CFSTR("group"), CFSTR("admin"));
+    /* Explicit, because it is the bit that makes this a prompt at all. */
+    CFDictionarySetValue(rule, CFSTR("authenticate-user"), kCFBooleanTrue);
+    CFDictionarySetValue(rule, CFSTR("shared"), kCFBooleanFalse);
+    /* **`allow-root` is false, and the earlier intent to set it true was
+     * wrong.** The reasoning that produced `true` was about the *client*: a
+     * `sudo` client is genuinely uid 0, so `allow-root` would make headless
+     * macOS mean "mutations need sudo". But the process that calls
+     * `AuthorizationCopyRights` here is *this helper*, and it is root. If
+     * `allow-root` is honoured for the verifying process, every imported form
+     * would verify no matter what it held, and the gate would be off while
+     * appearing to be on.
+     *
+     * **This is the safe default and not a free one, and §11's route is what it
+     * costs.** §11 found that a `sudo` client over `ssh` could acquire the
+     * right with no prompt and no window server if `allow-root` were true,
+     * which turns headless macOS from "cannot mutate" into "mutations need
+     * `sudo`". That route needs `true`, and `true` is only safe if an
+     * *imported* form ignores `allow-root` -- which nobody has measured. Note
+     * that the daemon's own uid-0 shortcut does not substitute for it: this
+     * helper sees the daemon's uid on the socket and never the client's, so it
+     * cannot exempt root even when root is who is asking.
+     *
+     * So `false` until that measurement exists (spike §12.3). It can never
+     * silently disable the gate; `true` on an unmeasured behaviour can, and
+     * would do it while looking correct. If the measurement says imported forms
+     * ignore the flag, this becomes `true` and the headless route returns -- one
+     * line, once it is knowledge.
+     *
+     * **Apple agrees.** `security authorizationdb read default` on this machine
+     * (11 October 2026) has `allow-root false` on the rule that catches every
+     * unregistered right, so this is the system's own choice for the same
+     * situation and not a reading of ours against the grain. */
+    CFDictionarySetValue(rule, CFSTR("allow-root"), kCFBooleanFalse);
+    int timeout = RIGHT_TIMEOUT;
+    CFNumberRef seconds = CFNumberCreate(NULL, kCFNumberIntType, &timeout);
+    if (seconds != NULL) {
+        CFDictionarySetValue(rule, CFSTR("timeout"), seconds);
+        CFRelease(seconds);
+    }
+    return rule;
+}
+
+/* §10.6 applies to the authorization database like everything else: the install
+ * registers what it needs and the uninstall removes exactly that. */
+static int rights_install(void) {
+    AuthorizationRef ref = NULL;
+    if (AuthorizationCreate(NULL, NULL, kAuthorizationFlagDefaults, &ref) !=
+        errAuthorizationSuccess) {
+        fprintf(stderr, "smbpal-helper: could not open the authorization database\n");
+        return -1;
+    }
+    CFDictionaryRef rule = rule_for();
+    if (rule == NULL) {
+        AuthorizationFree(ref, kAuthorizationFlagDefaults);
+        return -1;
+    }
+    int failures = 0;
+    for (size_t i = 0; i < RIGHTS_COUNT; i++) {
+        CFStringRef description = CFStringCreateWithCString(
+            NULL, RIGHTS[i].description, kCFStringEncodingUTF8);
+        OSStatus st = AuthorizationRightSet(ref, RIGHTS[i].name, rule, description,
+                                            NULL, NULL);
+        if (description != NULL) CFRelease(description);
+        if (st != errAuthorizationSuccess) {
+            /* **Named, and the warning does not claim this fails closed,
+             * because it does not.** An unregistered right is not an absent
+             * right: the database falls back to the `default` rule, and
+             * `security authorizationdb read default` on this machine
+             * (11 October 2026) is `class user`, `group admin`,
+             * `authenticate-user true`, `allow-root false`, `timeout 300` --
+             * and `shared true`.
+             *
+             * So a failed registration still prompts an administrator; what it
+             * loses is `shared false`, which is the one field our rule changes.
+             * `shared true` means a credential obtained by any other client for
+             * anything can satisfy this right with no prompt. That is a real
+             * weakening and worth a warning, and it is not the same sentence as
+             * "mutations will be refused". */
+            fprintf(stderr,
+                    "smbpal-helper: could not register %s (OSStatus %d); the "
+                    "database's `default` rule applies instead, so the grant "
+                    "will be shared with other clients\n",
+                    RIGHTS[i].name, (int)st);
+            failures++;
+        }
+    }
+    CFRelease(rule);
+    AuthorizationFree(ref, kAuthorizationFlagDefaults);
+    return failures == 0 ? 0 : -1;
+}
+
+static void rights_remove(void) {
+    AuthorizationRef ref = NULL;
+    if (AuthorizationCreate(NULL, NULL, kAuthorizationFlagDefaults, &ref) !=
+        errAuthorizationSuccess) {
+        fprintf(stderr, "smbpal-helper: COULD NOT REMOVE the rights: "
+                        "no handle on the authorization database\n");
+        return;
+    }
+    for (size_t i = 0; i < RIGHTS_COUNT; i++) {
+        OSStatus st = AuthorizationRightRemove(ref, RIGHTS[i].name);
+        /* `errAuthorizationDenied` is what a right that is not there reports,
+         * so it is not an error for a teardown that is meant to be idempotent. */
+        if (st != errAuthorizationSuccess && st != errAuthorizationDenied)
+            fprintf(stderr, "smbpal-helper: COULD NOT REMOVE right %s (OSStatus %d)\n",
+                    RIGHTS[i].name, (int)st);
+    }
+    AuthorizationFree(ref, kAuthorizationFlagDefaults);
+}
+
+/* Reads an `AuthorizationExternalForm` on stdin and answers whether it carries
+ * `right`. Exit 0 is authorised and every other exit is not, because "refused",
+ * "malformed" and "expired" are the same answer to the question asked and a
+ * caller that could tell them apart would be tempted to treat one as a yes.
+ *
+ * A subcommand rather than a private function because job B's framed protocol
+ * will call this code path, and because it is how §10's first measurement gets
+ * taken: does a no-interaction verify work inside a root LaunchDaemon with no
+ * session? §8 asked that of `sysadminctl` and the answer was yes, which is not
+ * the same as knowing. */
+static int verify(const char *right) {
+    size_t known = 0;
+    for (size_t i = 0; i < RIGHTS_COUNT; i++)
+        if (strcmp(right, RIGHTS[i].name) == 0) known = 1;
+    if (!known) {
+        fprintf(stderr, "smbpal-helper: %s is not a right this helper registers\n", right);
+        return 2;
+    }
+
+    AuthorizationExternalForm form;
+    size_t got = 0;
+    while (got < sizeof form) {
+        ssize_t n = read(STDIN_FILENO, ((char *)&form) + got, sizeof form - got);
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    if (got != sizeof form) {
+        fprintf(stderr, "smbpal-helper: expected %zu bytes of external form, read %zu\n",
+                sizeof form, got);
+        return 1;
+    }
+
+    AuthorizationRef ref = NULL;
+    if (AuthorizationCreateFromExternalForm(&form, &ref) != errAuthorizationSuccess) {
+        fprintf(stderr, "smbpal-helper: refused %s: the form did not import\n", right);
+        return 1;
+    }
+    AuthorizationItem item = {right, 0, NULL, 0};
+    AuthorizationRights rights = {1, &item};
+    /* `kAuthorizationFlagExtendRights` and **no**
+     * `kAuthorizationFlagInteractionAllowed`: this is a check, not a prompt.
+     * The helper has no session to prompt in and §11 measured what happens to
+     * anything that tries -- `InteractionNotAllowed`, -60007 -- so a helper that
+     * asked would hang nothing and authorise nothing. */
+    OSStatus st = AuthorizationCopyRights(ref, &rights, NULL,
+                                          kAuthorizationFlagExtendRights, NULL);
+    AuthorizationFree(ref, kAuthorizationFlagDefaults);
+    if (st == errAuthorizationSuccess) {
+        /* A grant leaves a trace for the same reason polkit.py's does: a gate
+         * whose successes are silent cannot be told from a gate that is not
+         * running. */
+        fprintf(stderr, "smbpal-helper: allowed %s\n", right);
+        return 0;
+    }
+    fprintf(stderr, "smbpal-helper: refused %s (OSStatus %d)\n", right, (int)st);
+    return 1;
+}
+
 static int install(int dry_run, const char *daemon_path) {
     struct group *gr = getgrnam(SOCKET_GROUP);
     struct passwd *pw = getpwnam(SERVICE_USER);
@@ -457,6 +712,13 @@ static int install(int dry_run, const char *daemon_path) {
                             " did not succeed; see launchctl error\n");
     }
 
+    /* After the jobs, because a registered right with nothing to use it is
+     * inert, while a running daemon with no rights registered refuses
+     * mutations -- which is the safe order to be caught halfway through. */
+    if (rights_install() != 0)
+        fprintf(stderr, "smbpal-helper: warning: not every right was registered; "
+                        "run uninstall and install again\n");
+
     /* The uid is named because the scan may not have landed on the preference,
      * and a service account quietly sitting on 467 is a surprise somebody finds
      * out about while debugging something else. */
@@ -488,6 +750,10 @@ static int uninstall(void) {
 
     bootout(DAEMON_LABEL);
     bootout(HELPER_LABEL);
+    /* Before the plists are unlinked, so a teardown interrupted here leaves
+     * jobs that cannot authorise anything rather than rights with nothing left
+     * to check them. */
+    rights_remove();
     unlink(DAEMON_PLIST);
     unlink(HELPER_PLIST);
     unlink(HELPER_SOCK);
@@ -593,8 +859,9 @@ static void usage(const char *program) {
     fprintf(stderr,
             "usage: %s install --daemon <path to smbpald> [--dry-run]\n"
             "       %s uninstall\n"
-            "       %s serve --service-user <name> [--check]\n",
-            program, program, program);
+            "       %s serve --service-user <name> [--check]\n"
+            "       %s verify <right>   (external form on stdin)\n",
+            program, program, program, program);
 }
 
 int main(int argc, char **argv) {
@@ -648,6 +915,16 @@ int main(int argc, char **argv) {
             return 2;
         }
         return uninstall();
+    }
+    if (strcmp(argv[1], "verify") == 0) {
+        if (argc != 3) {
+            usage(argv[0]);
+            return 2;
+        }
+        /* Needs no privilege: it asks the system about a grant it was handed,
+         * and the answer does not depend on who is asking. Job B calls it as
+         * root because that is where it runs, not because it must. */
+        return verify(argv[2]);
     }
     if (strcmp(argv[1], "serve") != 0) {
         usage(argv[0]);

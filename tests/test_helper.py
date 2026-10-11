@@ -410,3 +410,120 @@ class TestTheVocabularyIsFixed(unittest.TestCase):
         code = re.sub(r"#define ID_(?:PREFERRED|MIN|MAX) \d+", "", code)
         for number in re.findall(r"\b(4[5-9]\d)\b", code):
             self.fail(f"{number} looks like a compiled-in service id")
+
+
+@unittest.skipUnless(sys.platform == "darwin", "the helper is macOS-only by design")
+class TestTheVerifyRefuses(TestTheHelperBuildsAndRefuses):
+    """§10's verify, exercised through every path that needs no privilege.
+
+    The verify is the whole authorisation scheme on macOS, so its refusals are
+    worth more than its grant: a grant needs a real prompt and an administrator
+    standing at the machine, and the refusals are reachable here.
+    """
+
+    def verify(self, right: str, form: bytes) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [str(self.binary), "verify", right], input=form, capture_output=True, timeout=10
+        )
+
+    def test_a_right_the_helper_does_not_register_is_not_asked_about(self) -> None:
+        """Exit 2, not 1: a typo and a refusal are different answers.
+
+        Asking the database about an unregistered right would get an answer --
+        the fallback `default` rule -- about something SMBPal never registered.
+        """
+        done = self.verify("app.smbpal.nope", b"x" * 32)
+        self.assertEqual(done.returncode, 2)
+        self.assertIn(b"not a right this helper registers", done.stderr)
+
+    def test_a_short_form_is_refused_rather_than_padded(self) -> None:
+        done = self.verify("app.smbpal.manage-shares", b"x")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn(b"read 1", done.stderr)
+
+    def test_a_forged_form_does_not_import(self) -> None:
+        """**Measured, 11 October 2026.** 32 zero bytes are rejected by
+        `AuthorizationCreateFromExternalForm` itself, which is the property §10
+        relies on when it says the scheme survives a replaced daemon: the
+        privileged side does not have to trust the relay, because a form the
+        relay invented does not import."""
+        done = self.verify("app.smbpal.manage-shares", bytes(32))
+        self.assertEqual(done.returncode, 1)
+        self.assertIn(b"did not import", done.stderr)
+
+
+@unittest.skipUnless(sys.platform == "darwin", "the helper is macOS-only by design")
+class TestTheRightsMatchTheClient(unittest.TestCase):
+    """The names are in two files because the two halves are in two languages.
+
+    Same necessity as the polkit action ids, which live in XML and in Python and
+    are pinned by a test that parses the policy file. This is that test for
+    macOS.
+    """
+
+    def setUp(self) -> None:
+        self.code = (HELPER_DIR / "smbpal-helper.c").read_text()
+
+    def test_the_verify_never_asks_for_interaction(self) -> None:
+        """§11 measured that a process with no Aqua session cannot prompt
+        (-60007), and the helper is such a process. A verify that passed the
+        interaction flag would be asking a question that cannot be answered.
+
+        Read with the comments stripped, because the sentence above names the
+        flag it forbids -- the third time a rule in this file would have been
+        broken by the comment stating it.
+        """
+        code = _without_comments(self.code)
+        body = code[code.index("static int verify(") :]
+        body = body[: body.index("\nstatic ") if "\nstatic " in body else len(body)]
+        self.assertIn("kAuthorizationFlagExtendRights", body)
+        self.assertNotIn("kAuthorizationFlagInteractionAllowed", body)
+
+    def test_the_helper_registers_exactly_what_the_client_prompts_for(self) -> None:
+        from smbpal.system import authorization
+
+        import re
+
+        table = self.code[self.code.index("static const struct right_rule RIGHTS[]") :]
+        table = table[: table.index("};")]
+        in_c = tuple(re.findall(r'"(app\.smbpal\.[a-z-]+)"', table))
+        self.assertEqual(in_c, authorization.RIGHTS)
+
+    def test_use_connections_is_registered_nowhere(self) -> None:
+        """It is `allow_active yes` on Linux and needs no privilege here, so
+        there is no right for it -- and a right in the system's database that no
+        component checks would read like live policy while being dead."""
+        from smbpal.system import authorization
+
+        self.assertNotIn("app.smbpal.use-connections", self.code)
+        self.assertNotIn(authorization.USE_CONNECTIONS, authorization.RIGHTS)
+        self.assertIn(authorization.USE_CONNECTIONS, authorization.UNPROMPTED)
+
+    def test_the_external_form_length_is_pinned_to_the_sdk(self) -> None:
+        """The Python constant is a number in a file; the C makes the compiler
+        check it against the struct the system defines."""
+        from smbpal.system import authorization
+
+        self.assertEqual(authorization.EXTERNAL_FORM_LENGTH, 32)
+        self.assertIn(
+            "_Static_assert(sizeof(AuthorizationExternalForm) == 32", self.code
+        )
+
+    def test_the_rule_does_not_let_root_satisfy_it(self) -> None:
+        """**The one that matters.** The process calling `AuthorizationCopyRights`
+        on the verify side is the helper, and it is root. If `allow-root` were
+        true and honoured for the verifying process, every imported form would
+        verify whatever it held and the gate would be off while looking on.
+
+        `false` can never disable the gate, and matches the `default` rule Apple
+        ships. It is not free: it costs §11's headless `sudo` route, which needs
+        `true`. That trade is deliberate and recorded -- the flip waits on spike
+        §12.3 measuring whether an imported form honours the flag.
+        """
+        rule = self.code[self.code.index("static CFDictionaryRef rule_for(") :]
+        rule = rule[: rule.index("\n}")]
+        self.assertIn('CFSTR("allow-root"), kCFBooleanFalse', rule)
+        self.assertNotIn('CFSTR("allow-root"), kCFBooleanTrue', rule)
+        # Unshared is the one field this rule changes from the fallback, so it
+        # is the one field whose loss the install has to warn about.
+        self.assertIn('CFSTR("shared"), kCFBooleanFalse', rule)

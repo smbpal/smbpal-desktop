@@ -8,13 +8,18 @@
 # reader comparing the binary to the source should not have to account for it.
 CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Werror -fstack-protector-strong -D_DARWIN_C_SOURCE
+# Security for Authorization Services (§10's rights and the verify), and
+# CoreFoundation for the dictionary a right's rule is expressed as. Linked
+# rather than dlopened: this is the component that must not be able to run with
+# its authorisation code missing.
+LDFLAGS ?= -framework Security -framework CoreFoundation
 PREFIX ?= /usr/local
 LIBEXEC = $(PREFIX)/libexec/smbpal
 
 all: smbpal-helper
 
 smbpal-helper: smbpal-helper.c
-	$(CC) $(CFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 # Root-owned storage, which is the whole point: see the spike's §0.
 install: smbpal-helper
