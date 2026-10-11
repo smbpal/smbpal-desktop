@@ -19,6 +19,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/usr/local/libexec/smbpal/smbpal-helper</string>
+    <string>serve</string>
     <string>--service-user</string>
     <string>@SERVICE_USER@</string>
   </array>

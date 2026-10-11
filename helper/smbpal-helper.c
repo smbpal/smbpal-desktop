@@ -37,13 +37,28 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #define RUNTIME_DIR "/var/run/smbpal"
 #define HELPER_SOCK RUNTIME_DIR "/helper.sock"
 #define SOCKET_GROUP "smbpal"
+#define SERVICE_USER "_smbpald"
 #define SHARING "/usr/sbin/sharing"
+#define DSCL "/usr/bin/dscl"
+#define STATE_DIR "/var/db/smbpal"
+#define CREATED_FILE STATE_DIR "/created"
+
+/* 450 is the preference and not the value. §9: 450-499 is where Apple puts role
+ * accounts -- `sysadminctl -addUser -roleAccount` requires it, measured
+ * 11 October 2026 -- which is fifty slots with no registry and any installer
+ * free to take one. A collision is not benign: two accounts sharing a uid are
+ * indistinguishable for file ownership, so files SMBPal owns would be theirs
+ * too. Hence prefer, then scan, then record what it landed on. */
+#define ID_PREFERRED 450
+#define ID_MIN 450
+#define ID_MAX 499
 
 /* A request is one line naming a verb. Bounded, because an unbounded read from
  * a socket is a denial of service with extra steps. */
@@ -144,6 +159,158 @@ static int run_captured(char *const argv[], char *out, size_t cap, size_t *len) 
     return WEXITSTATUS(status);
 }
 
+/* Like `run_captured` but for writes, where the output is noise and the effect
+ * is the result. **The exit status is checked and then not believed**: §4 found
+ * `sysadminctl` exits 0 while printing failure in at least two formats, one of
+ * them indistinguishable from chatter, and the only reliable check turned out
+ * to be reading the state back. `dscl` has not been caught doing it, which is
+ * not the same as being known not to. */
+static int run_quiet(char *const argv[]) {
+    pid_t pid = fork();
+    int status = -1;
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            close(devnull);
+        }
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) continue;
+    if (!WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+
+static int dscl_set(const char *path, const char *key, const char *value) {
+    char *const argv[] = {(char *)DSCL, ".", "-create", (char *)path,
+                          (char *)key, (char *)value, NULL};
+    return run_quiet(argv);
+}
+
+/* Prefer `ID_PREFERRED`, else the first free slot in the range. Both namespaces
+ * are checked for both kinds, because a uid and a gid that differ for the same
+ * component is a thing nobody wants to debug at two in the morning. */
+static int find_free_id(void) {
+    for (int candidate = ID_PREFERRED; candidate <= ID_MAX; candidate++) {
+        if (getpwuid((uid_t)candidate) == NULL && getgrgid((gid_t)candidate) == NULL)
+            return candidate;
+    }
+    for (int candidate = ID_MIN; candidate < ID_PREFERRED; candidate++) {
+        if (getpwuid((uid_t)candidate) == NULL && getgrgid((gid_t)candidate) == NULL)
+            return candidate;
+    }
+    return -1;
+}
+
+static void note_created(const char *kind, const char *name, int id) {
+    FILE *fh;
+    if (mkdir(STATE_DIR, 0755) != 0 && errno != EEXIST) fail("mkdir " STATE_DIR);
+    /* §10.6 removes what SMBPal created and nothing else. An account that was
+     * already there when we arrived is somebody else's, and the only way to
+     * know the difference later is to have written it down now. The numbers go
+     * in beside the names because §9 asks for them; operation resolves by name,
+     * which cannot go stale the way a cached number can. */
+    if ((fh = fopen(CREATED_FILE, "a")) == NULL) fail("open " CREATED_FILE);
+    fprintf(fh, "%s %s %d\n", kind, name, id);
+    fclose(fh);
+    chmod(CREATED_FILE, 0644);
+}
+
+static int install(int dry_run) {
+    struct group *gr = getgrnam(SOCKET_GROUP);
+    struct passwd *pw = getpwnam(SERVICE_USER);
+    int id = -1;
+    char number[16];
+
+    if (gr != NULL && pw != NULL) {
+        printf("already installed: %s uid=%u, %s gid=%u\n", SERVICE_USER,
+               (unsigned)pw->pw_uid, SOCKET_GROUP, (unsigned)gr->gr_gid);
+        return 0;
+    }
+
+    if (gr == NULL || pw == NULL) {
+        id = find_free_id();
+        if (id < 0) {
+            fprintf(stderr, "smbpal-helper: no free id in %d-%d\n", ID_MIN, ID_MAX);
+            return 1;
+        }
+    }
+    snprintf(number, sizeof number, "%d", id);
+
+    if (dry_run) {
+        /* Needs no root, so it is the one thing a person can run to see what
+         * the install would choose before being asked for a password. */
+        if (gr == NULL) printf("would create group %s gid=%d\n", SOCKET_GROUP, id);
+        else printf("group %s exists, gid=%u\n", SOCKET_GROUP, (unsigned)gr->gr_gid);
+        if (pw == NULL) printf("would create user %s uid=%d\n", SERVICE_USER, id);
+        else printf("user %s exists, uid=%u\n", SERVICE_USER, (unsigned)pw->pw_uid);
+        return 0;
+    }
+    if (geteuid() != 0) {
+        fprintf(stderr, "smbpal-helper: install must run as root\n");
+        return 1;
+    }
+
+    if (gr == NULL) {
+        if (dscl_set("/Groups/" SOCKET_GROUP, "PrimaryGroupID", number) != 0 ||
+            dscl_set("/Groups/" SOCKET_GROUP, "RealName", "SMBPal") != 0 ||
+            dscl_set("/Groups/" SOCKET_GROUP, "Password", "*") != 0) {
+            fprintf(stderr, "smbpal-helper: could not create group " SOCKET_GROUP "\n");
+            return 1;
+        }
+        /* Read it back. §4's rule: verify the effect, do not parse the tool. */
+        if ((gr = getgrnam(SOCKET_GROUP)) == NULL) {
+            fprintf(stderr, "smbpal-helper: group " SOCKET_GROUP
+                            " did not appear after creating it\n");
+            return 1;
+        }
+        note_created("group", SOCKET_GROUP, (int)gr->gr_gid);
+        printf("created group %s gid=%u\n", SOCKET_GROUP, (unsigned)gr->gr_gid);
+    }
+
+    if (pw == NULL) {
+        char gidnum[16];
+        snprintf(gidnum, sizeof gidnum, "%u", (unsigned)gr->gr_gid);
+        /* **`Password "*"` is the point of this account, not a detail.** It is a
+         * process identity: it runs `smbpald` and must never authenticate to
+         * anything. Job B's SMB account is a different account for exactly that
+         * reason -- it carries `SMB-NT` and a real password, and merging the two
+         * would turn the identity the daemon runs as into a login credential. */
+        if (dscl_set("/Users/" SERVICE_USER, "UniqueID", number) != 0 ||
+            dscl_set("/Users/" SERVICE_USER, "PrimaryGroupID", gidnum) != 0 ||
+            dscl_set("/Users/" SERVICE_USER, "RealName", "SMBPal daemon") != 0 ||
+            dscl_set("/Users/" SERVICE_USER, "NFSHomeDirectory", "/var/empty") != 0 ||
+            dscl_set("/Users/" SERVICE_USER, "UserShell", "/usr/bin/false") != 0 ||
+            dscl_set("/Users/" SERVICE_USER, "IsHidden", "1") != 0 ||
+            dscl_set("/Users/" SERVICE_USER, "Password", "*") != 0) {
+            fprintf(stderr, "smbpal-helper: could not create user " SERVICE_USER "\n");
+            return 1;
+        }
+        if ((pw = getpwnam(SERVICE_USER)) == NULL) {
+            fprintf(stderr, "smbpal-helper: user " SERVICE_USER
+                            " did not appear after creating it\n");
+            return 1;
+        }
+        note_created("user", SERVICE_USER, (int)pw->pw_uid);
+        printf("created user %s uid=%u\n", SERVICE_USER, (unsigned)pw->pw_uid);
+    }
+
+    /* Membership, so the service account can traverse the 0750 runtime
+     * directory it binds in. §4 measured that the guard transfers with no
+     * re-login, because macOS resolves membership through `membershipd`. */
+    {
+        char *const argv[] = {(char *)DSCL, ".", "-append",
+                              (char *)"/Groups/" SOCKET_GROUP,
+                              (char *)"GroupMembership", (char *)SERVICE_USER, NULL};
+        run_quiet(argv);
+    }
+    printf("installed: %s uid=%u in %s gid=%u\n", SERVICE_USER,
+           (unsigned)pw->pw_uid, SOCKET_GROUP, (unsigned)gr->gr_gid);
+    return 0;
+}
+
 /* Rule 1: the whole vocabulary, and it is one verb. Anything else is refused
  * without being echoed back -- a helper that repeats what it was asked is a
  * helper that can be used to probe it. */
@@ -195,20 +362,48 @@ static void serve_one(int conn) {
     }
 }
 
+static void usage(const char *program) {
+    fprintf(stderr,
+            "usage: %s install [--dry-run]\n"
+            "       %s serve --service-user <name> [--check]\n",
+            program, program);
+}
+
 int main(int argc, char **argv) {
     const char *service = NULL;
     struct passwd *pw;
     struct group *gr;
     int check_only = 0;
+    int dry_run = 0;
     int listener;
 
-    for (int i = 1; i < argc; i++) {
+    if (argc < 2) {
+        usage(argv[0]);
+        return 2;
+    }
+    if (strcmp(argv[1], "install") == 0) {
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--dry-run") == 0) {
+                dry_run = 1;
+            } else {
+                usage(argv[0]);
+                return 2;
+            }
+        }
+        return install(dry_run);
+    }
+    if (strcmp(argv[1], "serve") != 0) {
+        usage(argv[0]);
+        return 2;
+    }
+
+    for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--service-user") == 0 && i + 1 < argc) {
             service = argv[++i];
         } else if (strcmp(argv[i], "--check") == 0) {
             check_only = 1;
         } else {
-            fprintf(stderr, "usage: %s --service-user <name> [--check]\n", argv[0]);
+            usage(argv[0]);
             return 2;
         }
     }

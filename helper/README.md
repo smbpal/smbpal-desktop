@@ -37,16 +37,41 @@ properties of the code and the running process needs root to reach.
 | peer check | `getpeereid`, refusing any uid but the service account's — defence in depth behind the `0600`, not instead of it |
 | `share.list` | runs `sharing -l -f json`. Read-only on purpose: the first verb should have nothing to undo |
 
-## Building
+## Identities
+
+`_smbpald` and the `smbpal` group, **both preferring 450 and both scanning
+450–499 if it is taken.** Apple requires a role account's uid to be in that
+range — measured 11 October 2026, `sysadminctl -addUser -roleAccount` refuses
+without it — and fifty slots with no registry means a collision is a real
+possibility rather than a theoretical one. A collision is not benign: two
+accounts sharing a uid are indistinguishable for file ownership.
+
+**`Password "*"` is the point of the service account, not a detail.** It is a
+process identity: it runs `smbpald` and must never authenticate to anything. Job
+B's SMB account is a *different* account for exactly that reason — it carries
+`SMB-NT` and a real password, and merging them would turn the identity the
+daemon runs as into a login credential. That is also why the daemon takes 450
+and job B's account will scan past it.
+
+What the install created is written to `/var/db/smbpal/created`, because §10.6
+removes what SMBPal made and nothing else, and an account that was already there
+when we arrived is somebody else's.
+
+## Building and running
 
 ```sh
-make                      # -Wall -Wextra -Werror; macOS only
-make install PREFIX=/usr/local   # as root; lands in root-owned storage
-./smbpal-helper --service-user <name> --check
+make                                   # -Wall -Wextra -Werror; macOS only
+sudo make install PREFIX=/usr/local    # root-owned storage: the whole point
+
+./smbpal-helper install --dry-run      # what it would choose; needs no root
+sudo ./smbpal-helper install           # creates the pair, idempotent
+./smbpal-helper serve --service-user _smbpald --check
+sudo ./smbpal-helper serve --service-user _smbpald
 ```
 
-`--check` resolves the identities and touches nothing, so it **does not need
-root** — it is the one diagnostic available before elevating.
+**`--dry-run` and `--check` both need no root** — between them they answer *what
+will this do* and *is it set up*, which are the two questions somebody has before
+they are willing to type a password.
 
 ## Not here yet
 
