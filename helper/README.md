@@ -88,6 +88,25 @@ knows its own, which is why it is the documented route.
 this do* and *is it set up*, which are the two questions somebody has before
 they are willing to type a password.
 
+## Logs, and why they are in two places
+
+| | |
+|---|---|
+| `/var/log/app.smbpal.helper.log` | root-owned, written by the root component |
+| `/var/log/smbpal/daemon.log` | in a directory the install gives to the service account |
+
+**The split is deliberate.** The helper's log records refused uids, so the
+unprivileged component must not be able to edit the root component's account of
+what it refused.
+
+**And the daemon's own directory is not cosmetic.** launchd opens
+`StandardErrorPath` **as the job's user, before it execs the program**. A
+non-root job pointed at root-owned `/var/log` fails its own configuration with
+`EX_CONFIG`, the program never runs, and there is **no log to say why — because
+the log is what could not be created.** Measured on the first real start,
+11 October 2026, and it cost a diagnosis that read `last exit code = 78` against
+a binary that ran perfectly under `sudo -u`.
+
 ## Installing twice, and uninstalling
 
 **`install` refuses to run twice** and points at `uninstall`. Repairing would

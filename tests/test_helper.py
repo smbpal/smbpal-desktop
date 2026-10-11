@@ -151,7 +151,25 @@ class TestTheInstallChoosesIdentities(TestTheHelperBuildsAndRefuses):
     **Nothing here asserts 450.** It is a preference, and a machine where
     something else already holds it must still pass -- a test that hardcoded the
     number would be the very mistake §9's scan rule exists to prevent.
+
+    **These read the live directory, so they depend on machine state, and two of
+    them found that out the hard way.** On a machine where SMBPal is already
+    installed, `install` answers *already installed* before it can answer
+    *must run as root*, and the scan prints nothing to check because there is
+    nothing left to create -- which made one test fail and one pass vacuously.
+    Both now skip with a reason instead, because a test that quietly asserts
+    nothing is worse than one that says it cannot run here.
     """
+
+    def skip_if_installed(self) -> None:
+        import grp
+
+        try:
+            grp.getgrnam("smbpal")
+            pwd.getpwnam("_smbpald")
+        except KeyError:
+            return
+        self.skipTest("SMBPal is installed on this machine; needs a clean one")
 
     def test_dry_run_needs_no_root(self) -> None:
         done = self.run_helper("install", "--dry-run")
@@ -176,7 +194,9 @@ class TestTheInstallChoosesIdentities(TestTheHelperBuildsAndRefuses):
         import grp
         import re
 
+        self.skip_if_installed()
         done = self.run_helper("install", "--dry-run")
+        self.assertIn("would create", done.stdout, "nothing to check")
         for chosen in re.findall(r"would create \w+ \S+ (?:gid|uid)=(\d+)", done.stdout):
             with self.assertRaises(KeyError):
                 pwd.getpwuid(int(chosen))
@@ -210,9 +230,28 @@ class TestTheInstallChoosesIdentities(TestTheHelperBuildsAndRefuses):
         elevate and then told their arguments were wrong."""
         if __import__("os").geteuid() == 0:
             self.skipTest("this asserts the refusal, so it needs a non-root runner")
+        self.skip_if_installed()
         done = self.run_helper("install", "--daemon", "/bin/sh")
         self.assertEqual(done.returncode, 1)
         self.assertIn("must run as root", done.stderr)
+
+    def test_install_refuses_a_second_time_and_points_at_uninstall(self) -> None:
+        """The other exit-1 refusal, and the one reachable on this machine.
+
+        Both are correct and which one you get is machine state, which is why
+        the test above has to say which machine it needs.
+        """
+        import grp
+
+        try:
+            grp.getgrnam("smbpal")
+            pwd.getpwnam("_smbpald")
+        except KeyError:
+            self.skipTest("SMBPal is not installed here; nothing to refuse")
+        done = self.run_helper("install", "--daemon", "/bin/sh")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("already installed", done.stderr)
+        self.assertIn("uninstall", done.stderr)
 
     def test_uninstall_refuses_unprivileged(self) -> None:
         if __import__("os").geteuid() == 0:
@@ -259,6 +298,30 @@ class TestTheVocabularyIsFixed(unittest.TestCase):
         """
         self.assertIn('"Password", "*"', self.code)
         self.assertNotIn("SMB-NT", self.code)
+
+    def test_the_daemon_logs_somewhere_its_own_user_can_write(self) -> None:
+        """launchd opens `StandardErrorPath` as the job's user, before exec.
+
+        **This was a real failure, not a hypothetical.** The daemon's plist
+        pointed at root-owned `/var/log`, so launchd could not create the file,
+        failed the job's configuration with `EX_CONFIG` and never ran the
+        program -- leaving no log, because the log was what could not be made.
+        Measured on the first real start, 11 October 2026.
+
+        So the daemon's log lives in a directory the install gives to the
+        service account, and the **helper's** stays outside it: the helper
+        records refused uids, and the unprivileged component must not be able to
+        edit the root component's account of what it refused.
+        """
+        self.assertIn('#define LOG_DIR "/var/log/smbpal"', self.code)
+        self.assertIn('#define DAEMON_LOG LOG_DIR "/daemon.log"', self.code)
+        # The helper's log is NOT under LOG_DIR.
+        self.assertIn('#define HELPER_LOG "/var/log/" HELPER_LABEL ".log"', self.code)
+        # And the directory is chowned to the service account before the plists
+        # are written, since launchd opens the file at bootstrap.
+        log_dir = self.code.index('mkdir(LOG_DIR')
+        plists = self.code.index("write_plist(HELPER_PLIST")
+        self.assertLess(log_dir, plists)
 
     def test_no_identity_number_is_compiled_in(self) -> None:
         """§9: the install scans 450-499 and records what it landed on."""
