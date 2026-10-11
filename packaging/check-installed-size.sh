@@ -20,10 +20,32 @@ set -eu
 # The number, and the one line in this file worth arguing about.
 #
 # 425 KiB was the first build, 29 August 2026, measured with
-# `dpkg-query -W -f='${Installed-Size}'`. 700 leaves about 65% of headroom:
+# `dpkg-query -W -f='${Installed-Size}'`. 700 left about 65% of headroom:
 # loose enough that adding a screen, an icon set or another maintainer script
 # never trips it, tight enough that no bundled dependency fits underneath.
-BUDGET_KIB=700
+#
+# **Raised to 1024 on 11 October 2026, a deliberate decision recorded in the
+# plan's §3.2.** The 700 was fully consumed by honest growth: main measured
+# *exactly* 700 KiB, so the next commit to add a line of anything failed CI,
+# and the one that did was 51 lines of docstring. 85% of the package is our own
+# Python source -- 593 KiB of it -- and nothing unintended ships: the install
+# list is six files plus `smbpal/`. So the ceiling moved rather than the code.
+#
+# **What the new number still catches**, which is the only test that matters
+# here: a vendored PyGObject or GTK, tens of megabytes, instantly; `tests/`,
+# which is 472 KiB of source against 321 KiB of headroom; a shipped
+# `__pycache__`, which for 593 KiB of source is a few hundred KiB.
+#
+# **What it no longer catches, and what that means.** The icons shipped twice is
+# about 50 KiB, and no fixed ceiling can resolve that any more: the package grew
+# 425 -> 700 KiB in six weeks, about 46 KiB a week, so any headroom small enough
+# to catch a 50 KiB mistake is gone within days of being set. **A budget on
+# weight stopped being able to separate vendoring from honest growth once our
+# own source became the dominant term.** The answer is to assert *what* ships
+# rather than how much -- the six installed paths plus `smbpal/**.py` and
+# nothing else -- which is immune to growth and catches the small mistakes by
+# name. Recorded as a candidate in the plan's §12.2; this file is the stopgap.
+BUDGET_KIB=1024
 
 deb=${1:-}
 if [ -z "$deb" ]; then
