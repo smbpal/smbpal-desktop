@@ -257,7 +257,8 @@ static void note_created(const char *kind, const char *name, int id) {
  * this function would be two, and the one that drifts is always the one nobody
  * runs. */
 static int write_plist(const char *path, const char *label, const char *const args[],
-                       const char *user, const char *stderr_path) {
+                       const char *user, const char *stderr_path,
+                       int retry_on_failure) {
     FILE *fh = fopen(path, "w");
     if (fh == NULL) return -1;
     fprintf(fh, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
@@ -271,11 +272,19 @@ static int write_plist(const char *path, const char *label, const char *const ar
     fprintf(fh, "  <key>ProgramArguments</key>\n  <array>\n");
     for (int i = 0; args[i] != NULL; i++)
         fprintf(fh, "    <string>%s</string>\n", args[i]);
-    /* No KeepAlive. A component that respawns after refusing something hides
-     * the refusal, and launchd's own log is the record. */
     fprintf(fh, "  </array>\n"
-                "  <key>RunAtLoad</key><true/>\n"
-                "  <key>StandardErrorPath</key><string>%s</string>\n"
+                "  <key>RunAtLoad</key><true/>\n");
+    /* `SuccessfulExit false` and not a bare KeepAlive: a component that
+     * respawns after refusing something hides the refusal, and launchd's own
+     * log is the record. Retrying only a *failed* exit keeps that property and
+     * buys one thing the daemon cannot do without -- see the boot race at
+     * `ensure_runtime_dir`'s install-time call. A clean shutdown is still
+     * final. */
+    if (retry_on_failure)
+        fprintf(fh, "  <key>KeepAlive</key>\n"
+                    "  <dict><key>SuccessfulExit</key><false/></dict>\n"
+                    "  <key>ThrottleInterval</key><integer>10</integer>\n");
+    fprintf(fh, "  <key>StandardErrorPath</key><string>%s</string>\n"
                 "</dict>\n</plist>\n", stderr_path);
     if (fclose(fh) != 0) return -1;
     if (chown(path, 0, 0) != 0) return -1;
@@ -399,11 +408,23 @@ static int install(int dry_run, const char *daemon_path) {
     if (chmod(CONFIG_DIR, 0750) != 0) fail("chmod " CONFIG_DIR);
 
     /* Created here as well as in `serve`, because launchd gives no ordering
-     * between two jobs and the daemon cannot make this directory itself. If the
-     * daemon won the race it would fail to bind and, having no KeepAlive, stay
-     * down. **This closes the install-time race and not the boot-time one**:
-     * whether `/var/run` survives a reboot on macOS has not been measured, and
-     * if it does not then the ordering question is real and open. */
+     * between two jobs and the daemon cannot make this directory itself: as the
+     * service account, `mkdir` under `/var/run` (root:daemon) is EPERM.
+     *
+     * **The boot-time race is real, measured.** `/var/run` does not survive a
+     * reboot on macOS: after one, `/var/run/smbpal` had a birth time of
+     * 19:34:32 against a `kern.boottime` of 19:34:26, so it was created six
+     * seconds into the boot and not carried over. The helper happened to win by
+     * about two seconds, and nothing made it win. So this call closes the
+     * install-time race, and the boot-time one is closed by the daemon's
+     * `KeepAlive`/`SuccessfulExit false` in `write_plist`: a daemon that loses
+     * exits non-zero on the failed bind and launchd brings it back, by which
+     * time the directory exists.
+     *
+     * Socket activation would remove the race rather than retry it -- launchd
+     * would own the socket and the directory would not need to exist when the
+     * daemon starts -- but it needs `launch_activate_socket` and a daemon that
+     * accepts an inherited fd, so it is the later answer, not this one. */
     ensure_runtime_dir(pw->pw_uid, gr->gr_gid);
 
     /* Before the plists, because launchd will try to open the file the moment
@@ -422,10 +443,11 @@ static int install(int dry_run, const char *daemon_path) {
          * because it will be. */
         const char *daemon_args[] = {daemon_path, "--socket",
                                      RUNTIME_DIR "/smbpald.sock", NULL};
-        if (write_plist(HELPER_PLIST, HELPER_LABEL, helper_args, NULL, HELPER_LOG) != 0)
+        if (write_plist(HELPER_PLIST, HELPER_LABEL, helper_args, NULL, HELPER_LOG,
+                        0) != 0)
             fail("write " HELPER_PLIST);
         if (write_plist(DAEMON_PLIST, DAEMON_LABEL, daemon_args, SERVICE_USER,
-                        DAEMON_LOG) != 0)
+                        DAEMON_LOG, 1) != 0)
             fail("write " DAEMON_PLIST);
         if (bootstrap(HELPER_PLIST) != 0)
             fprintf(stderr, "smbpal-helper: warning: bootstrap of " HELPER_LABEL
