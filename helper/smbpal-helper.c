@@ -860,8 +860,9 @@ static void usage(const char *program) {
             "usage: %s install --daemon <path to smbpald> [--dry-run]\n"
             "       %s uninstall\n"
             "       %s serve --service-user <name> [--check]\n"
+            "       %s rights install|remove\n"
             "       %s verify <right>   (external form on stdin)\n",
-            program, program, program, program);
+            program, program, program, program, program);
 }
 
 int main(int argc, char **argv) {
@@ -915,6 +916,39 @@ int main(int argc, char **argv) {
             return 2;
         }
         return uninstall();
+    }
+    if (strcmp(argv[1], "rights") == 0) {
+        /* **The rights are repairable on their own, and the install is not.**
+         * `install` refuses to run twice rather than guess which half to
+         * repair, which is right for accounts and jobs -- they are the half
+         * with state to get wrong. The rights have none: `AuthorizationRightSet`
+         * overwrites, and a removal is idempotent.
+         *
+         * The hole this fills was found by measuring §12.4. Removing a right to
+         * learn whether its `cdhash` requirement was enforced left the install
+         * half-registered, and the only way back was tearing down the service
+         * account and the launchd jobs to rebuild something that was never
+         * broken. A root component should be able to repair the part that is
+         * cheap to repair. */
+        if (argc != 3) {
+            usage(argv[0]);
+            return 2;
+        }
+        /* The verb before the privilege check, so a typo is answered with the
+         * usage and not with "must run as root" -- which would be a refusal
+         * naming a problem the caller does not have. */
+        int installing = strcmp(argv[2], "install") == 0;
+        if (!installing && strcmp(argv[2], "remove") != 0) {
+            usage(argv[0]);
+            return 2;
+        }
+        if (geteuid() != 0) {
+            fprintf(stderr, "smbpal-helper: rights must run as root\n");
+            return 1;
+        }
+        if (installing) return rights_install() == 0 ? 0 : 1;
+        rights_remove();
+        return 0;
     }
     if (strcmp(argv[1], "verify") == 0) {
         if (argc != 3) {

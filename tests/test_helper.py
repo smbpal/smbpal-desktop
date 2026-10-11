@@ -453,6 +453,46 @@ class TestTheVerifyRefuses(TestTheHelperBuildsAndRefuses):
 
 
 @unittest.skipUnless(sys.platform == "darwin", "the helper is macOS-only by design")
+class TestTheRightsAreRepairableAlone(TestTheHelperBuildsAndRefuses):
+    """`install` refuses to run twice; the rights have to be repairable anyway.
+
+    **The hole was found by measuring §12.4.** Removing a right to learn whether
+    its `cdhash` requirement was enforced left the install half-registered, and
+    the only way back was tearing down the service account and the launchd jobs
+    to rebuild something that was never broken.
+
+    The asymmetry is justified: accounts and jobs are the half with state to get
+    wrong, and `install` is right to refuse to guess which of them to repair.
+    `AuthorizationRightSet` overwrites and a removal is idempotent, so the rights
+    have no such state.
+    """
+
+    def test_it_refuses_unprivileged(self) -> None:
+        done = self.run_helper("rights", "install")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("must run as root", done.stderr)
+
+    def test_an_unknown_verb_is_answered_with_the_usage(self) -> None:
+        """Not "must run as root", which would name a problem the caller does
+        not have. The verb is checked before the privilege for that reason."""
+        done = self.run_helper("rights", "sideways")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("usage", done.stderr)
+        self.assertNotIn("must run as root", done.stderr)
+
+    def test_it_takes_exactly_one_verb(self) -> None:
+        for args in (("rights",), ("rights", "install", "remove")):
+            with self.subTest(args=args):
+                done = self.run_helper(*args)
+                self.assertEqual(done.returncode, 2)
+                self.assertIn("usage", done.stderr)
+
+    def test_the_usage_names_it(self) -> None:
+        done = self.run_helper()
+        self.assertIn("rights install|remove", done.stderr)
+
+
+@unittest.skipUnless(sys.platform == "darwin", "the helper is macOS-only by design")
 class TestTheRightsMatchTheClient(unittest.TestCase):
     """The names are in two files because the two halves are in two languages.
 
