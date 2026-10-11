@@ -177,13 +177,17 @@ class Authoriser:
 
     def policy_note(self) -> str:
         if self.policy == "helper":
-            there = self.checker.available() if hasattr(self.checker, "available") else False
-            if not there:
+            if not getattr(self.checker, "available", lambda: False)():
                 return (
                     "authorisation: the privileged helper, which is NOT RUNNING — "
                     "every mutation will be refused. Run `smbpal setup`"
                 )
-            return "authorisation: the privileged helper, via " + self.checker.path
+            # `getattr` for the path too, not just for `available`: guarding one
+            # and not the other is the inconsistency that makes a startup note
+            # crash a daemon that would otherwise have run.
+            return "authorisation: the privileged helper, via " + getattr(
+                self.checker, "path", "an unnamed socket"
+            )
         if self.policy == "polkit":
             where = self.checker.executable() if hasattr(self.checker, "executable") else None
             found = where or "NOT FOUND — every mutation will be refused"
@@ -240,7 +244,7 @@ class Authoriser:
                 raise NeedsAuthorisation(
                     f"{method} needs authorisation on macOS", right=right
                 )
-            if self.checker.check(right, auth):
+            if self.checker.check_grant(right, auth):
                 audit.info("the helper allowed %s for %s", right, peer.describe())
                 return
             raise self._refusal(peer, method, action=right)

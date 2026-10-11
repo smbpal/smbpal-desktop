@@ -73,22 +73,22 @@ class Helper:
             return False
 
     def _frame(self, verb: str, auth: bytes | None, args: tuple[str, ...]) -> bytes:
-        lines = [f"VERB {verb}"]
-        if auth is not None:
-            lines.append(f"AUTH {auth.hex()}")
-        lines.extend(f"ARG {arg}" for arg in args)
-        lines.append("END")
-        frame = ("\n".join(lines) + "\n").encode()
-        # The helper rejects these too, and that is the point -- it does not
-        # trust this side. Checking here as well turns a refusal that reads as
-        # "the helper said no" into a message that names the actual mistake.
+        # Before building it, not after. The helper rejects these too, and that
+        # is the point -- it does not trust this side. Checking here as well
+        # turns a refusal that reads as "the helper said no" into a message that
+        # names the actual mistake.
         for arg in (verb, *args):
             if "\n" in arg or "\r" in arg:
                 raise HelperError(
                     f"{verb} was given an argument containing a newline",
                     detail="it would end the line and be read as a truncated frame",
                 )
-        return frame
+        lines = [f"VERB {verb}"]
+        if auth is not None:
+            lines.append(f"AUTH {auth.hex()}")
+        lines.extend(f"ARG {arg}" for arg in args)
+        lines.append("END")
+        return ("\n".join(lines) + "\n").encode()
 
     def call(
         self, verb: str, *args: str, auth: bytes | None = None
@@ -118,6 +118,17 @@ class Helper:
                 "the privileged helper is not running",
                 detail=f"no socket at {self.path}; run `smbpal setup`",
             ) from exc
+        except PermissionError as exc:
+            # The first error a person hits, measured by hitting it: the socket
+            # is `0600` and owned by the service account, so only the daemon may
+            # ask. Worth a sentence rather than a bare EACCES.
+            raise HelperError(
+                "only the daemon may talk to the privileged helper",
+                detail=(
+                    f"{self.path} is 0600 and owned by the service account; "
+                    "even root is refused, by the peer check behind the mode"
+                ),
+            ) from exc
         except socket.timeout as exc:
             raise HelperError(
                 f"the helper did not answer {verb} within {self.timeout}s"
@@ -140,8 +151,18 @@ class Helper:
             detail=f"{answer[:40]!r}",
         )
 
-    def check(self, right: str, auth: bytes) -> bool:
-        """Whether `auth` carries `right`. Any failure is `False`."""
+    def check_grant(self, right: str, auth: bytes) -> bool:
+        """Whether `auth` carries `right`. Any failure is `False`.
+
+        **Not called `check`, which is what it was first.** `Polkit.check`
+        takes `(peer, action)` and answers the same question from an identity,
+        and `Authoriser` reaches both through one `self.checker`. Two
+        incompatible contracts behind one name is a trap for whoever wires up a
+        checker next: a mismatch would pass a right where a peer was expected
+        and only be caught by whatever attribute the wrong object lacked.
+        Different names make the mismatch an obvious `AttributeError` at the
+        call rather than a puzzle.
+        """
         try:
             self.call("auth.check", right, auth=auth)
         except HelperError as exc:

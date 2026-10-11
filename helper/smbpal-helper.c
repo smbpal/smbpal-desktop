@@ -34,6 +34,7 @@
 
 #include <errno.h>
 #include <grp.h>
+#include <signal.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -97,6 +98,12 @@
  * The prefix is the fix and also the honest name -- this bounds one argument of
  * ours, not the system's exec limit. */
 #define REQUEST_ARG_MAX 256
+/* Nothing at the far end waits for a person -- §11 measured that the helper
+ * cannot prompt even if it wanted to -- so a peer that has not finished a
+ * request in this long is not thinking about it. Comfortably longer than
+ * `system/helper.py`'s own timeout, so the client gives up first and the
+ * helper's limit is the backstop rather than the thing normally hit. */
+#define PEER_TIMEOUT_SECONDS 30
 /* `sharing -l -f json` on a machine with a plausible number of shares. The read
  * loop stops at the limit rather than growing, so a surprising amount of output
  * truncates instead of becoming an allocation this file has to reason about. */
@@ -1213,6 +1220,21 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* **Without this a client that hangs up mid-response kills the helper.**
+     * `write` to a peer that has closed raises SIGPIPE, whose default action is
+     * to terminate -- and this component deliberately has no `KeepAlive`, so it
+     * would stay down for the rest of the boot and nothing could be authorised
+     * until a reboot.
+     *
+     * Not a theoretical client either: `system/helper.py` has a read timeout
+     * and closes the socket when it expires, so a slow `sharing -l -f json`
+     * would have killed the authorisation gate by accident rather than by
+     * attack. Job A was never exposed to it because job A had no client.
+     *
+     * Every `write` here already checks its return, so ignoring the signal
+     * turns a fatal signal into the `EPIPE` the loops were written for. */
+    signal(SIGPIPE, SIG_IGN);
+
     ensure_runtime_dir(pw->pw_uid, gr->gr_gid);
     listener = listen_on_socket();
     fprintf(stderr, "smbpal-helper: listening on %s for uid %u\n", HELPER_SOCK,
@@ -1224,6 +1246,17 @@ int main(int argc, char **argv) {
             if (errno == EINTR) continue;
             fail("accept");
         }
+        /* **One conversation at a time, so one client must not be able to
+         * stop the clock.** A peer that connects and sends nothing, or trickles
+         * bytes, would otherwise block the only accept loop for ever and the
+         * helper would serve nobody -- availability rather than escalation, but
+         * the thing it stops being available for is authorisation.
+         *
+         * Set on the accepted socket rather than the listener, because these
+         * are not reliably inherited. */
+        struct timeval limit = {.tv_sec = PEER_TIMEOUT_SECONDS, .tv_usec = 0};
+        setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &limit, sizeof limit);
+        setsockopt(conn, SOL_SOCKET, SO_SNDTIMEO, &limit, sizeof limit);
         serve_one(conn);
         shutdown(conn, SHUT_WR);
         close(conn);

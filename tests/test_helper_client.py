@@ -74,7 +74,7 @@ class TestTheWireFormat(HelperClientCase):
 
     def test_a_grant_travels_as_hex_in_its_own_line(self) -> None:
         client, server = self.helper(b"OK\n")
-        self.assertTrue(client.check("app.smbpal.manage-shares", bytes(range(32))))
+        self.assertTrue(client.check_grant("app.smbpal.manage-shares", bytes(range(32))))
         self.assertEqual(
             server.seen,
             b"VERB auth.check\n"
@@ -102,7 +102,7 @@ class TestEveryRefusal(HelperClientCase):
         for answer in (b"ERR denied\n", b"ERR frame\n", b"", b"nonsense\n"):
             with self.subTest(answer=answer):
                 client, _ = self.helper(answer)
-                self.assertFalse(client.check("app.smbpal.manage-shares", bytes(32)))
+                self.assertFalse(client.check_grant("app.smbpal.manage-shares", bytes(32)))
 
     def test_a_missing_socket_says_what_to_run(self) -> None:
         client = Helper(path="/var/run/smbpal/does-not-exist.sock")

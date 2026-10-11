@@ -453,6 +453,51 @@ class TestTheVerifyRefuses(TestTheHelperBuildsAndRefuses):
 
 
 @unittest.skipUnless(sys.platform == "darwin", "the helper is macOS-only by design")
+class TestOneClientCannotTakeTheHelperDown(unittest.TestCase):
+    """Two ways a peer could stop the gate working, found reviewing job B.
+
+    Both are about the helper being **one accept loop with no `KeepAlive`**: it
+    serves one conversation at a time, and if it dies it stays dead for the rest
+    of the boot. Neither is an escalation; what they make unavailable is
+    authorisation, which is worse than it sounds -- a gate that is down refuses
+    everything, and the person whose share will not save has no idea why.
+
+    Asserted against the source because the running socket needs root, which is
+    this file's standing position on the bind.
+    """
+
+    def setUp(self) -> None:
+        self.code = _without_comments(
+            (HELPER_DIR / "smbpal-helper.c").read_text(encoding="utf-8")
+        )
+
+    def test_sigpipe_cannot_kill_it(self) -> None:
+        """**This was reachable, not theoretical.** `write` to a peer that has
+        closed raises SIGPIPE, which terminates by default. `system/helper.py`
+        has a read timeout and closes the socket when it expires, so a slow
+        `sharing -l -f json` would have killed the root authorisation component
+        by accident. Job A was never exposed because job A had no client.
+        """
+        self.assertIn("signal(SIGPIPE, SIG_IGN)", self.code)
+
+    def test_a_peer_that_says_nothing_is_bounded(self) -> None:
+        """Otherwise a connect with no `END` blocks the only loop for ever."""
+        self.assertIn("SO_RCVTIMEO", self.code)
+        self.assertIn("SO_SNDTIMEO", self.code)
+        self.assertIn("PEER_TIMEOUT_SECONDS", self.code)
+
+    def test_every_socket_write_checks_its_return(self) -> None:
+        """Ignoring SIGPIPE turns a fatal signal into `EPIPE`, which is only an
+        improvement if the writes look at what they got back."""
+        for function in ("static void respond(", "static void serve_one("):
+            body = self.code[self.code.index(function) :]
+            body = body[: body.index("\nstatic ")]
+            with self.subTest(function=function):
+                self.assertIn("write(", body)
+                self.assertIn("w <= 0", body)
+
+
+@unittest.skipUnless(sys.platform == "darwin", "the helper is macOS-only by design")
 class TestTheFrameParser(unittest.TestCase):
     """`helper/parse-test.c`, run as part of this suite.
 

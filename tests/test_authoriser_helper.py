@@ -31,7 +31,7 @@ class Recorder:
     def available(self) -> bool:
         return self.there
 
-    def check(self, right: str, auth: bytes) -> bool:
+    def check_grant(self, right: str, auth: bytes) -> bool:
         self.asked.append((right, auth))
         return self.answer
 
