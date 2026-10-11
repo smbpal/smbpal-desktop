@@ -282,6 +282,21 @@ class TestTheVocabularyIsFixed(unittest.TestCase):
         self.source = (HELPER_DIR / "smbpal-helper.c").read_text(encoding="utf-8")
         self.code = _without_comments(self.source)
 
+    def function(self, signature: str) -> str:
+        """One function's body, bounded at the next top-level definition.
+
+        **Slicing to end-of-file was a bug in these tests, twice.** A rule about
+        what `uninstall` must not call matched `main`, which calls it correctly
+        for a different purpose -- so the assertion failed on code that was
+        right. A scope-free text search cannot express a scoped rule.
+        """
+        import re
+
+        start = self.code.index(signature)
+        rest = self.code[start + len(signature):]
+        end = re.search(r"\n(?=(?:static\s|int main\())", rest)
+        return self.code[start : start + len(signature) + (end.start() if end else len(rest))]
+
     def test_there_is_no_shell(self) -> None:
         for forbidden in ("system(", "popen(", "execvp(", "execlp(", "/bin/sh"):
             self.assertNotIn(forbidden, self.code, f"{forbidden} is rule 3")
@@ -298,6 +313,40 @@ class TestTheVocabularyIsFixed(unittest.TestCase):
         """
         self.assertIn('"Password", "*"', self.code)
         self.assertNotIn("SMB-NT", self.code)
+
+    def test_the_runtime_directory_is_owned_by_the_user_that_binds_in_it(self) -> None:
+        """Creating a socket needs **write** on the directory, not just execute.
+
+        §9 specified `root:smbpal 0750`, copied from Linux where the daemon is
+        root and the bit is irrelevant. On macOS the daemon binds as the service
+        account and group `smbpal` has `r-x`, so it failed with
+        `cannot bind /var/run/smbpal/smbpald.sock: [Errno 13] Permission
+        denied`. Owner must be the service account.
+        """
+        self.assertIn("ensure_runtime_dir(uid_t uid, gid_t gid)", self.code)
+        self.assertIn("chown(RUNTIME_DIR, uid, gid)", self.code)
+        self.assertNotIn("chown(RUNTIME_DIR, 0,", self.code)
+
+    def test_the_install_creates_the_runtime_directory_too(self) -> None:
+        """launchd gives no ordering between two jobs, and the daemon cannot
+        make this directory itself -- if it won the race it would fail to bind
+        and, having no KeepAlive, stay down."""
+        self.assertIn("ensure_runtime_dir(", self.function("static int install("))
+
+    def test_a_delete_is_verified_through_the_tool_that_wrote_it(self) -> None:
+        """`getgrnam` answers from opendirectoryd's cache.
+
+        It reported the group one instruction after `dscl` had deleted it, so
+        uninstall said `COULD NOT REMOVE` about something that was gone --
+        measured 11 October 2026. §4's rule needs the sharper form: verify the
+        effect *through the interface that made it*.
+        """
+        body = self.function("static int uninstall(")
+        self.assertIn('"-read"', body)
+        # Not anywhere in the file: `main` resolves identities with these to
+        # serve, which is correct. Only the delete must not trust the cache.
+        self.assertNotIn("getgrnam", body)
+        self.assertNotIn("getpwnam", body)
 
     def test_the_daemon_logs_somewhere_its_own_user_can_write(self) -> None:
         """launchd opens `StandardErrorPath` as the job's user, before exec.
