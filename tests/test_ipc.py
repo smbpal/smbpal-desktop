@@ -736,3 +736,61 @@ class TestWhyTheSocketRefusedUs(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestADirectoryThatIsAlreadyCorrect(unittest.TestCase):
+    """The daemon must not try to change what is already right.
+
+    **This is the macOS case, and it was a real blocker.** There the daemon runs
+    as a service account and the compiled helper creates the runtime directory
+    for it, so an unconditional `chown` fails -- changing a directory's group
+    needs root or ownership, and the daemon has neither. The spike's §9 claimed
+    *nothing in `ipc/server.py` asserts the uid is 0*, which was true of the
+    assertions and false of the behaviour.
+
+    On Linux nothing changes: the package creates the directory with the group
+    already set, so the check passes there too and the `chown` it skips was a
+    no-op anyway.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.directory = Path(self.tmp.name) / "run"
+        self.directory.mkdir(mode=0o750)
+
+    def transport(self) -> UnixSocketTransport:
+        return UnixSocketTransport(self.directory / "smbpald.sock", group="smbpal")
+
+    def test_a_matching_directory_is_left_alone(self) -> None:
+        """No `chown` attempted, so no permission error to handle."""
+        gid = self.directory.stat().st_gid
+        os.chmod(self.directory, 0o750)
+        with mock.patch.object(os, "chown") as chown:
+            self.transport()._apply_directory_ownership(gid)
+        chown.assert_not_called()
+
+    def test_a_mismatched_directory_is_still_changed(self) -> None:
+        os.chmod(self.directory, 0o700)
+        gid = self.directory.stat().st_gid
+        with mock.patch.object(os, "chown") as chown, mock.patch.object(os, "chmod"):
+            self.transport()._apply_directory_ownership(gid)
+        chown.assert_called_once()
+
+    def test_the_refusal_names_the_numbers_instead_of_asserting_root(self) -> None:
+        """The message this replaces said *the daemon is a root service*.
+
+        That is no longer true on macOS, and a message that states a false
+        premise sends the reader to fix the wrong thing -- D14's whole subject.
+        """
+        os.chmod(self.directory, 0o700)
+        gid = self.directory.stat().st_gid + 1
+        with (
+            mock.patch.object(os, "chown", side_effect=PermissionError),
+            self.assertRaises(OSError) as raised,
+        ):
+            self.transport()._apply_directory_ownership(gid)
+        message = str(raised.exception)
+        self.assertNotIn("root service", message)
+        self.assertIn("0750", message)
+        self.assertIn("smbpal setup", message)
