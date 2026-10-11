@@ -151,7 +151,25 @@ class TestTheInstallChoosesIdentities(TestTheHelperBuildsAndRefuses):
     **Nothing here asserts 450.** It is a preference, and a machine where
     something else already holds it must still pass -- a test that hardcoded the
     number would be the very mistake §9's scan rule exists to prevent.
+
+    **These read the live directory, so they depend on machine state, and two of
+    them found that out the hard way.** On a machine where SMBPal is already
+    installed, `install` answers *already installed* before it can answer
+    *must run as root*, and the scan prints nothing to check because there is
+    nothing left to create -- which made one test fail and one pass vacuously.
+    Both now skip with a reason instead, because a test that quietly asserts
+    nothing is worse than one that says it cannot run here.
     """
+
+    def skip_if_installed(self) -> None:
+        import grp
+
+        try:
+            grp.getgrnam("smbpal")
+            pwd.getpwnam("_smbpald")
+        except KeyError:
+            return
+        self.skipTest("SMBPal is installed on this machine; needs a clean one")
 
     def test_dry_run_needs_no_root(self) -> None:
         done = self.run_helper("install", "--dry-run")
@@ -176,7 +194,9 @@ class TestTheInstallChoosesIdentities(TestTheHelperBuildsAndRefuses):
         import grp
         import re
 
+        self.skip_if_installed()
         done = self.run_helper("install", "--dry-run")
+        self.assertIn("would create", done.stdout, "nothing to check")
         for chosen in re.findall(r"would create \w+ \S+ (?:gid|uid)=(\d+)", done.stdout):
             with self.assertRaises(KeyError):
                 pwd.getpwuid(int(chosen))
@@ -210,9 +230,28 @@ class TestTheInstallChoosesIdentities(TestTheHelperBuildsAndRefuses):
         elevate and then told their arguments were wrong."""
         if __import__("os").geteuid() == 0:
             self.skipTest("this asserts the refusal, so it needs a non-root runner")
+        self.skip_if_installed()
         done = self.run_helper("install", "--daemon", "/bin/sh")
         self.assertEqual(done.returncode, 1)
         self.assertIn("must run as root", done.stderr)
+
+    def test_install_refuses_a_second_time_and_points_at_uninstall(self) -> None:
+        """The other exit-1 refusal, and the one reachable on this machine.
+
+        Both are correct and which one you get is machine state, which is why
+        the test above has to say which machine it needs.
+        """
+        import grp
+
+        try:
+            grp.getgrnam("smbpal")
+            pwd.getpwnam("_smbpald")
+        except KeyError:
+            self.skipTest("SMBPal is not installed here; nothing to refuse")
+        done = self.run_helper("install", "--daemon", "/bin/sh")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("already installed", done.stderr)
+        self.assertIn("uninstall", done.stderr)
 
     def test_uninstall_refuses_unprivileged(self) -> None:
         if __import__("os").geteuid() == 0:
