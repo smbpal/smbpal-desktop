@@ -10,7 +10,7 @@
 # no second removal step.
 
 Name:           smbpal
-Version:        0.2.10
+Version:        0.2.11
 Release:        1%{?dist}
 Summary:        Share folders over SMB, and connect to shares on other machines
 
@@ -261,6 +261,16 @@ fi
 %{_datadir}/icons/hicolor/scalable/status/smbpal-attention.svg
 
 %changelog
+* Sun Oct 11 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.11-1
+- macOS: sharing a folder says it is not supported yet, rather than failing
+  with a permission error about /etc/samba -- a path macOS has never had,
+  naming a program it does not ship. It said that after asking for an
+  administrator password, too, which it no longer does.
+- Corrects 0.2.10's note. That release said a share "can be defined" on macOS
+  with only serving missing. There is no such state: the daemon saves and
+  applies as one step on purpose, so a share is either served or not recorded.
+  Sharing folders on macOS does not work yet at all. Connecting to shares
+  other machines serve does, fully.
 * Sun Oct 11 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.10-1
 - macOS: SMBPal can ask for permission instead of refusing everything. The
   daemon was asking polkit, which macOS does not have, so every change to a

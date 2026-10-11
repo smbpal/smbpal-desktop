@@ -1,3 +1,22 @@
+smbpal (0.2.11) trixie; urgency=medium
+
+  * On macOS, trying to share a folder says so plainly instead of failing
+    into Samba. It ended in `cannot write /etc/samba/smbpal.conf: Permission
+    denied` — a path macOS has never had, naming a program it does not ship,
+    suggesting a permission that would not have helped. And it got there
+    *after* asking for an administrator password, which is the worst place to
+    find out. It now answers before asking for anything, and says which half
+    does work.
+  * **A correction to 0.2.10.** That release's notes said a share "can be
+    defined" on macOS and that only serving was missing. There is no such
+    state, by design: SMBPal saves and applies as one step, because a saved
+    share it has not applied would be a lie about what the machine is doing.
+    So a share is either served or not recorded, and sharing folders on macOS
+    does not work yet at all. Connecting to shares other machines serve does,
+    and it works fully. Nothing on Linux was affected either way.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Sun, 11 Oct 2026 23:00:00 +0100
+
 smbpal (0.2.10) trixie; urgency=medium
 
   * On macOS, SMBPal can ask for permission, so it no longer refuses
