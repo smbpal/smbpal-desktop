@@ -1042,9 +1042,11 @@ class TestSetupSaysWhatIsLeftToDoByHand(unittest.TestCase):
 
 class TestTheHelperInstallLine(unittest.TestCase):
     def test_setup_installs_the_helper_onto_a_new_inode(self) -> None:
-        """Without `-S` an upgrade wrote over the running helper's inode and the
-        kernel killed the new one at launch (OS_REASON_CODESIGNING), leaving
-        every grant check failing. 12 October 2026."""
+        """`-S` renames a temporary file into place, so the root binary is never
+        half-written. It was first added believing it stopped a replaced
+        helper being killed at launch; that was a launch constraint, cleared by
+        bootstrapping the job again (helper spike §16). `-S` stays on its own
+        merits."""
         import inspect
 
         from smbpal.cli import main

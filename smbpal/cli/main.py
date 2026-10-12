@@ -1123,11 +1123,12 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     print("third, which by then is a root-owned file:")
     print()
     print(f"  sudo install -d -o root -g wheel -m 755 {HELPER_INSTALLED.parent}")
-    # `-S`: write a temporary file and rename it, so an upgrade gets a new
-    # inode. Measured 12 October 2026: installing over the running helper
-    # without it left a binary that was valid on disk and was killed at launch
-    # with OS_REASON_CODESIGNING -- the kernel's cached signature for the old
-    # inode -- so the helper stayed down and every grant check failed.
+    # `-S`: write a temporary file and rename it, so a root-owned binary is
+    # never half-written. **Not** what keeps a replaced helper running, which
+    # an earlier comment here claimed: a new build is killed at launch with
+    # OS_REASON_CODESIGNING | Launch Constraint Violation until its launchd job
+    # is bootstrapped again (helper spike §16, corrected 12 October 2026). The
+    # third command below bootstraps, so this front door is not affected.
     print(f"  sudo install -S -o root -g wheel -m 755 {source} {HELPER_INSTALLED}")
     print(f"  sudo {HELPER_INSTALLED} install --daemon {smbpald}")
     print()

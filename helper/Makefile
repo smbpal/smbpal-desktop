@@ -22,12 +22,21 @@ smbpal-helper: smbpal-helper.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 # Root-owned storage, which is the whole point: see the spike's §0. `-S` renames
-# a temporary file into place so an upgrade gets a new inode; writing over the
-# old one got the new helper killed at launch with OS_REASON_CODESIGNING
-# (12 October 2026).
+# a temporary file into place, so the root binary is never half-written.
+#
+# **A replaced helper must be bootstrapped again, or it is killed at launch.**
+# launchd attaches a launch constraint to the job's plist that the build it was
+# registered with satisfies; a new build fails it -- OS_REASON_CODESIGNING |
+# Launch Constraint Violation -- and the helper stays down behind its old
+# socket. Measured 12 October 2026, twice; `bootout` then `bootstrap` cleared it
+# (helper spike §16). So when a job is installed, this target re-registers it.
 install: smbpal-helper
 	install -d -o root -g wheel -m 755 $(LIBEXEC)
 	install -S -o root -g wheel -m 755 smbpal-helper $(LIBEXEC)/smbpal-helper
+	if [ -f /Library/LaunchDaemons/app.smbpal.helper.plist ]; then \
+	    launchctl bootout system/app.smbpal.helper 2>/dev/null || true; \
+	    launchctl bootstrap system /Library/LaunchDaemons/app.smbpal.helper.plist; \
+	fi
 
 # `-Dmain=` renames the helper's entry point so the test can have its own,
 # which is how the parser is tested without the shipped file knowing about it.

@@ -113,6 +113,18 @@ sudo install -S -o root -g wheel -m 755 <built helper> /usr/local/libexec/smbpal
 sudo /usr/local/libexec/smbpal/smbpal-helper install --daemon <path to smbpald>
 ```
 
+**Replacing the binary of an installed helper is not enough on its own.** launchd
+attaches a launch constraint to the job's plist that the build it was registered
+with satisfies, and a new build fails it: the helper is killed at launch with
+`OS_REASON_CODESIGNING | Launch Constraint Violation` and stays down behind its old
+socket, so every grant check fails. Bootstrapping the job again clears it (spike
+§16), and `sudo make -C helper install` does that when a job exists:
+
+```sh
+sudo launchctl bootout system/app.smbpal.helper
+sudo launchctl bootstrap system /Library/LaunchDaemons/app.smbpal.helper.plist
+```
+
 **The order is the property worth having: nothing of SMBPal's runs as root until
 the third command, and by then it is a root-owned file.** The first two are
 `install(1)`, a system binary. A `setup` that elevated by itself, or a one-liner
