@@ -58,6 +58,10 @@ class DirectoryStatus:
     # "the owner has no write bit" have different fixes, and saying the wrong
     # one sends people to change the wrong thing.
     why_not_writable: str | None = None
+    # Whether `make_writable` can change the answer. False for a deny ACE:
+    # somebody set it on purpose, the helper will not override it, and
+    # offering the command anyway sends people to a refusal.
+    fixable: bool = True
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -68,6 +72,7 @@ class DirectoryStatus:
             "mode": f"{self.mode:04o}" if self.mode is not None else None,
             "writable": self.writable,
             "why_not_writable": self.why_not_writable,
+            "fixable": self.fixable,
         }
 
 
@@ -168,6 +173,7 @@ def describe(
         mode=stat.S_IMODE(mode),
         owner_name=owner_name,
         writable=writable,
+        fixable=access != "deny",
         why_not_writable=(
             why
             or (

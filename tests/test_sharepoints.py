@@ -401,6 +401,23 @@ class TestAccessForExistingAccounts(SharepointCase):
         with self.assertRaises(ApplyError) as caught:
             self.applier.make_writable(self.share, grant=GRANT)
         self.assertIn("on purpose", caught.exception.detail or "")
+        # Headed with what could not be done, not with the helper's verb.
+        self.assertIn("cannot make 'Docs' writable", caught.exception.message)
+        self.assertNotIn("share.grant", caught.exception.message)
+
+    def test_a_deny_is_not_offered_the_command_that_cannot_fix_it(self) -> None:
+        """Measured 12 October 2026: `share add` on a denied folder suggested
+        `make-writable`, which the helper then refused."""
+        from smbpal.cli.main import _read_only_notes
+
+        self.helper.facts[f"{HOME}/Documents"] = PathFacts(
+            "ok", f"{HOME}/Documents", 4242, 4242, 0o777, "someone-else", has_acl=True
+        )
+        self.helper.access[(f"{HOME}/Documents", self.user)] = "deny"
+        [planned] = self.applier.plan(self.config(self.share))
+        notes = "\n".join(_read_only_notes([planned.to_wire()]))
+        self.assertIn("denies", notes)
+        self.assertNotIn("make-writable", notes)
 
     def test_the_plan_asks_about_the_shares_account(self) -> None:
         self.applier.plan(self.config(self.share))

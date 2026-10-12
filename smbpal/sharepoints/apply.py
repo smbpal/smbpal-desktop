@@ -298,7 +298,11 @@ class SharepointApplier:
         try:
             self.helper.share_grant(share["path"], user, auth=grant)
         except HelperError as exc:
-            raise _explain(exc) from exc
+            # Headed with what could not be done, not with the verb that said
+            # no: "the helper refused share.grant" is plumbing.
+            raise _explain(
+                exc, headline=f"cannot make {share['name']!r} writable for {user}"
+            ) from exc
         [planned] = self.plan({"shares": [share]})
         return planned.status
 
@@ -414,11 +418,11 @@ _HELPER_REFUSALS = {
 }
 
 
-def _explain(exc: HelperError) -> SmbpalError:
+def _explain(exc: HelperError, *, headline: str | None = None) -> SmbpalError:
     detail = _HELPER_REFUSALS.get(exc.token or "")
     if detail is None and exc.token:
         # A §13 verdict: the helper re-checked the folder and refused it, after
         # `apply` had already found it acceptable. Rare (the folder changed in
         # between), and exactly the TOCTOU window §13 records.
         detail = f"the helper refused the folder: {exc.token}"
-    return ApplyError(exc.message, detail=detail or exc.detail)
+    return ApplyError(headline or exc.message, detail=detail or exc.detail)

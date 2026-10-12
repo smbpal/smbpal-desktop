@@ -1070,3 +1070,27 @@ class TestTheHelperInstallLine(unittest.TestCase):
         source = inspect.getsource(main)
         self.assertIn("sudo install -S -o root -g wheel -m 755", source)
         self.assertNotIn("sudo install -o root -g wheel -m 755", source)
+
+
+class TestReadOnlyNotes(unittest.TestCase):
+    def note(self, **directory: object) -> str:
+        from smbpal.cli.main import _read_only_notes
+
+        share = {
+            "id": "media",
+            "read_only_reason": "read-only: /srv/media belongs to root",
+            "directory": {"writable": False, **directory},
+        }
+        return "\n".join(_read_only_notes([share]))
+
+    def test_a_fixable_reason_offers_the_fix(self) -> None:
+        self.assertIn("run: smbpal share make-writable media", self.note(fixable=True))
+
+    def test_a_daemon_from_before_fixable_still_offers_it(self) -> None:
+        self.assertIn("make-writable", self.note())
+
+    def test_an_unfixable_reason_does_not(self) -> None:
+        """A deny ACE: offering the command sends people to a refusal."""
+        note = self.note(fixable=False)
+        self.assertIn("belongs to root", note)
+        self.assertNotIn("make-writable", note)

@@ -1197,7 +1197,10 @@ def _read_only_notes(shares: list[dict[str, Any]]) -> list[str]:
         notes.append(f"  {reason}")
         # Offer the fix from the structured flag, not by matching words in our
         # own message — a reworded reason should not silently drop the hint.
-        if (share.get("directory") or {}).get("writable") is False:
+        directory = share.get("directory") or {}
+        # `fixable` absent is a daemon from before it existed: offer the fix,
+        # as that daemon's every read-only reason had one.
+        if directory.get("writable") is False and directory.get("fixable", True):
             notes.append(f"  run: smbpal share make-writable {share['id']}")
     return notes
 
