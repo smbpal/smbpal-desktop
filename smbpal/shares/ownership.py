@@ -123,6 +123,7 @@ def describe(
     owner_name: str | None,
     identity: ServingIdentity | None = None,
     has_acl: bool = False,
+    access: str | None = None,
 ) -> DirectoryStatus:
     """A `DirectoryStatus` from facts somebody else gathered.
 
@@ -131,13 +132,30 @@ def describe(
     §15) -- so the privileged helper gathers them and this turns its answer
     into the same object, rather than a second description that could drift.
 
-    **An ACL makes writability unknown, not false.** macOS grants share access
-    with `chmod +a` (account spike, step 5), so there an ACL is the normal case
-    and the mode bits are not the whole answer. Reporting "not writable" from
-    them would send someone to change the wrong thing.
+    **An ACL makes writability unknown, not false** -- unless the helper said
+    what it means for this account (`access`). macOS grants share access with
+    `chmod +a` (account spike, step 5), so there an ACL is the normal case and
+    the mode bits are not the whole answer. Reporting "not writable" from them
+    would send someone to change the wrong thing.
+
+    `access` is the helper's reading of the ACL for `identity`: "allow" means
+    an ACE lets it write, "deny" that one stops it -- the kernel evaluates deny
+    first, so that is a no whatever the mode says -- and "none" that the ACL
+    says nothing about it, which leaves the mode bits as the answer.
     """
     path = Path(path)
-    if identity is None or has_acl:
+    why: str | None = None
+    if identity is None:
+        writable = None
+    elif access == "allow":
+        writable = True
+    elif access == "deny":
+        writable = False
+        why = (
+            f"{path} has an access entry that denies {identity.username} — "
+            "somebody set it on purpose, so SMBPal leaves it alone"
+        )
+    elif has_acl and access is None:
         writable = None
     else:
         writable = _writable_by(uid, gid, mode, identity)
@@ -151,9 +169,12 @@ def describe(
         owner_name=owner_name,
         writable=writable,
         why_not_writable=(
-            _why_not(path, uid, mode, identity, owner_name)
-            if writable is False and identity
-            else None
+            why
+            or (
+                _why_not(path, uid, mode, identity, owner_name)
+                if writable is False and identity
+                else None
+            )
         ),
     )
 

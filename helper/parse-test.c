@@ -86,6 +86,62 @@ static void expect_name(const char *name, const char *candidate, int want_ok) {
     }
 }
 
+static void expect_smb_nt(const char *name, const char *text, int want) {
+    ran++;
+    if (hashlist_has_smb_nt(text) != want) {
+        printf("FAIL %s: SMB-NT %s\n", name, want ? "missed" : "invented");
+        failures++;
+    }
+}
+
+static void expect_user(const char *name, const char *candidate, int want_ok) {
+    ran++;
+    if (user_name_ok(candidate) != want_ok) {
+        printf("FAIL %s: user name %s\n", name, want_ok ? "rejected" : "accepted");
+        failures++;
+    }
+}
+
+/* `ace_add`, `ace_for` and `ace_remove` against a real directory, as the
+ * current user: putting an ACE on your own directory needs no root. This is
+ * also the measurement the account spike left open -- whether `chmod -a` with
+ * the text an ACE was added with removes it after macOS has stored it
+ * rewritten. */
+static void expect_ace_round_trip(void) {
+    char dir[PATH_MAX];
+    const char *tmp = getenv("TMPDIR");
+    snprintf(dir, sizeof dir, "%s/smbpal-ace-XXXXXX", tmp != NULL ? tmp : "/tmp");
+    ran++;
+    if (mkdtemp(dir) == NULL) {
+        printf("FAIL ace round trip: mkdtemp\n");
+        failures++;
+        return;
+    }
+    char resolved[PATH_MAX];
+    struct passwd *me = getpwuid(getuid());
+    if (realpath(dir, resolved) == NULL || me == NULL) {
+        printf("FAIL ace round trip: setup\n");
+        failures++;
+        rmdir(dir);
+        return;
+    }
+    if (ace_for(resolved, me->pw_uid) != ACCESS_NONE) {
+        printf("FAIL ace round trip: a new directory already has an ACE\n");
+        failures++;
+    }
+    ace_add(me->pw_name, resolved);
+    if (ace_for(resolved, me->pw_uid) != ACCESS_ALLOW) {
+        printf("FAIL ace round trip: the granted ACE does not read back as allow\n");
+        failures++;
+    }
+    ace_remove(me->pw_name, resolved);
+    if (ace_for(resolved, me->pw_uid) != ACCESS_NONE) {
+        printf("FAIL ace round trip: chmod -a did not remove the rewritten ACE\n");
+        failures++;
+    }
+    rmdir(resolved);
+}
+
 int main(void) {
     const char *form64 =
         "0011223344556677889900aabbccddeeff00112233445566778899aabbccddee";
@@ -163,6 +219,27 @@ int main(void) {
     expect_name("eighty", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1);
     expect_name("eighty-one",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0);
+
+    /* Shapes from the account spike's readings, with the principal elided. */
+    expect_smb_nt("present, last",
+                  "AuthenticationAuthority:\n ;ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2,"
+                  "SRP-RFC5054-4096-SHA512-PBKDF2,SMB-NT> ;SecureToken; ;Kerberosv5;;x@LKDC:SHA1.X\n",
+                  1);
+    expect_smb_nt("absent", " ;ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2,SRP-RFC5054-4096-SHA512-PBKDF2>\n", 0);
+    expect_smb_nt("present, first", ";ShadowHash;HASHLIST:<SMB-NT,SALTED-SHA512-PBKDF2>", 1);
+    expect_smb_nt("a longer name is not it", ";ShadowHash;HASHLIST:<SMB-NTLMv2,SALTED-SHA512-PBKDF2>", 0);
+    expect_smb_nt("outside the list is not it", ";ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2> SMB-NT", 0);
+    expect_smb_nt("no list at all", "No such key: AuthenticationAuthority", 0);
+    expect_smb_nt("unterminated list", ";ShadowHash;HASHLIST:<SMB-NT", 0);
+
+    expect_ace_round_trip();
+
+    expect_user("plain", "someone", 1);
+    expect_user("underscore and dot", "first.last_2", 1);
+    expect_user("space would change the ACE", "some one", 0);
+    expect_user("comma would change the ACE", "a,b", 0);
+    expect_user("colon", "a:b", 0);
+    expect_user("empty", "", 0);
 
     printf("%d cases, %d failures\n", ran, failures);
     return failures == 0 ? 0 : 1;

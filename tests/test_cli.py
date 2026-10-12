@@ -823,13 +823,29 @@ class TestShareNotes(unittest.TestCase):
                 {"name": "Media", "credential_ref": "luke", "can_sign_in": False},
                 {"name": "Fine", "credential_ref": "luke", "can_sign_in": True},
                 {"name": "Old", "credential_ref": "luke"},
-            ]
+            ],
+            platform="linux",
         )
         text = "\n".join(notes)
         self.assertIn("Media: nobody can sign in yet", text)
         self.assertIn("smbpal credential set luke", text)
         self.assertNotIn("Fine", text)
         self.assertNotIn("Old", text)
+
+    def test_on_a_mac_the_fix_is_the_switch_not_a_command(self) -> None:
+        """macOS's SMB password is the login password; `credential set` is
+        refused there, so pointing at it would be advice that cannot work."""
+        from smbpal.cli.main import share_notes
+
+        text = "\n".join(
+            share_notes(
+                [{"name": "Media", "credential_ref": "someone", "can_sign_in": False}],
+                platform="darwin",
+            )
+        )
+        self.assertIn("someone does not have SMB sign-in turned on", text)
+        self.assertIn("File Sharing > Options", text)
+        self.assertNotIn("credential set", text)
 
     def test_nothing_to_say_says_nothing(self) -> None:
         from smbpal.cli.main import share_notes

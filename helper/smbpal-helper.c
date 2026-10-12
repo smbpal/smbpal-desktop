@@ -35,6 +35,7 @@
 #include <errno.h>
 #include <grp.h>
 #include <limits.h>
+#include <membership.h>
 #include <signal.h>
 #include <pwd.h>
 #include <stdio.h>
@@ -54,6 +55,7 @@
 #define SERVICE_USER "_smbpald"
 #define SHARING "/usr/sbin/sharing"
 #define DSCL "/usr/bin/dscl"
+#define CHMOD "/bin/chmod"
 #define STATE_DIR "/var/db/smbpal"
 #define CREATED_FILE STATE_DIR "/created"
 /* The sharepoints SMBPal published, one record name per line. **A separate file
@@ -975,6 +977,161 @@ static int sharepoint_remove(const char *name) {
     return sharepoint_exists(name) ? -1 : 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * Access for existing accounts -- the macOS form of `share.make_writable`.
+ *
+ * Decided 12 October 2026: macOS shares are served to accounts that already
+ * exist, and SMBPal creates none yet. On macOS the SMB password *is* the login
+ * password, so SMBPal cannot turn SMB sign-in on for somebody without theirs --
+ * the person ticks it in System Settings. What SMBPal can do is let that
+ * account write to the folder, and the account spike measured how: an ACE,
+ * appended, which never takes ownership from whoever owns the folder.
+ * ------------------------------------------------------------------------- */
+
+/* The account spike's step 4, verbatim: the string that let the Pi write. macOS
+ * stores it rewritten (`read,write,execute` becomes `list,add_file,search`), so
+ * nothing here compares ACE *text* -- presence is read back from the ACL's
+ * bits, by uid. */
+#define GRANT_PERMS                                                                    \
+    "read,write,execute,delete,add_file,add_subdirectory,file_inherit,directory_inherit"
+#define USER_NAME_MAX 64
+/* What SMBPal granted, one `<user>\t<resolved path>` per line, so uninstall can
+ * take back exactly the ACEs it added and none that somebody else did. */
+#define GRANTS_FILE STATE_DIR "/grants"
+
+enum access_state { ACCESS_NONE, ACCESS_ALLOW, ACCESS_DENY };
+static const char *const ACCESS_STATES[] = {"none", "allow", "deny"};
+
+/* A POSIX name in the conservative set, which is also everything `chmod +a`
+ * would otherwise have to parse: the ACE is built here as `<user> allow ...`,
+ * and a space or a comma in `user` would change what it says. */
+static int user_name_ok(const char *name) {
+    size_t len = strlen(name);
+    if (len == 0 || len > USER_NAME_MAX) return 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = name[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '_' || c == '.' || c == '-'))
+            return 0;
+    }
+    return 1;
+}
+
+/* An existing *person*: §13 rule 5's line, applied to accounts. Role accounts
+ * and root are not who "existing accounts" means, and granting a system
+ * account write on somebody's folder is the piggybacked-grant blast radius §13
+ * exists to bound. */
+static struct passwd *person(const char *name) {
+    if (!user_name_ok(name)) return NULL;
+    struct passwd *pw = getpwnam(name);
+    if (pw == NULL || pw->pw_uid < FIRST_PERSON_UID) return NULL;
+    return pw;
+}
+
+/* Whether `uid` is allowed to write in `resolved` by an ACE, denied by one, or
+ * neither. Allow means an entry with both `add_file` and `add_subdirectory`;
+ * any deny entry for the uid wins, because the kernel evaluates deny first. */
+static enum access_state ace_for(const char *resolved, uid_t uid) {
+    acl_t acl = acl_get_link_np(resolved, ACL_TYPE_EXTENDED);
+    if (acl == NULL) return ACCESS_NONE;
+    int allow = 0, deny = 0;
+    acl_entry_t entry;
+    for (int which = ACL_FIRST_ENTRY; acl_get_entry(acl, which, &entry) == 0;
+         which = ACL_NEXT_ENTRY) {
+        acl_tag_t tag;
+        if (acl_get_tag_type(entry, &tag) != 0) continue;
+        if (tag != ACL_EXTENDED_ALLOW && tag != ACL_EXTENDED_DENY) continue;
+        guid_t *who = acl_get_qualifier(entry);
+        if (who == NULL) continue;
+        id_t id;
+        int type;
+        int mine = mbr_uuid_to_id(who->g_guid, &id, &type) == 0 && type == ID_TYPE_UID &&
+                   id == uid;
+        acl_free(who);
+        if (!mine) continue;
+        if (tag == ACL_EXTENDED_DENY) {
+            deny = 1;
+            continue;
+        }
+        acl_permset_t perms;
+        if (acl_get_permset(entry, &perms) == 0 && acl_get_perm_np(perms, ACL_ADD_FILE) == 1 &&
+            acl_get_perm_np(perms, ACL_ADD_SUBDIRECTORY) == 1)
+            allow = 1;
+    }
+    acl_free(acl);
+    return deny ? ACCESS_DENY : allow ? ACCESS_ALLOW : ACCESS_NONE;
+}
+
+/* The parse, apart from the `dscl` call so `parse-test` can feed it text.
+ * Item by item, so `SMB-NTLMv2` -- or anything else that merely begins with
+ * the name -- is not mistaken for it, and only inside `HASHLIST:<...>`. */
+static int hashlist_has_smb_nt(const char *text) {
+    const char *list = strstr(text, "HASHLIST:<");
+    const char *end = list != NULL ? strchr(list, '>') : NULL;
+    if (end == NULL) return 0;
+    const char *item = list + strlen("HASHLIST:<");
+    while (item < end) {
+        const char *comma = memchr(item, ',', (size_t)(end - item));
+        const char *stop = comma != NULL ? comma : end;
+        if ((size_t)(stop - item) == strlen("SMB-NT") &&
+            strncmp(item, "SMB-NT", strlen("SMB-NT")) == 0)
+            return 1;
+        item = stop + 1;
+    }
+    return 0;
+}
+
+/* Whether `name` has `SMB-NT` in its HASHLIST -- what the Sharing pane's
+ * per-account checkbox adds, and what `smbd` requires (account spike §2).
+ *
+ * As root, because unprivileged `dscl` answers `No such key` for some accounts
+ * and that read as "not provisioned" twice in one session (the spike's first
+ * trap). **Only the answer leaves this function.** The attribute names hash
+ * *types* and a Kerberos principal, not hashes -- `ShadowHashData` is never
+ * read -- but nothing about it is the daemon's business beyond yes or no. */
+static int has_smb_nt(const char *name) {
+    char record[USER_NAME_MAX + 16];
+    snprintf(record, sizeof record, "/Users/%s", name);
+    char *const argv[] = {(char *)DSCL, ".", "-read", record, "AuthenticationAuthority", NULL};
+    static char out[8192];
+    size_t len = 0;
+    int found = 0;
+    if (run_captured(argv, out, sizeof out - 1, &len) == 0) {
+        out[len] = '\0';
+        found = hashlist_has_smb_nt(out);
+    }
+    memset(out, 0, sizeof out);
+    return found;
+}
+
+static int grants_add(const char *user, const char *resolved) {
+    if (mkdir(STATE_DIR, 0755) != 0 && errno != EEXIST) return -1;
+    FILE *fh = fopen(GRANTS_FILE, "a");
+    if (fh == NULL) return -1;
+    int ok = fprintf(fh, "%s\t%s\n", user, resolved) > 0;
+    ok = (fclose(fh) == 0) && ok;
+    chmod(GRANTS_FILE, 0644);
+    return ok ? 0 : -1;
+}
+
+static int ace_add(const char *user, const char *resolved) {
+    char ace[USER_NAME_MAX + sizeof " allow " GRANT_PERMS];
+    snprintf(ace, sizeof ace, "%s allow %s", user, GRANT_PERMS);
+    char *const argv[] = {(char *)CHMOD, "+a", ace, (char *)resolved, NULL};
+    return run_quiet(argv);
+}
+
+/* `chmod -a` with the text it was added with. It matches on the parsed bits,
+ * so the rewrite above is harmless here: `parse-test` adds this ACE to a real
+ * directory, reads it back by uid and removes it this way (12 October 2026).
+ * Uninstall still reads the ACL back rather than trusting the exit. */
+static int ace_remove(const char *user, const char *resolved) {
+    char ace[USER_NAME_MAX + sizeof " allow " GRANT_PERMS];
+    snprintf(ace, sizeof ace, "%s allow %s", user, GRANT_PERMS);
+    char *const argv[] = {(char *)CHMOD, "-a", ace, (char *)resolved, NULL};
+    return run_quiet(argv);
+}
+
 /* Removes what the install recorded and nothing else -- §10.6. The order is
  * §4's, learned on 11 October 2026: an ACE outlives the account it names and
  * orphans to a raw UUID, and ownership does the same, so files go before the
@@ -1026,6 +1183,37 @@ static int uninstall(void) {
         }
         fclose(published);
         if (!stuck) unlink(SHAREPOINTS_FILE);
+    }
+
+    /* The ACEs SMBPal added, and only those: the list holds what `share.grant`
+     * added, never one that was already there. Read back by uid afterwards
+     * rather than trusting `chmod`'s exit, as everywhere else. An account
+     * that has gone since is skipped -- its ACE is a raw UUID now, and
+     * guessing which one is a worse failure than reporting it. */
+    FILE *granted = fopen(GRANTS_FILE, "r");
+    if (granted != NULL) {
+        char line[USER_NAME_MAX + PATH_MAX + 4];
+        int stuck = 0;
+        while (fgets(line, sizeof line, granted) != NULL) {
+            line[strcspn(line, "\n")] = '\0';
+            char *tab = strchr(line, '\t');
+            if (tab == NULL) continue;
+            *tab = '\0';
+            const char *path = tab + 1;
+            struct passwd *who = person(line);
+            if (who == NULL) {
+                printf("COULD NOT REMOVE access for %s on %s: no such account\n", line, path);
+                stuck = 1;
+                continue;
+            }
+            ace_remove(who->pw_name, path);
+            int gone = ace_for(path, who->pw_uid) != ACCESS_ALLOW;
+            printf("%s access for %s on %s\n", gone ? "removed" : "COULD NOT REMOVE",
+                   who->pw_name, path);
+            if (!gone) stuck = 1;
+        }
+        fclose(granted);
+        if (!stuck) unlink(GRANTS_FILE);
     }
 
     if ((fh = fopen(CREATED_FILE, "r")) == NULL) {
@@ -1209,11 +1397,11 @@ static int parse_frame(char *buf, struct request *req) {
     return 0;
 }
 
-/* The whole vocabulary. Three reads that must not be authorised (`share.list`,
- * `path.inspect`, `share.owned`), one authorisation that reads nothing
- * (`auth.check`), and two mutations that verify their own grant
- * (`share.publish`, `share.unpublish`) rather than trusting that the daemon
- * asked `auth.check` first. */
+/* The whole vocabulary. Four reads that must not be authorised (`share.list`,
+ * `path.inspect`, `share.owned`, `account.smb`), one authorisation that reads
+ * nothing (`auth.check`), and three mutations that verify their own grant
+ * (`share.publish`, `share.unpublish`, `share.grant`) rather than trusting
+ * that the daemon asked `auth.check` first. */
 static void serve_one(int conn) {
     char buf[REQUEST_MAX + 1];
     struct request req;
@@ -1310,9 +1498,19 @@ static void serve_one(int conn) {
          * say why a share is read-only, and a replaced daemon gains no write
          * from it. Requiring a grant would put a password prompt in front of
          * every `smbpal status`. */
+        /* An optional second argument names an account, and the answer then
+         * says whether an ACE lets it write here -- which is what makes a
+         * share's writability knowable on macOS, where access is an ACE and
+         * the mode bits are not the whole story. */
         struct path_report report;
-        if (req.has_auth || req.argc != 1 || inspect_path(req.args[0], &report) != 0) {
+        struct passwd *who = NULL;
+        if (req.has_auth || req.argc < 1 || req.argc > 2 ||
+            inspect_path(req.args[0], &report) != 0) {
             respond_err(conn, "args");
+            return;
+        }
+        if (req.argc == 2 && (who = person(req.args[1])) == NULL) {
+            respond_err(conn, "account");
             return;
         }
         if (strpbrk(report.resolved, "\n\r") != NULL) {
@@ -1334,11 +1532,89 @@ static void serve_one(int conn) {
                          (unsigned)report.st.st_uid, (unsigned)report.st.st_gid,
                          (unsigned)(report.st.st_mode & 07777), report.owner,
                          report.has_acl);
+        if (n >= 0 && (size_t)n < sizeof out && who != NULL &&
+            report.verdict != PATH_NOT_FOUND) {
+            int more = snprintf(out + n, sizeof out - (size_t)n, "access %s\n",
+                                ACCESS_STATES[ace_for(report.resolved, who->pw_uid)]);
+            n = more < 0 ? more : n + more;
+        }
         if (n < 0 || (size_t)n >= sizeof out) {
             respond_err(conn, "path");
             return;
         }
         respond(conn, out);
+        return;
+    }
+
+    if (strcmp(req.verb, "account.smb") == 0) {
+        /* Whether an existing person can sign in over SMB at all: the reason
+         * a correctly published share can still be useless. A read, so no
+         * form; the answer is one bit and the attribute never leaves. */
+        struct passwd *who;
+        if (req.has_auth || req.argc != 1 || (who = person(req.args[0])) == NULL) {
+            respond_err(conn, req.argc == 1 && !req.has_auth ? "account" : "args");
+            return;
+        }
+        respond(conn, has_smb_nt(who->pw_name) ? "OK\nsmb-nt 1\n" : "OK\nsmb-nt 0\n");
+        return;
+    }
+
+    if (strcmp(req.verb, "share.grant") == 0) {
+        /* ARG <path>, ARG <user>. `share.make_writable` on macOS: an ACE that
+         * lets an existing person write, appended, never an ownership change.
+         * Same order as `share.publish`: shape, then the grant, then a look at
+         * the filesystem. */
+        struct path_report report;
+        struct passwd *who;
+        if (!req.has_auth || req.argc != 2 || !user_name_ok(req.args[1])) {
+            respond_err(conn, "args");
+            return;
+        }
+        if (verify_form(MANAGE_SHARES_RIGHT, &req.auth) != 0) {
+            respond_err(conn, "denied");
+            return;
+        }
+        if (inspect_path(req.args[0], &report) != 0) {
+            respond_err(conn, "args");
+            return;
+        }
+        if (report.verdict != PATH_OK) {
+            respond_err(conn, PATH_VERDICTS[report.verdict]);
+            return;
+        }
+        if ((who = person(req.args[1])) == NULL) {
+            respond_err(conn, "account");
+            return;
+        }
+        enum access_state state = ace_for(report.resolved, who->pw_uid);
+        if (state == ACCESS_DENY) {
+            /* Somebody denied this account deliberately. Adding an allow
+             * beside it would change nothing -- deny is evaluated first -- and
+             * removing theirs is not ours to do. */
+            respond_err(conn, "deny-ace");
+            return;
+        }
+        if (state == ACCESS_ALLOW) {
+            /* Already able to write, by an ACE this helper may or may not have
+             * added. Not recorded: only what this call adds is SMBPal's. */
+            respond(conn, "OK\n");
+            return;
+        }
+        ace_add(who->pw_name, report.resolved);
+        if (ace_for(report.resolved, who->pw_uid) != ACCESS_ALLOW) {
+            respond_err(conn, "chmod");
+            return;
+        }
+        if (grants_add(who->pw_name, report.resolved) != 0) {
+            /* An ACE SMBPal cannot remember adding is one uninstall would
+             * leave behind, so it does not get to stay. */
+            ace_remove(who->pw_name, report.resolved);
+            respond_err(conn, "ledger");
+            return;
+        }
+        fprintf(stderr, "smbpal-helper: granted %s write on %s\n", who->pw_name,
+                report.resolved);
+        respond(conn, "OK\n");
         return;
     }
 

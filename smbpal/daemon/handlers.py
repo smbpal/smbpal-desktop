@@ -592,12 +592,20 @@ class Dispatcher:
         except SmbpalError:
             effective = None
         serving = None if effective is None else set(effective)
-        accounts = self._smb_accounts()
+        # An applier that can answer per share does (macOS asks the helper
+        # whether each account has SMB sign-in on); otherwise Samba's account
+        # list answers for all of them at once.
+        per_share = getattr(self.applier, "can_sign_in", None)
+        accounts = None if per_share is not None else self._smb_accounts()
 
         rows = []
         for planned in self.applier.plan(config):
             row = planned.to_wire()
-            row["can_sign_in"] = _can_sign_in(planned.share, accounts)
+            row["can_sign_in"] = (
+                per_share(planned.share)
+                if per_share is not None
+                else _can_sign_in(planned.share, accounts)
+            )
             if not planned.share.get("enabled", True):
                 row["state"] = SHARE_DISABLED
             elif serving is None:
@@ -782,6 +790,12 @@ class Dispatcher:
                 detail="Assign one with --user so there is an identity to give "
                 "the directory to.",
             )
+        if hasattr(self.applier, "make_writable"):
+            # macOS: an ACE through the helper, not an ownership change, and no
+            # re-apply -- the sharepoint itself has not changed.
+            status = self.applier.make_writable(share, grant=request.auth)
+            _audit(peer, "share.make_writable", share["id"])
+            return {"share": share, "directory": status.to_wire()}
         identity = ownership.serving_identity(user)
         status = ownership.make_writable(share["path"], identity)
         _audit(peer, "share.make_writable", share["id"])
