@@ -393,6 +393,22 @@ class TestTheVocabularyIsFixed(unittest.TestCase):
         assert match is not None
         self.assertEqual(int(match.group(1)), FIRST_PERSON_UID)
 
+    def test_uninstall_does_not_narrate_failures_it_expects(self) -> None:
+        """Measured 12 October 2026: a clean uninstall printed `chmod: No ACL
+        present` and `DS Error: -14136 (eDSRecordNotFound)` beside its own
+        "removed" lines. Calls whose failure is the expected answer, or whose
+        effect is read back anyway, discard their stderr."""
+        self.assertIn("run_silent(argv)", self.function("static int ace_remove("))
+        self.assertIn("run_silent(argv)", self.function("static int sharepoint_exists("))
+        self.assertIn("run_silent(check)", self.function("static int uninstall("))
+        # And the one that adds an ACE still reports why it could not.
+        self.assertIn("run_quiet(argv)", self.function("static int ace_add("))
+
+    def test_a_grant_on_a_deleted_folder_is_not_reported_as_removed(self) -> None:
+        body = self.function("static int uninstall(")
+        self.assertIn("the folder no longer exists", body)
+        self.assertLess(body.index("lstat(path"), body.index("ace_remove(who->pw_name, path)"))
+
     def test_sharepoints_are_not_recorded_with_identities(self) -> None:
         """Uninstall deletes every non-user line of CREATED_FILE as a group."""
         self.assertNotIn("CREATED_FILE", self.function("static int ledger_add("))

@@ -228,7 +228,7 @@ static int run_captured(char *const argv[], char *out, size_t cap, size_t *len) 
  * them indistinguishable from chatter, and the only reliable check turned out
  * to be reading the state back. `dscl` has not been caught doing it, which is
  * not the same as being known not to. */
-static int run_quiet(char *const argv[]) {
+static int run_discarding(char *const argv[], int discard_stderr) {
     pid_t pid = fork();
     int status = -1;
     if (pid < 0) return -1;
@@ -236,6 +236,7 @@ static int run_quiet(char *const argv[]) {
         int devnull = open("/dev/null", O_WRONLY);
         if (devnull >= 0) {
             dup2(devnull, STDOUT_FILENO);
+            if (discard_stderr) dup2(devnull, STDERR_FILENO);
             close(devnull);
         }
         execv(argv[0], argv);
@@ -245,6 +246,16 @@ static int run_quiet(char *const argv[]) {
     if (!WIFEXITED(status)) return -1;
     return WEXITSTATUS(status);
 }
+
+static int run_quiet(char *const argv[]) { return run_discarding(argv, 0); }
+
+/* For a call whose *failure is the expected answer*, or whose effect is read
+ * back regardless: a `dscl -read` confirming a record is gone, a `chmod -a` on
+ * an ACE that may already be gone. Their stderr is the tool narrating an
+ * outcome this file checks for itself -- and uninstall runs in a terminal,
+ * where `DS Error: -14136 (eDSRecordNotFound)` beside "removed user" reads as
+ * the opposite of what happened (12 October 2026). */
+static int run_silent(char *const argv[]) { return run_discarding(argv, 1); }
 
 static int dscl_set(const char *path, const char *key, const char *value) {
     char *const argv[] = {(char *)DSCL, ".", "-create", (char *)path,
@@ -910,7 +921,7 @@ static int sharepoint_exists(const char *name) {
     char record[SHARE_NAME_MAX + 16];
     snprintf(record, sizeof record, "/SharePoints/%s", name);
     char *const argv[] = {(char *)DSCL, ".", "-read", record, "RecordName", NULL};
-    return run_quiet(argv) == 0;
+    return run_silent(argv) == 0;
 }
 
 /* Whether SMBPal published `name`. Line by line and exact, so `Media` does not
@@ -1129,7 +1140,7 @@ static int ace_remove(const char *user, const char *resolved) {
     char ace[USER_NAME_MAX + sizeof " allow " GRANT_PERMS];
     snprintf(ace, sizeof ace, "%s allow %s", user, GRANT_PERMS);
     char *const argv[] = {(char *)CHMOD, "-a", ace, (char *)resolved, NULL};
-    return run_quiet(argv);
+    return run_silent(argv);
 }
 
 /* Removes what the install recorded and nothing else -- §10.6. The order is
@@ -1200,6 +1211,15 @@ static int uninstall(void) {
             if (tab == NULL) continue;
             *tab = '\0';
             const char *path = tab + 1;
+            /* A folder deleted since has no ACE left to take back. Said as
+             * that, rather than as "removed access" -- which claimed a removal
+             * on a folder that was not there (12 October 2026). */
+            struct stat gone_check;
+            if (lstat(path, &gone_check) != 0 && errno == ENOENT) {
+                printf("nothing to remove for %s on %s: the folder no longer exists\n",
+                       line, path);
+                continue;
+            }
             struct passwd *who = person(line);
             if (who == NULL) {
                 printf("COULD NOT REMOVE access for %s on %s: no such account\n", line, path);
@@ -1241,7 +1261,7 @@ static int uninstall(void) {
              * the install a moment later created it afresh. `dscl -read` asks
              * the node the write went to. */
             char *const check[] = {(char *)DSCL, ".", "-read", path, "RecordName", NULL};
-            int gone = run_quiet(check) != 0;
+            int gone = run_silent(check) != 0;
             printf("%s %s %s\n", gone ? "removed" : "COULD NOT REMOVE", kind, name);
             if (gone) removed++;
         }
