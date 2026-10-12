@@ -104,19 +104,54 @@ def inspect_directory(
         owner_name = pwd.getpwuid(info.st_uid).pw_name
     except KeyError:
         owner_name = str(info.st_uid)
+    return describe(
+        path,
+        uid=info.st_uid,
+        gid=info.st_gid,
+        mode=info.st_mode,
+        owner_name=owner_name,
+        identity=identity,
+    )
 
-    writable = _writable_by(info, identity) if identity else None
+
+def describe(
+    path: str | Path,
+    *,
+    uid: int,
+    gid: int,
+    mode: int,
+    owner_name: str | None,
+    identity: ServingIdentity | None = None,
+    has_acl: bool = False,
+) -> DirectoryStatus:
+    """A `DirectoryStatus` from facts somebody else gathered.
+
+    `inspect_directory` gathers them with `stat`. On macOS the daemon cannot --
+    it runs as `_smbpald` and a home directory is `drwxr-x---` (helper spike
+    §15) -- so the privileged helper gathers them and this turns its answer
+    into the same object, rather than a second description that could drift.
+
+    **An ACL makes writability unknown, not false.** macOS grants share access
+    with `chmod +a` (account spike, step 5), so there an ACL is the normal case
+    and the mode bits are not the whole answer. Reporting "not writable" from
+    them would send someone to change the wrong thing.
+    """
+    path = Path(path)
+    if identity is None or has_acl:
+        writable = None
+    else:
+        writable = _writable_by(uid, gid, mode, identity)
     return DirectoryStatus(
         path=str(path),
         exists=True,
-        is_dir=stat.S_ISDIR(info.st_mode),
-        owner_uid=info.st_uid,
-        owner_gid=info.st_gid,
-        mode=stat.S_IMODE(info.st_mode),
+        is_dir=stat.S_ISDIR(mode),
+        owner_uid=uid,
+        owner_gid=gid,
+        mode=stat.S_IMODE(mode),
         owner_name=owner_name,
         writable=writable,
         why_not_writable=(
-            _why_not(path, info, identity, owner_name)
+            _why_not(path, uid, mode, identity, owner_name)
             if writable is False and identity
             else None
         ),
@@ -124,10 +159,14 @@ def inspect_directory(
 
 
 def _why_not(
-    path: Path, info: os.stat_result, identity: ServingIdentity, owner_name: str | None
+    path: Path,
+    owner_uid: int,
+    mode: int,
+    identity: ServingIdentity,
+    owner_name: str | None,
 ) -> str:
-    mode = stat.S_IMODE(info.st_mode)
-    if info.st_uid != identity.uid:
+    mode = stat.S_IMODE(mode)
+    if owner_uid != identity.uid:
         return (
             f"{path} belongs to {owner_name}, not to {identity.username}, and its "
             f"mode ({mode:04o}) does not grant {identity.username} write access"
@@ -138,7 +177,7 @@ def _why_not(
     )
 
 
-def _writable_by(info: os.stat_result, identity: ServingIdentity) -> bool:
+def _writable_by(uid: int, gid: int, mode: int, identity: ServingIdentity) -> bool:
     """Compute the mode bits that apply to `identity`.
 
     Deliberately not `os.access`: that answers for the *calling* process, which
@@ -153,10 +192,9 @@ def _writable_by(info: os.stat_result, identity: ServingIdentity) -> bool:
     """
     if identity.uid == 0:
         return True
-    mode = info.st_mode
-    if info.st_uid == identity.uid:
+    if uid == identity.uid:
         return bool(mode & stat.S_IWUSR) and bool(mode & stat.S_IXUSR)
-    if info.st_gid in identity.gids:
+    if gid in identity.gids:
         return bool(mode & stat.S_IWGRP) and bool(mode & stat.S_IXGRP)
     return bool(mode & stat.S_IWOTH) and bool(mode & stat.S_IXOTH)
 

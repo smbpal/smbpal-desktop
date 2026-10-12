@@ -404,6 +404,17 @@ def samba_notes(
             "is serving them.",
         ]
     unit = samba.get("unit") or "smbd"
+    if unit == "com.apple.smbd":
+        # The macOS applier's answer. Never `launchctl enable`: on an
+        # Apple-managed service it produces a server that authenticates nobody
+        # (account spike §1). And the switch is not SMBPal's alone -- it serves
+        # every shared folder on the Mac -- so the sentence says that too.
+        return [
+            "",
+            "! File Sharing is off, so these shares are published and nothing is "
+            "serving them.\n  Turn it on in System Settings > General > Sharing. "
+            "It serves every shared folder on this Mac, not only SMBPal's.",
+        ]
     return [
         "",
         f"! Samba is not running, so these shares are configured and nothing is "
@@ -601,6 +612,8 @@ def _cmd_teardown(client: Client, args: argparse.Namespace) -> int:
             lines.append(f"removed the include block from {result['smb_conf']}")
         if result.get("smbpal_conf_removed"):
             lines.append("removed the generated smbpal.conf")
+        for name in result.get("sharepoints_removed", []):
+            lines.append(f"unpublished the sharepoint {name}")
         for unit in result.get("units_removed", []):
             lines.append(f"removed {unit}")
         # Naming the files is the point: "done" is not something anyone can

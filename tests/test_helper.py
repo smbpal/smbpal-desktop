@@ -301,6 +301,71 @@ class TestTheVocabularyIsFixed(unittest.TestCase):
         for forbidden in ("system(", "popen(", "execvp(", "execlp(", "/bin/sh"):
             self.assertNotIn(forbidden, self.code, f"{forbidden} is rule 3")
 
+    def verb(self, name: str) -> str:
+        """One verb's branch of `serve_one`, up to the next verb."""
+        body = self.function("static void serve_one(")
+        start = body.index(f'strcmp(req.verb, "{name}")')
+        end = body.find("strcmp(req.verb,", start + 1)
+        return body[start : end if end != -1 else len(body)]
+
+    def test_guest_access_is_never_an_argument(self) -> None:
+        """§13 rule 6: `-g 000` is not validated, it is not an input."""
+        publish = self.verb("share.publish")
+        self.assertIn('"-g", "000"', publish)
+        self.assertIn('"-s", "001"', publish)
+
+    def test_publish_passes_the_resolved_path(self) -> None:
+        """§13 rule 1: `/Volumes/Macintosh HD` is a symlink to `/`, so what is
+        checked has to be what is shared."""
+        publish = self.verb("share.publish")
+        self.assertIn('"-a", report.resolved', publish)
+        self.assertNotIn('"-a", req.args', publish)
+
+    def test_the_record_name_is_always_the_share_name(self) -> None:
+        """Helper spike §3: `-S` alone leaves the record named after the folder
+        and `sharing -r <share name>` then leaks the share."""
+        publish = self.verb("share.publish")
+        self.assertIn('"-n", (char *)name', publish)
+        self.assertIn('"-S", (char *)name', publish)
+
+    def test_each_mutation_verifies_its_own_grant(self) -> None:
+        """The daemon asking `auth.check` first is voluntary; these are not."""
+        for name in ("share.publish", "share.unpublish"):
+            with self.subTest(verb=name):
+                branch = self.verb(name)
+                self.assertIn("verify_form(MANAGE_SHARES_RIGHT, &req.auth)", branch)
+                self.assertIn("!req.has_auth", branch)
+
+    def test_the_reads_refuse_a_form(self) -> None:
+        for name in ("path.inspect", "share.owned", "share.list"):
+            with self.subTest(verb=name):
+                self.assertIn("req.has_auth ||", self.verb(name))
+
+    def test_only_what_the_helper_published_can_be_unpublished(self) -> None:
+        branch = self.verb("share.unpublish")
+        self.assertLess(
+            branch.index("ledger_contains(name)"), branch.index("sharepoint_remove(name)")
+        )
+
+    def test_a_folder_is_inspected_only_after_the_grant(self) -> None:
+        """A look at the filesystem as root is not given away to a request that
+        has not shown it may change anything."""
+        branch = self.verb("share.publish")
+        self.assertLess(branch.index("verify_form("), branch.index("inspect_path("))
+
+    def test_the_verdicts_match_the_client(self) -> None:
+        import re
+
+        from smbpal.system.helper import PATH_VERDICTS
+
+        table = self.code[self.code.index("PATH_VERDICTS[] = {") :]
+        table = table[: table.index("};")]
+        self.assertEqual(tuple(re.findall(r'"([a-z-]+)"', table)), PATH_VERDICTS)
+
+    def test_sharepoints_are_not_recorded_with_identities(self) -> None:
+        """Uninstall deletes every non-user line of CREATED_FILE as a group."""
+        self.assertNotIn("CREATED_FILE", self.function("static int ledger_add("))
+
     def test_the_only_executable_is_an_absolute_system_path(self) -> None:
         self.assertIn('#define SHARING "/usr/sbin/sharing"', self.source)
 
@@ -595,6 +660,12 @@ class TestTheRightsMatchTheClient(unittest.TestCase):
 
         table = self.code[self.code.index("static const struct right_rule RIGHTS[]") :]
         table = table[: table.index("};")]
+        # A right the verbs also check is named once as a macro, so the table
+        # may spell it either way; expand the macros before reading it.
+        for macro, value in re.findall(
+            r'#define (\w+) "(app\.smbpal\.[a-z-]+)"', self.code
+        ):
+            table = re.sub(rf"\b{macro}\b", f'"{value}"', table)
         in_c = tuple(re.findall(r'"(app\.smbpal\.[a-z-]+)"', table))
         self.assertEqual(in_c, authorization.RIGHTS)
 

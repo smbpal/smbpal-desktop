@@ -305,7 +305,7 @@ class TestRollback(ApplyTestCase):
         store = ConfigStore(self.root / "config.json")
         dispatcher = Dispatcher(store, applier=self.applier)
 
-        def explode(_config):
+        def explode(_config, **_kwargs):
             raise RuntimeError("something nobody wrote a SmbpalError for")
 
         self.applier.apply = explode  # type: ignore[method-assign]

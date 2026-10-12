@@ -34,11 +34,13 @@
 
 #include <errno.h>
 #include <grp.h>
+#include <limits.h>
 #include <signal.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/acl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -54,6 +56,11 @@
 #define DSCL "/usr/bin/dscl"
 #define STATE_DIR "/var/db/smbpal"
 #define CREATED_FILE STATE_DIR "/created"
+/* The sharepoints SMBPal published, one record name per line. **A separate file
+ * from CREATED_FILE, deliberately**: uninstall reads that one as identities and
+ * deletes anything that is not a user as a group, so a sharepoint written there
+ * would be handed to `dscl -delete /Groups/<name>`. */
+#define SHAREPOINTS_FILE STATE_DIR "/sharepoints"
 #define CONFIG_DIR "/etc/smbpal"
 /* **The daemon needs a log directory it owns, and that is not cosmetic.**
  * launchd opens `StandardErrorPath` *as the job's user* before it execs the
@@ -352,6 +359,10 @@ static int bootout(const char *label) {
 _Static_assert(sizeof(AuthorizationExternalForm) == 32,
                "AuthorizationExternalForm is not 32 bytes on this SDK");
 
+/* Named because the sharepoint verbs check it as well as `auth.check` relaying
+ * it, and two spellings of one right is a typo waiting to be a refusal. */
+#define MANAGE_SHARES_RIGHT "app.smbpal.manage-shares"
+
 struct right_rule {
     const char *name;
     /* Shown in the dialog. macOS renders it as "<app> is trying to <text>", so
@@ -371,7 +382,7 @@ struct right_rule {
  * either -- and a right in the system database that no component ever checks is
  * dead policy that reads like live policy. */
 static const struct right_rule RIGHTS[] = {
-    {"app.smbpal.manage-shares", "change the folders this computer shares"},
+    {MANAGE_SHARES_RIGHT, "change the folders this computer shares"},
     {"app.smbpal.manage-connections",
      "change the network shares this computer connects to"},
 };
@@ -767,6 +778,203 @@ static int install(int dry_run, const char *daemon_path) {
     return 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * Sharepoints -- the macOS apply's privileged half.
+ *
+ * `samba/apply.py` is `smb.conf`, `testparm` and `smbcontrol`, none of which
+ * exist on macOS, so serving a folder here means a sharepoint record, and
+ * creating one needs root. docs/phase-2/macos-helper-spike.md §15 adds the
+ * other half: the daemon runs as `_smbpald` and cannot even `stat` inside a
+ * home directory (`drwxr-x---`), which is where the folders people share live.
+ * So **inspection is privileged here too**, and §13's rules about which folder
+ * may be shared need the same `stat`. One function answers both, and the
+ * daemon asks rather than looks.
+ * ------------------------------------------------------------------------- */
+
+/* §3's measured recipe uses `-s 001` (SMB only) and `-g 000`. The share name is
+ * also the record name: `sharing -r` takes the record name and it defaults to
+ * the directory's basename, which leaked a share on the spike's first attempt,
+ * so `-n` is always passed and the two cannot diverge. */
+#define SHARE_NAME_MAX 80
+/* Below this a uid belongs to the system (§13 rule 5). */
+#define FIRST_PERSON_UID 500
+
+enum path_verdict {
+    PATH_OK,
+    PATH_NOT_FOUND,
+    PATH_NOT_DIRECTORY,
+    PATH_OUTSIDE_ROOTS,
+    PATH_HOME_ROOT,
+    PATH_SYSTEM_OWNED,
+};
+
+/* These are also the error tokens `share.publish` answers with, so each is a
+ * fixed string and never an echo of the request. `system/helper.py` keeps the
+ * same list and a test reads it out of this file. */
+static const char *const PATH_VERDICTS[] = {
+    "ok", "not-found", "not-directory", "outside-roots", "home-root", "system-owned",
+};
+
+static int under_root(const char *resolved, const char *root) {
+    size_t len = strlen(root);
+    /* Strictly under: `/Users/` itself is not a folder anybody means to share,
+     * and `realpath` never leaves a trailing slash to make it look like one. */
+    return strncmp(resolved, root, len) == 0 && resolved[len] != '\0';
+}
+
+/* §13's rules 2-5 over facts already gathered, so the policy is a pure function
+ * `parse-test` can exercise without root, a home directory or a mounted volume.
+ * `resolved` must already be `realpath`'s answer: rule 1 is what makes rule 3
+ * sound, because `/Volumes/Macintosh HD` is a symlink to `/`.
+ *
+ * The order is the order of the messages a person can act on: a file is not a
+ * folder before it is anywhere; a home directory is named as one before its
+ * owner's uid is mentioned. */
+static enum path_verdict share_path_verdict(const char *resolved, mode_t mode, uid_t owner,
+                                            const char *owner_home) {
+    if (!S_ISDIR(mode)) return PATH_NOT_DIRECTORY;
+    if (!under_root(resolved, "/Users/") && !under_root(resolved, "/Volumes/"))
+        return PATH_OUTSIDE_ROOTS;
+    /* Rule 4 is about *being* a home directory, not about depth: `/Users/Shared`
+     * and `/Volumes/Backup` are one level down and legitimate. */
+    if (owner_home != NULL && strcmp(resolved, owner_home) == 0) return PATH_HOME_ROOT;
+    if (owner < FIRST_PERSON_UID) return PATH_SYSTEM_OWNED;
+    return PATH_OK;
+}
+
+struct path_report {
+    enum path_verdict verdict;
+    char resolved[PATH_MAX];
+    struct stat st;
+    char owner[64];
+    int has_acl;
+};
+
+/* Gathers the facts and applies the policy. Returns -1 for a request that is
+ * not a path at all and 0 otherwise, with the answer in `verdict`.
+ *
+ * **Anything `realpath` cannot resolve is `not-found`.** As root the only
+ * plausible failures are a missing component and a symlink loop, and both mean
+ * there is no folder to share; a finer answer would be a finer probe. */
+static int inspect_path(const char *path, struct path_report *out) {
+    memset(out, 0, sizeof *out);
+    if (path[0] != '/') return -1;
+    if (realpath(path, out->resolved) == NULL || stat(out->resolved, &out->st) != 0) {
+        out->resolved[0] = '\0';
+        out->verdict = PATH_NOT_FOUND;
+        return 0;
+    }
+
+    struct passwd *pw = getpwuid(out->st.st_uid);
+    char home[PATH_MAX];
+    const char *owner_home = NULL;
+    if (pw != NULL) {
+        snprintf(out->owner, sizeof out->owner, "%s", pw->pw_name);
+        /* Resolved too, or a home reached through a symlink would compare
+         * unequal to itself and rule 4 would wave it through. */
+        owner_home = realpath(pw->pw_dir, home) != NULL ? home : pw->pw_dir;
+    } else {
+        snprintf(out->owner, sizeof out->owner, "%u", (unsigned)out->st.st_uid);
+    }
+
+    /* Reported so the daemon can say "unknown" instead of computing a wrong
+     * answer from mode bits alone: on macOS access is granted with `chmod +a`
+     * (the account spike's step 5), so an ACL is the normal case and the mode is
+     * not the whole story. Whether it is read is the daemon's business; the
+     * helper does not interpret ACEs. */
+    acl_t acl = acl_get_link_np(out->resolved, ACL_TYPE_EXTENDED);
+    if (acl != NULL) {
+        acl_entry_t entry;
+        out->has_acl = acl_get_entry(acl, ACL_FIRST_ENTRY, &entry) == 0;
+        acl_free(acl);
+    }
+
+    out->verdict = share_path_verdict(out->resolved, out->st.st_mode, out->st.st_uid, owner_home);
+    return 0;
+}
+
+/* The same characters `config/schema.py` refuses in a served share name, plus
+ * printable ASCII only (already enforced for every argument by `copy_token`).
+ * Checked again here because the daemon is not trusted to have checked, and a
+ * `/` would change which directory-service record `dscl` is asked about. */
+static int share_name_ok(const char *name) {
+    size_t len = strlen(name);
+    if (len == 0 || len > SHARE_NAME_MAX) return 0;
+    if (name[0] == ' ' || name[len - 1] == ' ') return 0;
+    return strpbrk(name, "\t/\\[]:;\"'`$%") == NULL;
+}
+
+static int sharepoint_exists(const char *name) {
+    char record[SHARE_NAME_MAX + 16];
+    snprintf(record, sizeof record, "/SharePoints/%s", name);
+    char *const argv[] = {(char *)DSCL, ".", "-read", record, "RecordName", NULL};
+    return run_quiet(argv) == 0;
+}
+
+/* Whether SMBPal published `name`. Line by line and exact, so `Media` does not
+ * match `Media 2`. */
+static int ledger_contains(const char *name) {
+    char line[SHARE_NAME_MAX + 2];
+    FILE *fh = fopen(SHAREPOINTS_FILE, "r");
+    int found = 0;
+    if (fh == NULL) return 0;
+    while (!found && fgets(line, sizeof line, fh) != NULL) {
+        line[strcspn(line, "\n")] = '\0';
+        found = strcmp(line, name) == 0;
+    }
+    fclose(fh);
+    return found;
+}
+
+static int ledger_add(const char *name) {
+    if (mkdir(STATE_DIR, 0755) != 0 && errno != EEXIST) return -1;
+    FILE *fh = fopen(SHAREPOINTS_FILE, "a");
+    if (fh == NULL) return -1;
+    int ok = fprintf(fh, "%s\n", name) > 0;
+    ok = (fclose(fh) == 0) && ok;
+    chmod(SHAREPOINTS_FILE, 0644);
+    return ok ? 0 : -1;
+}
+
+/* Rewritten through a temporary file and `rename`, so an interrupted removal
+ * leaves the old list rather than half of it -- and half a list is a share
+ * SMBPal published and then forgot, which uninstall would never remove. */
+static int ledger_remove(const char *name) {
+    char line[SHARE_NAME_MAX + 2];
+    FILE *in = fopen(SHAREPOINTS_FILE, "r");
+    if (in == NULL) return errno == ENOENT ? 0 : -1;
+    FILE *out = fopen(SHAREPOINTS_FILE ".new", "w");
+    if (out == NULL) {
+        fclose(in);
+        return -1;
+    }
+    int ok = 1;
+    while (fgets(line, sizeof line, in) != NULL) {
+        char bare[sizeof line];
+        snprintf(bare, sizeof bare, "%s", line);
+        bare[strcspn(bare, "\n")] = '\0';
+        if (strcmp(bare, name) == 0) continue;
+        if (fputs(line, out) < 0) ok = 0;
+    }
+    fclose(in);
+    ok = (fclose(out) == 0) && ok;
+    if (!ok) {
+        unlink(SHAREPOINTS_FILE ".new");
+        return -1;
+    }
+    chmod(SHAREPOINTS_FILE ".new", 0644);
+    return rename(SHAREPOINTS_FILE ".new", SHAREPOINTS_FILE);
+}
+
+/* `sharing -r`, then read the effect back rather than trusting the exit code
+ * (§4's rule). A record that was already gone -- removed by hand in the
+ * Sharing pane -- counts as removed, because what was asked for is true. */
+static int sharepoint_remove(const char *name) {
+    char *const argv[] = {(char *)SHARING, "-r", (char *)name, NULL};
+    run_quiet(argv);
+    return sharepoint_exists(name) ? -1 : 0;
+}
+
 /* Removes what the install recorded and nothing else -- §10.6. The order is
  * §4's, learned on 11 October 2026: an ACE outlives the account it names and
  * orphans to a raw UUID, and ownership does the same, so files go before the
@@ -799,6 +1007,26 @@ static int uninstall(void) {
     unlink(DAEMON_LOG);
     rmdir(LOG_DIR);
     printf("removed " LOG_DIR " and its log; " HELPER_LOG " is left for launchd\n");
+
+    /* Sharepoints before identities. They name folders rather than accounts,
+     * but a share that outlives SMBPal is the most visible thing it could
+     * leave -- it is on the network -- and §6's guarantee is that only what
+     * SMBPal published goes. The list is kept if anything would not go, so a
+     * second uninstall still knows what to try. */
+    FILE *published = fopen(SHAREPOINTS_FILE, "r");
+    if (published != NULL) {
+        char line[SHARE_NAME_MAX + 2];
+        int stuck = 0;
+        while (fgets(line, sizeof line, published) != NULL) {
+            line[strcspn(line, "\n")] = '\0';
+            if (!share_name_ok(line)) continue;
+            int gone = sharepoint_remove(line) == 0;
+            printf("%s sharepoint %s\n", gone ? "removed" : "COULD NOT REMOVE", line);
+            if (!gone) stuck = 1;
+        }
+        fclose(published);
+        if (!stuck) unlink(SHAREPOINTS_FILE);
+    }
 
     if ((fh = fopen(CREATED_FILE, "r")) == NULL) {
         printf("nothing recorded as created; left the identities alone\n");
@@ -981,8 +1209,11 @@ static int parse_frame(char *buf, struct request *req) {
     return 0;
 }
 
-/* The whole vocabulary. Two verbs: one read that must not be authorised, and
- * one authorisation that reads nothing. */
+/* The whole vocabulary. Three reads that must not be authorised (`share.list`,
+ * `path.inspect`, `share.owned`), one authorisation that reads nothing
+ * (`auth.check`), and two mutations that verify their own grant
+ * (`share.publish`, `share.unpublish`) rather than trusting that the daemon
+ * asked `auth.check` first. */
 static void serve_one(int conn) {
     char buf[REQUEST_MAX + 1];
     struct request req;
@@ -1064,6 +1295,155 @@ static void serve_one(int conn) {
             respond_err(conn, "denied");
             return;
         }
+        respond(conn, "OK\n");
+        return;
+    }
+
+    if (strcmp(req.verb, "path.inspect") == 0) {
+        /* §15: the daemon cannot `stat` inside a home directory, so it asks.
+         * A read, so a form is refused exactly as `share.list` refuses one.
+         *
+         * **What this discloses, stated rather than implied.** It answers for
+         * any absolute path, so the daemon learns whether a folder exists
+         * inside somebody else's home, and its owner and mode. That is the
+         * whole of what `ls -ld` shows, it is the minimum `status` needs to
+         * say why a share is read-only, and a replaced daemon gains no write
+         * from it. Requiring a grant would put a password prompt in front of
+         * every `smbpal status`. */
+        struct path_report report;
+        if (req.has_auth || req.argc != 1 || inspect_path(req.args[0], &report) != 0) {
+            respond_err(conn, "args");
+            return;
+        }
+        if (strpbrk(report.resolved, "\n\r") != NULL) {
+            /* A symlink can resolve to a name containing a newline, and the
+             * payload is lines: it would forge a field. Refused rather than
+             * escaped, because nobody shares such a folder on purpose. */
+            respond_err(conn, "path");
+            return;
+        }
+        static char out[PATH_MAX + 256];
+        int n;
+        if (report.verdict == PATH_NOT_FOUND)
+            n = snprintf(out, sizeof out, "OK\nverdict %s\n", PATH_VERDICTS[report.verdict]);
+        else
+            n = snprintf(out, sizeof out,
+                         "OK\nverdict %s\nresolved %s\nuid %u\ngid %u\nmode %04o\n"
+                         "owner %s\nacl %d\n",
+                         PATH_VERDICTS[report.verdict], report.resolved,
+                         (unsigned)report.st.st_uid, (unsigned)report.st.st_gid,
+                         (unsigned)(report.st.st_mode & 07777), report.owner,
+                         report.has_acl);
+        if (n < 0 || (size_t)n >= sizeof out) {
+            respond_err(conn, "path");
+            return;
+        }
+        respond(conn, out);
+        return;
+    }
+
+    if (strcmp(req.verb, "share.owned") == 0) {
+        /* The record names SMBPal published, so the daemon can tell its own
+         * sharepoints from somebody else's -- §6's guarantee is "every record
+         * we did not create is unchanged", and that needs a list of the ones
+         * we did. A read: no form, no arguments. */
+        if (req.has_auth || req.argc != 0) {
+            respond_err(conn, "args");
+            return;
+        }
+        respond(conn, "OK\n");
+        FILE *fh = fopen(SHAREPOINTS_FILE, "r");
+        if (fh == NULL) return; /* nothing published yet is an empty answer */
+        char line[SHARE_NAME_MAX + 2];
+        while (fgets(line, sizeof line, fh) != NULL) respond(conn, line);
+        fclose(fh);
+        return;
+    }
+
+    if (strcmp(req.verb, "share.publish") == 0) {
+        /* ARG <name>, ARG <path>. The shape is checked before the grant and
+         * the path after it: the first is structural, the second is a
+         * privileged look at the filesystem and is not given away to a request
+         * that has not shown it may change anything. */
+        struct path_report report;
+        const char *name = req.args[0];
+        if (!req.has_auth || req.argc != 2 || !share_name_ok(name)) {
+            respond_err(conn, "args");
+            return;
+        }
+        if (verify_form(MANAGE_SHARES_RIGHT, &req.auth) != 0) {
+            respond_err(conn, "denied");
+            return;
+        }
+        if (inspect_path(req.args[1], &report) != 0) {
+            respond_err(conn, "args");
+            return;
+        }
+        if (report.verdict != PATH_OK) {
+            /* §13's job is the blast radius of a piggybacked grant: the person
+             * consented to "change the folders this computer shares", and a
+             * replaced daemon may have changed *which*. */
+            respond_err(conn, PATH_VERDICTS[report.verdict]);
+            return;
+        }
+        if (sharepoint_exists(name)) {
+            /* Never replaced, whoever made it. Ours means the daemon's view is
+             * stale; somebody else's is not ours to touch. */
+            respond_err(conn, ledger_contains(name) ? "published" : "exists");
+            return;
+        }
+        /* §13 rule 6: guest access is not an argument, so `-g 000` is not
+         * either -- a redirected intent can choose the folder and still cannot
+         * expose it to guests. The resolved path is what is passed (rule 1),
+         * which leaves the TOCTOU window §13 records rather than contorts
+         * around: `sharing` takes a path, not a descriptor. */
+        char *const argv[] = {(char *)SHARING, "-a", report.resolved, "-n", (char *)name,
+                              "-S", (char *)name, "-s", "001", "-g", "000", NULL};
+        run_quiet(argv);
+        if (!sharepoint_exists(name)) {
+            respond_err(conn, "sharing");
+            return;
+        }
+        if (ledger_add(name) != 0) {
+            /* A sharepoint SMBPal cannot remember publishing is one uninstall
+             * would leave behind, so it does not get to stay. */
+            sharepoint_remove(name);
+            respond_err(conn, "ledger");
+            return;
+        }
+        fprintf(stderr, "smbpal-helper: published %s at %s\n", name, report.resolved);
+        respond(conn, "OK\n");
+        return;
+    }
+
+    if (strcmp(req.verb, "share.unpublish") == 0) {
+        const char *name = req.args[0];
+        if (!req.has_auth || req.argc != 1 || !share_name_ok(name)) {
+            respond_err(conn, "args");
+            return;
+        }
+        if (verify_form(MANAGE_SHARES_RIGHT, &req.auth) != 0) {
+            respond_err(conn, "denied");
+            return;
+        }
+        if (!ledger_contains(name)) {
+            /* The guard that makes a piggybacked grant unable to unshare the
+             * person's own folders: only what this helper published can go. */
+            respond_err(conn, "not-ours");
+            return;
+        }
+        if (sharepoint_remove(name) != 0) {
+            respond_err(conn, "sharing");
+            return;
+        }
+        /* Gone but still listed is harmless -- the next unpublish finds no
+         * record, counts it removed and tries the list again -- so this is an
+         * error for the log, not a share left behind. */
+        if (ledger_remove(name) != 0) {
+            respond_err(conn, "ledger");
+            return;
+        }
+        fprintf(stderr, "smbpal-helper: unpublished %s\n", name);
         respond(conn, "OK\n");
         return;
     }

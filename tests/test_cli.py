@@ -869,6 +869,17 @@ class TestSambaNotRunningNotes(unittest.TestCase):
         self.assertIn("not installed", note)
         self.assertNotIn("systemctl", note)
 
+    def test_macos_file_sharing_off_says_where_the_switch_is_and_what_else_it_serves(
+        self,
+    ) -> None:
+        note = self.notes({"unit": "com.apple.smbd", "active": False, "installed": True})
+        self.assertIn("File Sharing is off", note)
+        self.assertIn("System Settings", note)
+        self.assertIn("every shared folder on this Mac", note)
+        # Never the route that breaks the server (account spike §1).
+        self.assertNotIn("launchctl", note)
+        self.assertNotIn("systemctl", note)
+
     def test_a_running_samba_says_nothing(self) -> None:
         self.assertEqual(
             self.notes({"unit": "smb.service", "active": True}), ""

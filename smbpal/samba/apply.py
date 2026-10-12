@@ -133,7 +133,11 @@ class Applier:
 
     # --- applying ----------------------------------------------------------
 
-    def apply(self, config: dict[str, Any]) -> ApplyReport:
+    def apply(self, config: dict[str, Any], *, grant: bytes | None = None) -> ApplyReport:
+        # `grant` is the macOS applier's: there the helper verifies the
+        # request's authorisation itself. Here the daemon is root and polkit
+        # has already answered, so it is accepted and unused.
+        del grant
         planned = self.plan(config)
         self._create_missing_directories(planned)
         planned = self.plan(config)  # re-read: creation changed the answers
@@ -159,7 +163,7 @@ class Applier:
         )
         return report
 
-    def teardown(self) -> dict[str, Any]:
+    def teardown(self, *, grant: bytes | None = None) -> dict[str, Any]:
         """Undo everything outside the config. §6's reversibility claim.
 
         `smb.conf` comes back byte-identical because the block is removed as a
@@ -188,11 +192,26 @@ class Applier:
             # Nothing left to serve either way; a Samba that will not reload is
             # worth reporting but not worth failing an uninstall over.
             log.warning("could not reload Samba after teardown: %s", exc.message)
+        del grant  # see apply
         return {
             "smb_conf": str(self.smb_conf),
             "include_removed": include_removed,
             "smbpal_conf_removed": smbpal_conf_removed,
         }
+
+    # --- what the dispatcher asks of any applier ---------------------------
+    #
+    # Methods rather than the dispatcher calling `control` itself, because the
+    # macOS applier answers the same three questions from sharepoints instead.
+
+    def effective_shares(self) -> dict[str, str]:
+        return control.effective_shares(runner=self.runner)
+
+    def unmanaged_shares(self, configured: list[str]) -> dict[str, str]:
+        return control.unmanaged_shares(configured, runner=self.runner)
+
+    def service_state(self) -> dict[str, object]:
+        return control.service_state(runner=self.runner)
 
     # --- pieces ------------------------------------------------------------
 

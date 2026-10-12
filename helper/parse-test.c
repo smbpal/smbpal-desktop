@@ -65,6 +65,27 @@ static void expect_hex(const char *name, const char *text, size_t len, int want_
     }
 }
 
+/* §13's rules 2-5. The facts are handed in, so no case needs root, a real home
+ * directory or a mounted volume -- and rule 1 is `realpath`, which is the
+ * caller's half and is not re-tested here. */
+static void expect_verdict(const char *name, const char *resolved, mode_t mode, uid_t owner,
+                           const char *home, enum path_verdict want) {
+    ran++;
+    enum path_verdict got = share_path_verdict(resolved, mode, owner, home);
+    if (got != want) {
+        printf("FAIL %s: %s, wanted %s\n", name, PATH_VERDICTS[got], PATH_VERDICTS[want]);
+        failures++;
+    }
+}
+
+static void expect_name(const char *name, const char *candidate, int want_ok) {
+    ran++;
+    if (share_name_ok(candidate) != want_ok) {
+        printf("FAIL %s: share name %s\n", name, want_ok ? "rejected" : "accepted");
+        failures++;
+    }
+}
+
 int main(void) {
     const char *form64 =
         "0011223344556677889900aabbccddeeff00112233445566778899aabbccddee";
@@ -109,6 +130,39 @@ int main(void) {
     expect_hex("odd length", "ABC", 2, 0);
     expect_hex("too long", "AABBCC", 2, 0);
     expect_hex("empty for a non-zero length", "", 2, 0);
+
+    const mode_t dir = S_IFDIR | 0755;
+    expect_verdict("a folder in a home", "/Users/luke/Documents", dir, 501, "/Users/luke", PATH_OK);
+    expect_verdict("a folder on a volume", "/Volumes/Backup", dir, 501, "/Users/luke", PATH_OK);
+    expect_verdict("a file", "/Users/luke/notes.txt", S_IFREG | 0644, 501, "/Users/luke",
+                   PATH_NOT_DIRECTORY);
+    expect_verdict("the system volume, resolved", "/", dir, 0, "/var/root", PATH_OUTSIDE_ROOTS);
+    expect_verdict("/etc", "/private/etc", dir, 0, "/var/root", PATH_OUTSIDE_ROOTS);
+    expect_verdict("/Users itself", "/Users/", dir, 0, "/var/root", PATH_OUTSIDE_ROOTS);
+    expect_verdict("a prefix that is not a root", "/Usersfoo/x", dir, 501, "/Users/luke",
+                   PATH_OUTSIDE_ROOTS);
+    expect_verdict("a whole home", "/Users/luke", S_IFDIR | 0750, 501, "/Users/luke",
+                   PATH_HOME_ROOT);
+    expect_verdict("somebody else's whole home", "/Users/alice", S_IFDIR | 0750, 502,
+                   "/Users/alice", PATH_HOME_ROOT);
+    expect_verdict("/Users/Shared is root's", "/Users/Shared", S_IFDIR | 01777, 0, "/var/root",
+                   PATH_SYSTEM_OWNED);
+    expect_verdict("a role account's folder", "/Volumes/Backup/x", dir, 451, "/var/empty",
+                   PATH_SYSTEM_OWNED);
+    expect_verdict("no passwd entry for the owner", "/Volumes/Backup", dir, 501, NULL, PATH_OK);
+
+    expect_name("plain", "Media", 1);
+    expect_name("spaces inside", "Family Photos", 1);
+    expect_name("dash and dot", "my-share.v2", 1);
+    expect_name("empty", "", 0);
+    expect_name("leading space", " Media", 0);
+    expect_name("trailing space", "Media ", 0);
+    expect_name("slash would pick another record", "a/b", 0);
+    expect_name("apostrophe, as schema.py refuses", "Luke's", 0);
+    expect_name("dollar", "admin$", 0);
+    expect_name("eighty", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1);
+    expect_name("eighty-one",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0);
 
     printf("%d cases, %d failures\n", ran, failures);
     return failures == 0 ? 0 : 1;

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import socket
+from dataclasses import dataclass
 from typing import Any
 
 from smbpal.errors import SmbpalError
@@ -41,8 +42,80 @@ SOCKET_PATH = "/var/run/smbpal/helper.sock"
 DEFAULT_TIMEOUT = 10.0
 
 
+# §13's verdicts, in the helper's order. They are also the error tokens
+# `share.publish` refuses with, so a refusal can be explained in the same words
+# as an inspection. A test reads `PATH_VERDICTS` out of the C.
+PATH_VERDICTS = (
+    "ok",
+    "not-found",
+    "not-directory",
+    "outside-roots",
+    "home-root",
+    "system-owned",
+)
+
+
 class HelperError(SmbpalError):
     """The helper did not answer `OK`. The caller's correct response is to stop."""
+
+    def __init__(
+        self, message: str, *, detail: str | None = None, token: str | None = None
+    ) -> None:
+        super().__init__(message, detail=detail)
+        # The helper's own word for the refusal, when it gave one. Kept apart
+        # from `detail` so a caller can branch on it without parsing prose.
+        self.token = token
+
+
+@dataclass(frozen=True)
+class PathFacts:
+    """What `path.inspect` reports. Everything but `verdict` is None when the
+    path does not resolve, because the helper says nothing more about it."""
+
+    verdict: str
+    resolved: str | None = None
+    uid: int | None = None
+    gid: int | None = None
+    mode: int | None = None
+    owner: str | None = None
+    has_acl: bool = False
+
+    @property
+    def exists(self) -> bool:
+        return self.verdict != "not-found"
+
+
+def parse_path_facts(payload: bytes) -> PathFacts:
+    """Read `path.inspect`'s `key value` lines, refusing anything surprising.
+
+    **A key said twice is a malformed answer, not a correction.** The helper
+    refuses to describe a path containing a newline precisely so that a field
+    cannot be forged; accepting the last of two `verdict` lines here would hand
+    that forgery back.
+    """
+    fields: dict[str, str] = {}
+    for line in payload.decode("utf-8", errors="strict").splitlines():
+        key, sep, value = line.partition(" ")
+        if not sep or key in fields:
+            raise HelperError("the helper's path.inspect answer is malformed")
+        fields[key] = value
+    verdict = fields.get("verdict")
+    if verdict not in PATH_VERDICTS:
+        raise HelperError("the helper's path.inspect answer has no known verdict")
+    if verdict == "not-found":
+        return PathFacts(verdict=verdict)
+    try:
+        return PathFacts(
+            verdict=verdict,
+            resolved=fields["resolved"],
+            uid=int(fields["uid"]),
+            gid=int(fields["gid"]),
+            mode=int(fields["mode"], 8),
+            owner=fields["owner"],
+            has_acl=fields["acl"] == "1",
+        )
+    except (KeyError, ValueError) as exc:
+        raise HelperError("the helper's path.inspect answer is malformed") from exc
 
 
 class Helper:
@@ -143,9 +216,8 @@ class Helper:
         if status.startswith(b"ERR "):
             # The token is the helper's whole vocabulary of failure and is not
             # an echo of the request, so it is safe to pass on verbatim.
-            raise HelperError(
-                f"the helper refused {verb}", detail=status[4:].decode(errors="replace")
-            )
+            token = status[4:].decode(errors="replace")
+            raise HelperError(f"the helper refused {verb}", detail=token, token=token)
         raise HelperError(
             f"the helper answered {verb} with something unrecognised",
             detail=f"{answer[:40]!r}",
@@ -173,3 +245,21 @@ class Helper:
     def share_list(self) -> bytes:
         """`sharing -l -f json`, as JSON bytes. No authorisation: it is a read."""
         return self.call("share.list")
+
+    def path_inspect(self, path: str) -> PathFacts:
+        """§15: the daemon cannot `stat` inside a home directory, so it asks."""
+        return parse_path_facts(self.call("path.inspect", path))
+
+    def share_owned(self) -> list[str]:
+        """The sharepoint record names SMBPal published, from the helper's list."""
+        return [
+            line for line in self.call("share.owned").decode("utf-8").splitlines() if line
+        ]
+
+    def share_publish(self, name: str, path: str, *, auth: bytes) -> None:
+        """`sharing -a`, with §13 applied at the far end. Raises on any refusal."""
+        self.call("share.publish", name, path, auth=auth)
+
+    def share_unpublish(self, name: str, *, auth: bytes) -> None:
+        """`sharing -r`, for a record the helper published and nothing else."""
+        self.call("share.unpublish", name, auth=auth)

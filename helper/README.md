@@ -21,7 +21,7 @@ performs whatever it is asked is a root-escalation service with a socket on it.*
 Spike §9 sets three rules and they are requirements, not preferences:
 
 1. **A fixed vocabulary of verbs.** No pass-through exec, no caller-supplied
-   command. Two verbs now, and arguments are validated at the point of parsing.
+   command. Six verbs now, and arguments are validated at the point of parsing.
 2. **Arguments validated against what the helper owns**, never relayed.
 3. **Never a shell.** `execv` with a vector the helper built itself.
 
@@ -37,6 +37,10 @@ properties of the code and the running process needs root to reach.
 | peer check | `getpeereid`, refusing any uid but the service account's — defence in depth behind the `0600`, not instead of it |
 | `share.list` | runs `sharing -l -f json`. Read-only on purpose: the first verb should have nothing to undo. **Refuses a request that carries a grant** — a read needs none, so one that offers it is confused about what it is asking |
 | `auth.check <right>` | verifies an `AuthorizationExternalForm` against a registered right. What every later mutation will call, and the daemon's way of asking about its own config writes |
+| `path.inspect <path>` | `realpath` and `stat` as root, with spike §13's verdict (`ok`, `not-found`, `not-directory`, `outside-roots`, `home-root`, `system-owned`) and the owner, mode and whether an ACL is present. The daemon cannot `stat` inside a home directory (spike §15), so it asks. A read: refuses a grant |
+| `share.owned` | the sharepoint record names this helper published, from `/var/db/smbpal/sharepoints`. How the daemon tells its own sharepoints from somebody else's. A read: refuses a grant |
+| `share.publish <name> <path>` | verifies its own grant for `app.smbpal.manage-shares`, applies §13 to the resolved path, refuses a name that already exists, then `sharing -a <resolved> -n <name> -S <name> -s 001 -g 000` and reads the record back. Guest access is not an argument |
+| `share.unpublish <name>` | verifies its own grant, refuses any record it did not publish, `sharing -r`, and reads the absence back |
 | `verify <right>` | the same evaluation as a subcommand, form on stdin. How §12.2 was measured |
 | `rights install\|remove` | registers or removes the rights. Separate from `install`, which refuses to run twice: accounts and jobs are the half with state to get wrong, and the rights have none |
 
@@ -164,10 +168,11 @@ raw UUID. `/etc/smbpal` and its contents are left alone and it says so.
 - **Identity creation.** The install scans 450–499, creates the pair, reads back
   what it landed on and records it. The recipe is the account spike's §4 minus
   the `SMB-NT` step; no number is compiled in anywhere.
-- **The mutating verbs**, sharepoints and the SMB-NT account. The framing is
-  here and the path policy is decided (spike §13), but `samba/apply.py` is Samba
-  top to bottom, so there is no macOS `apply` for them to belong to yet. That is
-  the next piece, and it is larger than the protocol was.
+- **Access and accounts.** Sharepoints are published (`smbpal/sharepoints/`),
+  but `chmod +a` and the `SMB-NT` account — the account spike's steps 1–5 — are
+  not verbs yet, so a share is served with the folder's existing permissions to
+  whoever can already sign in over SMB. Read-only shares are refused until
+  `smb_read_only` is measured.
 - **The socket's own behaviour under test.** Binding, the `0600` ownership and
   the peer check need root and a `smbpal` group, so they are a runbook step
   rather than an assertion. Overridable paths would have made them testable and
