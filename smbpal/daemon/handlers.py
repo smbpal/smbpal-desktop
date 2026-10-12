@@ -349,6 +349,13 @@ class Dispatcher:
                         "see `smbpal browse` and `smbpal connection add`."
                     ),
                 )
+            # **A request that cannot succeed, before permission**, for the
+            # same reason again: an administrator password typed for a share
+            # served as an account that does not exist is a prompt answered
+            # for nothing.
+            precheck = _PRECHECKS.get(request.method)
+            if precheck is not None:
+                precheck(request)
             self.authoriser.check(connection.peer, request.method, request.auth)
             result = method(self, request, connection.peer)
             return encode_success(request.id, result)
@@ -1411,6 +1418,43 @@ def _optional_bool(params: dict[str, Any], key: str, *, default: bool) -> bool:
     if not isinstance(value, bool):
         raise InvalidParams(f"'{key}' must be true or false when present")
     return value
+
+
+def _require_account(request: Request) -> None:
+    """A share's account must exist when the share is added.
+
+    §3b serves a share as an existing account. Measured on a Mac, 12 October
+    2026: `share add … --user OTHER` was accepted with no `OTHER` on the
+    machine, and `status` then showed the share `serving` with no note --
+    writability and sign-in are both "unknown" without an account to ask
+    about, and unknown says nothing. Only `make-writable` noticed, sideways.
+    Linux had the same gap: `valid users = OTHER` serves nobody, silently.
+
+    Existence only. Which accounts may be *granted* is the macOS helper's
+    rule, applied where it grants; refusing root here would be a Linux
+    behaviour change nobody asked for.
+    """
+    user = _optional_str(request.params, "credential_ref")
+    if not user:
+        return
+    try:
+        pwd.getpwnam(user)
+    except KeyError:
+        raise NotFound(
+            f"there is no account called {user!r} on this machine",
+            detail=(
+                "A share is served as an existing account (§3b). Check the name "
+                f"with `id {user}`, or add the share without --user."
+            ),
+        ) from None
+
+
+# Checks that need no permission to answer, run before authorisation so a
+# request that cannot succeed is refused before anybody is asked for a
+# password. Each must only read: they run for callers who may not mutate.
+_PRECHECKS = {
+    "share.add": _require_account,
+}
 
 
 _METHODS: dict[str, Method] = {
