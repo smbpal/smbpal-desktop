@@ -1038,3 +1038,17 @@ class TestSetupSaysWhatIsLeftToDoByHand(unittest.TestCase):
             code, out = self.run_setup()
         self.assertEqual(code, 1)
         self.assertIn("not on PATH", out)
+
+
+class TestTheHelperInstallLine(unittest.TestCase):
+    def test_setup_installs_the_helper_onto_a_new_inode(self) -> None:
+        """Without `-S` an upgrade wrote over the running helper's inode and the
+        kernel killed the new one at launch (OS_REASON_CODESIGNING), leaving
+        every grant check failing. 12 October 2026."""
+        import inspect
+
+        from smbpal.cli import main
+
+        source = inspect.getsource(main)
+        self.assertIn("sudo install -S -o root -g wheel -m 755", source)
+        self.assertNotIn("sudo install -o root -g wheel -m 755", source)

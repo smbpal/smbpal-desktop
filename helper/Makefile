@@ -21,10 +21,13 @@ all: smbpal-helper
 smbpal-helper: smbpal-helper.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
-# Root-owned storage, which is the whole point: see the spike's §0.
+# Root-owned storage, which is the whole point: see the spike's §0. `-S` renames
+# a temporary file into place so an upgrade gets a new inode; writing over the
+# old one got the new helper killed at launch with OS_REASON_CODESIGNING
+# (12 October 2026).
 install: smbpal-helper
 	install -d -o root -g wheel -m 755 $(LIBEXEC)
-	install -o root -g wheel -m 755 smbpal-helper $(LIBEXEC)/smbpal-helper
+	install -S -o root -g wheel -m 755 smbpal-helper $(LIBEXEC)/smbpal-helper
 
 # `-Dmain=` renames the helper's entry point so the test can have its own,
 # which is how the parser is tested without the shipped file knowing about it.

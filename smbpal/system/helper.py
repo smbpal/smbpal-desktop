@@ -237,7 +237,10 @@ class Helper:
         try:
             self.call("auth.check", right, auth=auth)
         except HelperError as exc:
-            log.info("helper refused %s: %s", right, exc)
+            # With the detail: "could not ask the helper" alone hid a helper
+            # the kernel had killed, and the errno behind it is the reading
+            # that says whether anything is listening (12 October 2026).
+            log.info("helper refused %s: %s (%s)", right, exc, exc.detail)
             return False
         return True
 

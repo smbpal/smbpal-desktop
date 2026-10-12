@@ -1123,7 +1123,12 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     print("third, which by then is a root-owned file:")
     print()
     print(f"  sudo install -d -o root -g wheel -m 755 {HELPER_INSTALLED.parent}")
-    print(f"  sudo install -o root -g wheel -m 755 {source} {HELPER_INSTALLED}")
+    # `-S`: write a temporary file and rename it, so an upgrade gets a new
+    # inode. Measured 12 October 2026: installing over the running helper
+    # without it left a binary that was valid on disk and was killed at launch
+    # with OS_REASON_CODESIGNING -- the kernel's cached signature for the old
+    # inode -- so the helper stayed down and every grant check failed.
+    print(f"  sudo install -S -o root -g wheel -m 755 {source} {HELPER_INSTALLED}")
     print(f"  sudo {HELPER_INSTALLED} install --daemon {smbpald}")
     print()
     print("The last one names the uid and gid it chose. It prefers 450 and takes")

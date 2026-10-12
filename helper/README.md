@@ -109,7 +109,7 @@ it. On macOS it reports what is installed and then names three commands:
 
 ```sh
 sudo install -d -o root -g wheel -m 755 /usr/local/libexec/smbpal
-sudo install -o root -g wheel -m 755 <built helper> /usr/local/libexec/smbpal/smbpal-helper
+sudo install -S -o root -g wheel -m 755 <built helper> /usr/local/libexec/smbpal/smbpal-helper
 sudo /usr/local/libexec/smbpal/smbpal-helper install --daemon <path to smbpald>
 ```
 
