@@ -305,3 +305,33 @@ class TestWhatTheDispatcherLeavesAlone(DispatcherCase):
             {"shares": [share("Docs", f"{HOME}/Documents")]}
         )
         self.assertIn("not running", planned.reason or "")
+
+
+class TestTheDaemonChoosesTheApplier(unittest.TestCase):
+    """The startup decision, run rather than reached. Its first build died on a
+    Mac with a `NameError` that no test executed."""
+
+    def test_macos_auto_serves_through_sharepoints(self) -> None:
+        from smbpal.daemon.main import choose_applier
+        from smbpal.samba.apply import Applier
+
+        self.assertIsInstance(choose_applier(Applier(), "auto", "darwin"), SharepointApplier)
+
+    def test_linux_keeps_samba(self) -> None:
+        from smbpal.daemon.main import choose_applier
+        from smbpal.samba.apply import Applier
+
+        samba = Applier()
+        self.assertIs(choose_applier(samba, "auto", "linux"), samba)
+
+    def test_yes_keeps_samba_on_a_mac_for_development(self) -> None:
+        from smbpal.daemon.main import choose_applier
+        from smbpal.samba.apply import Applier
+
+        samba = Applier()
+        self.assertIs(choose_applier(samba, "yes", "darwin"), samba)
+
+    def test_no_apply_stays_config_only(self) -> None:
+        from smbpal.daemon.main import choose_applier
+
+        self.assertIsNone(choose_applier(None, "auto", "darwin"))

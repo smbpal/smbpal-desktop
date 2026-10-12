@@ -29,6 +29,7 @@ from smbpal.mounts.credentials import DEFAULT_CREDENTIALS_DIR, CredentialsStore
 from smbpal.mounts.systemd import DEFAULT_UNIT_DIR
 from smbpal.ipc.protocol import encode_event
 from smbpal.samba.apply import DEFAULT_SMB_CONF, DEFAULT_SMBPAL_CONF, Applier
+from smbpal.sharepoints import SharepointApplier
 from smbpal.state.monitor import DEFAULT_INTERVAL, StateMonitor
 from smbpal.ipc.server import (
     DEFAULT_SOCKET_GROUP,
@@ -256,8 +257,8 @@ def main(argv: list[str] | None = None) -> int:
     # spike §9, §15). `yes` keeps Samba, which is for development on a Mac
     # that has it.
     serving = args.serve_shares != "no"
-    if applier is not None and args.serve_shares == "auto" and sys.platform == "darwin":
-        applier = SharepointApplier()
+    applier = choose_applier(applier, args.serve_shares, sys.platform)
+    if isinstance(applier, SharepointApplier):
         log.info(
             "serving folders as macOS sharepoints through the privileged helper; "
             "File Sharing must be on in System Settings for them to be reachable"
@@ -302,6 +303,21 @@ def main(argv: list[str] | None = None) -> int:
             monitor.stop()
         transport.shutdown()
     return 0
+
+
+def choose_applier(
+    samba: Applier | None, serve_shares: str, platform: str
+) -> Applier | SharepointApplier | None:
+    """The applier this daemon serves through, decided in one place.
+
+    A function so the decision is tested rather than only reached at startup:
+    the first build of the macOS branch here referenced `SharepointApplier`
+    without importing it, every test passed, and the daemon died on its first
+    start on a Mac with a `NameError` -- because no test ran this line.
+    """
+    if samba is not None and serve_shares == "auto" and platform == "darwin":
+        return SharepointApplier()
+    return samba
 
 
 def _configure_logging(level: str) -> None:

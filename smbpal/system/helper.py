@@ -27,7 +27,6 @@ from __future__ import annotations
 import logging
 import socket
 from dataclasses import dataclass
-from typing import Any
 
 from smbpal.errors import SmbpalError
 
