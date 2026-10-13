@@ -10,7 +10,7 @@
 # no second removal step.
 
 Name:           smbpal
-Version:        0.2.12
+Version:        0.2.13
 Release:        1%{?dist}
 Summary:        Share folders over SMB, and connect to shares on other machines
 
@@ -261,6 +261,12 @@ fi
 %{_datadir}/icons/hicolor/scalable/status/smbpal-attention.svg
 
 %changelog
+* Tue Oct 13 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.13-1
+- macOS: upgrading the helper works in one step. `make -C helper && sudo make
+  -C helper install` now waits for launchd to finish with the old helper
+  before starting the new one, instead of failing with "Bootstrap failed: 5:
+  Input/output error" and leaving no helper running. The install also no
+  longer builds as root: it asks you to build first, as yourself.
 * Tue Oct 13 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.12-1
 - macOS: sharing your own folders works. `smbpal share add` publishes the
   folder as a macOS shared folder through the privileged helper, with guest

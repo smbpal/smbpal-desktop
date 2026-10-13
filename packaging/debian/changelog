@@ -1,3 +1,20 @@
+smbpal (0.2.13) trixie; urgency=medium
+
+  * **macOS: upgrading the helper works in one step.** 0.2.12's
+    `sudo make -C helper install` started the new helper before launchd had
+    finished with the old one, failed with `Bootstrap failed: 5: Input/output
+    error`, and left no helper running — so nothing could be shared or
+    authorised until it was started again by hand. The install now waits for
+    launchd and tries again before giving up, and says exactly what to run
+    if it still cannot.
+  * **macOS: the install no longer builds as root.** It used to compile the
+    helper inside your checkout as root, leaving a file the next ordinary
+    `make` could not replace. It now asks you to build first, as yourself:
+    `make -C helper && sudo make -C helper install`.
+  * Nothing changes on Linux.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Tue, 13 Oct 2026 22:05:00 +0100
+
 smbpal (0.2.12) trixie; urgency=medium
 
   * **macOS: sharing your own folders works.** `smbpal share add` publishes
