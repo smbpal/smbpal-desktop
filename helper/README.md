@@ -120,7 +120,15 @@ attaches a launch constraint to the job's plist that the build it was registered
 with satisfies, and a new build fails it: the helper is killed at launch with
 `OS_REASON_CODESIGNING | Launch Constraint Violation` and stays down behind its old
 socket, so every grant check fails. Bootstrapping the job again clears it (spike
-§16), and `sudo make -C helper install` does that when a job exists:
+§16). Build as yourself and install as root; the install re-registers the job,
+waiting for launchd to let go of the old one first:
+
+```sh
+make -C helper && sudo make -C helper install
+```
+
+By hand, if it ever has to be — and if `bootstrap` answers `5: Input/output
+error`, launchd has not finished with the old job yet, so run it again:
 
 ```sh
 sudo launchctl bootout system/app.smbpal.helper
