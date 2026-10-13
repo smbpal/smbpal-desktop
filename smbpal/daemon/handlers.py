@@ -35,7 +35,7 @@ from smbpal.daemon import polkit
 from smbpal.system import authorization as macos_auth
 from smbpal.mounts import inventory, systemd, units
 from smbpal.mounts.apply import Mounter
-from smbpal.samba import control, passwd
+from smbpal.samba import passwd
 from smbpal.samba.apply import Applier
 from smbpal.shares import ownership
 from smbpal.system import selinux as selinux_module
@@ -331,6 +331,14 @@ class Dispatcher:
             # existence before permission above: prompting someone for an
             # administrator password and then telling them the platform cannot
             # do it is worse than either answer on its own.
+            if request.method in getattr(self.applier, "UNSUPPORTED_METHODS", ()):
+                # An applier that serves, but not everything yet -- macOS's,
+                # which publishes sharepoints and does not yet grant access or
+                # keep SMB passwords. It names what it lacks.
+                raise NotSupported(
+                    f"{request.method} is not supported on this platform yet",
+                    detail=self.applier.UNSUPPORTED_DETAIL,
+                )
             if not self.serving and request.method in self.SERVING_METHODS:
                 raise NotSupported(
                     f"{request.method} is not supported on this platform yet",
@@ -364,7 +372,11 @@ class Dispatcher:
     # --- applying ----------------------------------------------------------
 
     def _commit(
-        self, previous: dict[str, Any], updated: dict[str, Any]
+        self,
+        previous: dict[str, Any],
+        updated: dict[str, Any],
+        *,
+        grant: bytes | None = None,
     ) -> Any:
         """Save, then apply — and undo the save if applying fails.
 
@@ -386,12 +398,24 @@ class Dispatcher:
         rather than `Exception` because this is an undo that re-raises
         immediately: nothing is swallowed, and an apply stopped by anything at
         all must not leave the file describing it as done.
+
+        `grant` is the request's authorisation, carried to the applier because
+        on macOS the helper verifies it again for each change rather than
+        trusting that the daemon asked (helper spike §9). The rollback uses it
+        too: undoing a publish is a change like any other.
         """
         self.store.save(updated)
         if self.applier is None and self.mounter is None:
             return None
+        applier = self.applier
+        if (
+            applier is not None
+            and getattr(applier, "APPLY_ONLY_WHEN_SHARES_CHANGE", False)
+            and previous.get("shares") == updated.get("shares")
+        ):
+            applier = None  # see SharepointApplier.APPLY_ONLY_WHEN_SHARES_CHANGE
         try:
-            report = self.applier.apply(updated) if self.applier else None
+            report = applier.apply(updated, grant=grant) if applier else None
             if self.mounter is not None:
                 # `previous` bounds what this change may remove. Without it a
                 # commit against a config that never mentioned the units on
@@ -402,8 +426,8 @@ class Dispatcher:
             log.warning("apply failed; rolling the config back")
             self.store.save(previous)
             try:
-                if self.applier is not None:
-                    self.applier.apply(previous)
+                if applier is not None:
+                    applier.apply(previous, grant=grant)
                 if self.mounter is not None:
                     self.mounter.apply(previous, previous=updated)
             except Exception:
@@ -489,7 +513,7 @@ class Dispatcher:
         if self.applier is None:
             return {"unit": None, "active": False, "installed": False}
         try:
-            return control.service_state(runner=self.applier.runner)
+            return self.applier.service_state()
         except SmbpalError:
             # Asking failed, which is not the same as stopped. Saying nothing is
             # better than saying something untrue about somebody's server.
@@ -564,7 +588,7 @@ class Dispatcher:
         # Ask Samba what it is actually serving rather than assuming our own
         # writes took (M0 §1a: testparm's verdict proves nothing about our file).
         try:
-            effective = control.effective_shares(runner=self.applier.runner)
+            effective = self.applier.effective_shares()
         except SmbpalError:
             effective = None
         serving = None if effective is None else set(effective)
@@ -589,11 +613,7 @@ class Dispatcher:
             # showing two of someone's five shares reads as SMBPal having
             # broken the other three.
             configured = [s.get("name", "") for s in config.get("shares", [])]
-            for name, path in sorted(
-                control.unmanaged_shares(
-                    configured, runner=self.applier.runner
-                ).items()
-            ):
+            for name, path in sorted(self.applier.unmanaged_shares(configured).items()):
                 rows.append(
                     {
                         "id": "-",
@@ -626,7 +646,7 @@ class Dispatcher:
             credential_ref=_optional_str(params, "credential_ref"),
             enabled=_optional_bool(params, "enabled", default=True),
         )
-        report = self._commit(previous, updated)
+        report = self._commit(previous, updated, grant=request.auth)
         _audit(peer, "share.add", share["id"])
         described = self._describe(share, report)
         # SELinux, asked at the one moment the path is in front of somebody.
@@ -651,9 +671,8 @@ class Dispatcher:
         if self.applier is None:
             return
         try:
-            unmanaged = control.unmanaged_shares(
-                [s.get("name", "") for s in config.get("shares", [])],
-                runner=self.applier.runner,
+            unmanaged = self.applier.unmanaged_shares(
+                [s.get("name", "") for s in config.get("shares", [])]
             )
         except SmbpalError:
             # Cannot ask, so cannot prove a collision. Refusing on a failed
@@ -677,11 +696,11 @@ class Dispatcher:
         ref = _require_str(request.params, "ref")
         previous = self.store.load()
         updated, share = ops.remove_share(previous, ref)
-        self._commit(previous, updated)
+        self._commit(previous, updated, grant=request.auth)
         _audit(peer, "share.remove", share["id"])
         return share
 
-    def _apply(self, _request: Request, peer: PeerCredentials) -> dict[str, Any]:
+    def _apply(self, request: Request, peer: PeerCredentials) -> dict[str, Any]:
         """Re-apply the whole config. Idempotent, and the retry after a failure.
 
         **It has to mean the whole config, and until 27 August 2026 it did
@@ -707,7 +726,7 @@ class Dispatcher:
         if self.applier is None:
             raise SmbpalError("this daemon was started with --no-apply")
         config = self.store.load()
-        report = self.applier.apply(config)
+        report = self.applier.apply(config, grant=request.auth)
         wire = report.to_wire()
         wire["connections"] = (
             self.mounter.apply(config).to_wire()["connections"]
@@ -721,7 +740,7 @@ class Dispatcher:
         )
         return wire
 
-    def _teardown(self, _request: Request, peer: PeerCredentials) -> dict[str, Any]:
+    def _teardown(self, request: Request, peer: PeerCredentials) -> dict[str, Any]:
         """Undo everything SMBPal put outside the config. §6's claim, reachable.
 
         **Both teardowns existed and nothing called them.** They were written
@@ -739,7 +758,9 @@ class Dispatcher:
         """
         if self.applier is None and self.mounter is None:
             raise SmbpalError("this daemon was started with --no-apply")
-        samba = self.applier.teardown() if self.applier is not None else {}
+        samba = (
+            self.applier.teardown(grant=request.auth) if self.applier is not None else {}
+        )
         units_removed = self.mounter.teardown() if self.mounter is not None else []
         _audit(peer, "teardown", f"{len(units_removed)} unit(s)")
         return {**samba, "units_removed": units_removed}

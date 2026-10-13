@@ -869,6 +869,17 @@ class TestSambaNotRunningNotes(unittest.TestCase):
         self.assertIn("not installed", note)
         self.assertNotIn("systemctl", note)
 
+    def test_macos_file_sharing_off_says_where_the_switch_is_and_what_else_it_serves(
+        self,
+    ) -> None:
+        note = self.notes({"unit": "com.apple.smbd", "active": False, "installed": True})
+        self.assertIn("File Sharing is off", note)
+        self.assertIn("System Settings", note)
+        self.assertIn("every shared folder on this Mac", note)
+        # Never the route that breaks the server (account spike §1).
+        self.assertNotIn("launchctl", note)
+        self.assertNotIn("systemctl", note)
+
     def test_a_running_samba_says_nothing(self) -> None:
         self.assertEqual(
             self.notes({"unit": "smb.service", "active": True}), ""
@@ -1027,3 +1038,19 @@ class TestSetupSaysWhatIsLeftToDoByHand(unittest.TestCase):
             code, out = self.run_setup()
         self.assertEqual(code, 1)
         self.assertIn("not on PATH", out)
+
+
+class TestTheHelperInstallLine(unittest.TestCase):
+    def test_setup_installs_the_helper_onto_a_new_inode(self) -> None:
+        """`-S` renames a temporary file into place, so the root binary is never
+        half-written. It was first added believing it stopped a replaced
+        helper being killed at launch; that was a launch constraint, cleared by
+        bootstrapping the job again (helper spike §16). `-S` stays on its own
+        merits."""
+        import inspect
+
+        from smbpal.cli import main
+
+        source = inspect.getsource(main)
+        self.assertIn("sudo install -S -o root -g wheel -m 755", source)
+        self.assertNotIn("sudo install -o root -g wheel -m 755", source)

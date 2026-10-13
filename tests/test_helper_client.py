@@ -130,3 +130,70 @@ class TestEveryRefusal(HelperClientCase):
         client, server = self.helper(b"OK\n")
         self.assertTrue(client.available())
         self.assertEqual(server.seen, b"")
+
+
+class TestThePathAndSharepointVerbs(HelperClientCase):
+    """`path.inspect`, `share.owned`, `share.publish` and `share.unpublish`:
+    the macOS apply's half of the protocol (helper spike §13, §15)."""
+
+    ANSWER = (
+        b"OK\nverdict ok\nresolved /Users/someone/Documents\nuid 501\ngid 20\n"
+        b"mode 0700\nowner someone\nacl 1\n"
+    )
+
+    def test_inspect_sends_the_path_as_its_one_argument(self) -> None:
+        client, server = self.helper(self.ANSWER)
+        facts = client.path_inspect("/Users/someone/Documents")
+        self.assertEqual(
+            server.seen, b"VERB path.inspect\nARG /Users/someone/Documents\nEND\n"
+        )
+        self.assertEqual(facts.verdict, "ok")
+        self.assertEqual(facts.resolved, "/Users/someone/Documents")
+        self.assertEqual((facts.uid, facts.gid, facts.mode), (501, 20, 0o700))
+        self.assertTrue(facts.has_acl)
+
+    def test_a_missing_folder_carries_nothing_but_its_verdict(self) -> None:
+        client, _ = self.helper(b"OK\nverdict not-found\n")
+        facts = client.path_inspect("/Users/someone/gone")
+        self.assertFalse(facts.exists)
+        self.assertIsNone(facts.resolved)
+
+    def test_a_field_said_twice_is_malformed_not_a_correction(self) -> None:
+        """The helper refuses to describe a path with a newline in it so a field
+        cannot be forged; taking the last `verdict` would hand that back."""
+        client, _ = self.helper(self.ANSWER + b"verdict home-root\n")
+        with self.assertRaises(HelperError):
+            client.path_inspect("/Users/someone/Documents")
+
+    def test_an_unknown_verdict_is_not_guessed_at(self) -> None:
+        client, _ = self.helper(b"OK\nverdict probably-fine\n")
+        with self.assertRaises(HelperError):
+            client.path_inspect("/x")
+
+    def test_owned_is_one_record_name_per_line(self) -> None:
+        client, server = self.helper(b"OK\nMedia\nFamily Photos\n")
+        self.assertEqual(client.share_owned(), ["Media", "Family Photos"])
+        self.assertEqual(server.seen, b"VERB share.owned\nEND\n")
+
+    def test_publish_carries_the_grant_the_name_and_the_path(self) -> None:
+        client, server = self.helper(b"OK\n")
+        client.share_publish("Media", "/Volumes/Disk/Media", auth=bytes(32))
+        self.assertEqual(
+            server.seen,
+            b"VERB share.publish\nAUTH " + b"00" * 32 + b"\n"
+            b"ARG Media\nARG /Volumes/Disk/Media\nEND\n",
+        )
+
+    def test_a_refusal_keeps_its_token_apart_from_the_prose(self) -> None:
+        client, _ = self.helper(b"ERR home-root\n")
+        with self.assertRaises(HelperError) as caught:
+            client.share_publish("Home", "/Users/someone", auth=bytes(32))
+        self.assertEqual(caught.exception.token, "home-root")
+
+    def test_unpublish_names_only_the_record(self) -> None:
+        client, server = self.helper(b"OK\n")
+        client.share_unpublish("Media", auth=bytes(32))
+        self.assertEqual(
+            server.seen,
+            b"VERB share.unpublish\nAUTH " + b"00" * 32 + b"\nARG Media\nEND\n",
+        )

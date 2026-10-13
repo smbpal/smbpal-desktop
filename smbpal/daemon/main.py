@@ -29,6 +29,7 @@ from smbpal.mounts.credentials import DEFAULT_CREDENTIALS_DIR, CredentialsStore
 from smbpal.mounts.systemd import DEFAULT_UNIT_DIR
 from smbpal.ipc.protocol import encode_event
 from smbpal.samba.apply import DEFAULT_SMB_CONF, DEFAULT_SMBPAL_CONF, Applier
+from smbpal.sharepoints import SharepointApplier
 from smbpal.state.monitor import DEFAULT_INTERVAL, StateMonitor
 from smbpal.ipc.server import (
     DEFAULT_SOCKET_GROUP,
@@ -132,12 +133,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--serve-shares",
         choices=("auto", "yes", "no"),
         default="auto",
-        help="whether this daemon can serve folders over SMB. 'auto' (default) "
-        "picks by platform: everywhere except macOS, which has no Samba to "
-        "write a configuration for. The other two force it, which is for "
-        "development. A daemon that cannot serve says so at startup and "
-        "refuses those methods by name rather than failing partway through "
-        "writing a file.",
+        help="how this daemon serves folders over SMB. 'auto' (default) picks "
+        "by platform: Samba everywhere except macOS, which publishes "
+        "sharepoints through the privileged helper instead. 'yes' forces "
+        "Samba, which is for development. 'no' serves nothing, and a daemon "
+        "that cannot serve says so at startup and refuses those methods by "
+        "name rather than failing partway through writing a file.",
     )
     parser.add_argument(
         "--authorisation",
@@ -249,12 +250,22 @@ def main(argv: list[str] | None = None) -> int:
 
     # The same shape as `--mount-via auto` above: the platform decision in one
     # place rather than a `sys.platform` test inside the handlers.
-    serving = args.serve_shares == "yes" or (
-        args.serve_shares == "auto" and sys.platform != "darwin"
-    )
+    #
+    # **macOS serves through sharepoints, not Samba.** `auto` there swaps the
+    # Samba applier for one that asks the privileged helper to publish and
+    # inspect -- the daemon is `_smbpald` and can do neither itself (helper
+    # spike §9, §15). `yes` keeps Samba, which is for development on a Mac
+    # that has it.
+    serving = args.serve_shares != "no"
+    applier = choose_applier(applier, args.serve_shares, sys.platform)
+    if isinstance(applier, SharepointApplier):
+        log.info(
+            "serving folders as macOS sharepoints through the privileged helper; "
+            "File Sharing must be on in System Settings for them to be reachable"
+        )
     if not serving:
         log.info(
-            "serving folders over SMB is not supported on this platform yet; "
+            "serving folders over SMB is switched off for this daemon; "
             "connecting to shares other machines serve does work"
         )
 
@@ -292,6 +303,21 @@ def main(argv: list[str] | None = None) -> int:
             monitor.stop()
         transport.shutdown()
     return 0
+
+
+def choose_applier(
+    samba: Applier | None, serve_shares: str, platform: str
+) -> Applier | SharepointApplier | None:
+    """The applier this daemon serves through, decided in one place.
+
+    A function so the decision is tested rather than only reached at startup:
+    the first build of the macOS branch here referenced `SharepointApplier`
+    without importing it, every test passed, and the daemon died on its first
+    start on a Mac with a `NameError` -- because no test ran this line.
+    """
+    if samba is not None and serve_shares == "auto" and platform == "darwin":
+        return SharepointApplier()
+    return samba
 
 
 def _configure_logging(level: str) -> None:
