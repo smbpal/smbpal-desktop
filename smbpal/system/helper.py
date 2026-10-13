@@ -78,6 +78,9 @@ class PathFacts:
     mode: int | None = None
     owner: str | None = None
     has_acl: bool = False
+    # Only when an account was named: whether an ACE lets it write here
+    # ("allow"), stops it ("deny"), or neither ("none").
+    access: str | None = None
 
     @property
     def exists(self) -> bool:
@@ -93,9 +96,10 @@ def parse_path_facts(payload: bytes) -> PathFacts:
     that forgery back.
     """
     fields: dict[str, str] = {}
+    known = {"verdict", "resolved", "uid", "gid", "mode", "owner", "acl", "access"}
     for line in payload.decode("utf-8", errors="strict").splitlines():
         key, sep, value = line.partition(" ")
-        if not sep or key in fields:
+        if not sep or key in fields or key not in known:
             raise HelperError("the helper's path.inspect answer is malformed")
         fields[key] = value
     verdict = fields.get("verdict")
@@ -112,6 +116,7 @@ def parse_path_facts(payload: bytes) -> PathFacts:
             mode=int(fields["mode"], 8),
             owner=fields["owner"],
             has_acl=fields["acl"] == "1",
+            access=_access(fields.get("access")),
         )
     except (KeyError, ValueError) as exc:
         raise HelperError("the helper's path.inspect answer is malformed") from exc
@@ -248,9 +253,26 @@ class Helper:
         """`sharing -l -f json`, as JSON bytes. No authorisation: it is a read."""
         return self.call("share.list")
 
-    def path_inspect(self, path: str) -> PathFacts:
-        """§15: the daemon cannot `stat` inside a home directory, so it asks."""
-        return parse_path_facts(self.call("path.inspect", path))
+    def path_inspect(self, path: str, *, user: str | None = None) -> PathFacts:
+        """§15: the daemon cannot `stat` inside a home directory, so it asks.
+
+        With `user`, the answer also says whether an ACE lets that account
+        write here -- the macOS half of "is this share writable".
+        """
+        args = (path,) if user is None else (path, user)
+        return parse_path_facts(self.call("path.inspect", *args))
+
+    def account_smb(self, user: str) -> bool:
+        """Whether `user` can sign in over SMB at all (`SMB-NT` in its
+        HASHLIST). The helper answers one bit; the attribute never leaves it."""
+        payload = self.call("account.smb", user).decode("utf-8").strip()
+        if payload not in ("smb-nt 0", "smb-nt 1"):
+            raise HelperError("the helper's account.smb answer is malformed")
+        return payload == "smb-nt 1"
+
+    def share_grant(self, path: str, user: str, *, auth: bytes) -> None:
+        """`chmod +a` for an existing person: `share.make_writable` on macOS."""
+        self.call("share.grant", path, user, auth=auth)
 
     def share_owned(self) -> list[str]:
         """The sharepoint record names SMBPal published, from the helper's list."""
@@ -265,3 +287,11 @@ class Helper:
     def share_unpublish(self, name: str, *, auth: bytes) -> None:
         """`sharing -r`, for a record the helper published and nothing else."""
         self.call("share.unpublish", name, auth=auth)
+
+
+def _access(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value not in ("allow", "deny", "none"):
+        raise HelperError("the helper's path.inspect answer has an unknown access state")
+    return value

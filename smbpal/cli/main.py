@@ -115,7 +115,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     writable = share_cmds.add_parser(
         "make-writable",
-        help="give the share's folder to its user so the share can be written",
+        help="let the share's user write to its folder (Linux: by ownership; "
+        "macOS: by an access entry, leaving the owner alone)",
     )
     writable.add_argument("ref", help="share id or name")
 
@@ -422,19 +423,32 @@ def samba_notes(
     ]
 
 
-def share_notes(shares: list[dict[str, Any]]) -> list[str]:
+def share_notes(
+    shares: list[dict[str, Any]], *, platform: str = sys.platform
+) -> list[str]:
     """A share that is served and that nobody can open, said with the fix.
 
     Found on Ubuntu: served correctly, and useless, because no account had an
     SMB password. The table's `serving` is true and misleading, so the reason
     and the command go underneath it.
+
+    **The fix is different on a Mac.** There the SMB password is the account's
+    login password and SMBPal does not set it -- `credential set` is refused --
+    so the note names the switch in System Settings instead. The CLI only ever
+    talks to the daemon on its own machine, so its platform is the daemon's.
     """
     notes = []
     for share in shares:
         if share.get("can_sign_in") is not False:
             continue
         user = share.get("credential_ref")
-        if user:
+        if user and platform == "darwin":
+            notes.append(
+                f"  {share.get('name')}: nobody can sign in yet, {user} does not have "
+                "SMB sign-in turned on.\n  Turn it on in System Settings > General > "
+                f"Sharing > File Sharing > Options, by ticking {user}."
+            )
+        elif user:
             notes.append(
                 f"  {share.get('name')}: nobody can sign in yet, {user} has no SMB "
                 f"password. Set one with: smbpal credential set {user}"
@@ -646,10 +660,20 @@ def _cmd_share_make_writable(client: Client, args: argparse.Namespace) -> int:
         # Report the resulting state rather than claiming a change: the owner
         # is often already right and only the mode moved.
         directory = result["directory"]
-        lines = [
-            f"{directory['path']} is writable by the share's user "
-            f"(owner {directory['owner']}, mode {directory['mode']})"
-        ]
+        if directory.get("writable") is True:
+            lines = [
+                f"{directory['path']} is writable by the share's user "
+                f"(owner {directory['owner']}, mode {directory['mode']})"
+            ]
+        else:
+            # Not claimed unless the daemon said so. On macOS the answer comes
+            # from the helper's reading of the ACL, and "unknown" is a possible
+            # one -- reporting it as done would be the failure §3c is about.
+            lines = [
+                f"{directory['path']}: the change was made, and whether the share's "
+                "user can now write could not be confirmed"
+                + (f" ({directory['why_not_writable']})" if directory.get("why_not_writable") else "")
+            ]
         if result.get("note"):
             lines.append(f"  {result['note']}")
         return "\n".join(lines)
@@ -1173,7 +1197,10 @@ def _read_only_notes(shares: list[dict[str, Any]]) -> list[str]:
         notes.append(f"  {reason}")
         # Offer the fix from the structured flag, not by matching words in our
         # own message — a reworded reason should not silently drop the hint.
-        if (share.get("directory") or {}).get("writable") is False:
+        directory = share.get("directory") or {}
+        # `fixable` absent is a daemon from before it existed: offer the fix,
+        # as that daemon's every read-only reason had one.
+        if directory.get("writable") is False and directory.get("fixable", True):
             notes.append(f"  run: smbpal share make-writable {share['id']}")
     return notes
 

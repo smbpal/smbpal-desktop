@@ -25,7 +25,9 @@ from smbpal.ipc import server as server_module
 from smbpal.errors import (
     BadRequest,
     DaemonUnreachable,
+    NotFound,
     NotPermitted,
+    SmbpalError,
     NotSupported,
     UnknownMethod,
     UnsupportedVersion,
@@ -753,9 +755,6 @@ class TestWhyTheSocketRefusedUs(unittest.TestCase):
             self.assertIn("is required", client_module.why_refused())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestADirectoryThatIsAlreadyCorrect(unittest.TestCase):
     """The daemon must not try to change what is already right.
@@ -1042,3 +1041,50 @@ class TestItIsRefusedBeforeAuthorisation(ServerTestCase):
 class TestServingIsTheDefault(ServerTestCase):
     def test_so_linux_is_unaffected(self) -> None:
         self.assertTrue(self.dispatcher.serving)
+
+
+class TestAShareNeedsAnAccountThatExists(ServerTestCase):
+    """Measured on a Mac, 12 October 2026: `share add … --user OTHER` was
+    accepted with no such account, and `status` showed the share serving with
+    nothing to say. Refused now, on both platforms, before any prompt."""
+
+    MISSING = "smbpal-no-such-account"
+
+    def test_a_missing_account_is_refused_before_the_authoriser_is_asked(self) -> None:
+        checker = RecordingChecker(answer=True)
+        self.dispatcher.authoriser = Authoriser(policy="polkit", checker=checker)
+        # The client keeps the code and has no class for it, so it arrives as
+        # the base class carrying `not_found`.
+        with self.assertRaises(SmbpalError) as caught:
+            self.client().call(
+                "share.add",
+                {"name": "X", "path": "/srv/x", "credential_ref": self.MISSING},
+            )
+        self.assertEqual(caught.exception.code, NotFound.code)
+        self.assertIn(self.MISSING, caught.exception.message)
+        self.assertEqual(checker.calls, [], "nobody may be asked for a password")
+        self.assertEqual(self.store.load().get("shares", []), [])
+
+    def test_an_account_that_exists_goes_on_to_authorisation(self) -> None:
+        import os
+        import pwd
+
+        checker = RecordingChecker(answer=True)
+        self.dispatcher.authoriser = Authoriser(policy="polkit", checker=checker)
+        me = pwd.getpwuid(os.getuid()).pw_name
+        share = self.client().call(
+            "share.add", {"name": "X", "path": "/srv/x", "credential_ref": me}
+        )
+        self.assertEqual(share["credential_ref"], me)
+        self.assertEqual(len(checker.calls), 1)
+
+    def test_no_account_named_is_not_checked(self) -> None:
+        self.dispatcher.authoriser = Authoriser(
+            policy="polkit", checker=RecordingChecker(answer=True)
+        )
+        share = self.client().call("share.add", {"name": "X", "path": "/srv/x"})
+        self.assertIsNone(share.get("credential_ref"))
+
+
+if __name__ == "__main__":
+    unittest.main()

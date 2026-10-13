@@ -823,13 +823,29 @@ class TestShareNotes(unittest.TestCase):
                 {"name": "Media", "credential_ref": "luke", "can_sign_in": False},
                 {"name": "Fine", "credential_ref": "luke", "can_sign_in": True},
                 {"name": "Old", "credential_ref": "luke"},
-            ]
+            ],
+            platform="linux",
         )
         text = "\n".join(notes)
         self.assertIn("Media: nobody can sign in yet", text)
         self.assertIn("smbpal credential set luke", text)
         self.assertNotIn("Fine", text)
         self.assertNotIn("Old", text)
+
+    def test_on_a_mac_the_fix_is_the_switch_not_a_command(self) -> None:
+        """macOS's SMB password is the login password; `credential set` is
+        refused there, so pointing at it would be advice that cannot work."""
+        from smbpal.cli.main import share_notes
+
+        text = "\n".join(
+            share_notes(
+                [{"name": "Media", "credential_ref": "someone", "can_sign_in": False}],
+                platform="darwin",
+            )
+        )
+        self.assertIn("someone does not have SMB sign-in turned on", text)
+        self.assertIn("File Sharing > Options", text)
+        self.assertNotIn("credential set", text)
 
     def test_nothing_to_say_says_nothing(self) -> None:
         from smbpal.cli.main import share_notes
@@ -1054,3 +1070,27 @@ class TestTheHelperInstallLine(unittest.TestCase):
         source = inspect.getsource(main)
         self.assertIn("sudo install -S -o root -g wheel -m 755", source)
         self.assertNotIn("sudo install -o root -g wheel -m 755", source)
+
+
+class TestReadOnlyNotes(unittest.TestCase):
+    def note(self, **directory: object) -> str:
+        from smbpal.cli.main import _read_only_notes
+
+        share = {
+            "id": "media",
+            "read_only_reason": "read-only: /srv/media belongs to root",
+            "directory": {"writable": False, **directory},
+        }
+        return "\n".join(_read_only_notes([share]))
+
+    def test_a_fixable_reason_offers_the_fix(self) -> None:
+        self.assertIn("run: smbpal share make-writable media", self.note(fixable=True))
+
+    def test_a_daemon_from_before_fixable_still_offers_it(self) -> None:
+        self.assertIn("make-writable", self.note())
+
+    def test_an_unfixable_reason_does_not(self) -> None:
+        """A deny ACE: offering the command sends people to a refusal."""
+        note = self.note(fixable=False)
+        self.assertIn("belongs to root", note)
+        self.assertNotIn("make-writable", note)

@@ -197,3 +197,50 @@ class TestThePathAndSharepointVerbs(HelperClientCase):
             server.seen,
             b"VERB share.unpublish\nAUTH " + b"00" * 32 + b"\nARG Media\nEND\n",
         )
+
+
+class TestTheAccessVerbs(HelperClientCase):
+    """`path.inspect` with an account, `account.smb` and `share.grant`: existing
+    accounts, decided 12 October 2026."""
+
+    def test_inspect_names_the_account_as_a_second_argument(self) -> None:
+        client, server = self.helper(
+            TestThePathAndSharepointVerbs.ANSWER + b"access allow\n"
+        )
+        facts = client.path_inspect("/Users/someone/Documents", user="someone")
+        self.assertEqual(
+            server.seen,
+            b"VERB path.inspect\nARG /Users/someone/Documents\nARG someone\nEND\n",
+        )
+        self.assertEqual(facts.access, "allow")
+
+    def test_without_an_account_there_is_no_access_reading(self) -> None:
+        client, _ = self.helper(TestThePathAndSharepointVerbs.ANSWER)
+        self.assertIsNone(client.path_inspect("/Users/someone/Documents").access)
+
+    def test_an_unknown_field_is_malformed(self) -> None:
+        """A field the client does not know is a protocol it does not speak."""
+        client, _ = self.helper(TestThePathAndSharepointVerbs.ANSWER + b"surprise 1\n")
+        with self.assertRaises(HelperError):
+            client.path_inspect("/x")
+
+    def test_sign_in_is_one_bit(self) -> None:
+        for answer, expected in ((b"OK\nsmb-nt 1\n", True), (b"OK\nsmb-nt 0\n", False)):
+            with self.subTest(answer=answer):
+                client, server = self.helper(answer)
+                self.assertIs(client.account_smb("someone"), expected)
+                self.assertEqual(server.seen, b"VERB account.smb\nARG someone\nEND\n")
+
+    def test_a_sign_in_answer_that_is_not_one_bit_is_not_guessed_at(self) -> None:
+        client, _ = self.helper(b"OK\nsmb-nt yes\n")
+        with self.assertRaises(HelperError):
+            client.account_smb("someone")
+
+    def test_grant_carries_the_form_the_path_and_the_account(self) -> None:
+        client, server = self.helper(b"OK\n")
+        client.share_grant("/Volumes/Disk/Media", "someone", auth=bytes(32))
+        self.assertEqual(
+            server.seen,
+            b"VERB share.grant\nAUTH " + b"00" * 32 + b"\n"
+            b"ARG /Volumes/Disk/Media\nARG someone\nEND\n",
+        )

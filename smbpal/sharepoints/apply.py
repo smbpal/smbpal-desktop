@@ -19,9 +19,12 @@ is not.
   probably a way; nothing has measured it, and serving writable a share
   somebody marked read-only is the one failure here that would be a lie in the
   dangerous direction. Refused until it is measured.
-- *Granting access* (`chmod +a`, the account spike's step 5) and *SMB accounts*
-  (`SMB-NT`, steps 1-4). A share is served to whoever can already sign in to
-  this Mac over SMB, with the folder's existing permissions.
+- *Creating accounts or setting their SMB password* (`SMB-NT`, the account
+  spike's steps 1-4). Decided 12 October 2026: shares are served to accounts
+  that already exist. On macOS the SMB password is the login password, so the
+  person turns SMB sign-in on for their account in System Settings; SMBPal
+  reports whether they have, and `share make-writable` grants the folder with
+  an ACE (step 5) rather than an ownership change.
 - *Turning File Sharing on.* `launchctl enable` on an Apple-managed service is a
   trap (account spike §1), and starting `smbd` exposes every sharepoint on the
   machine, not just SMBPal's. Reported, not changed.
@@ -46,9 +49,12 @@ log = logging.getLogger(__name__)
 # missing piece named in the module docstring, refused by name before any
 # prompt (see `Dispatcher.handle`) rather than failing into a Samba tool that
 # is not there.
-UNSUPPORTED_METHODS = frozenset(
-    {"share.make_writable", "credential.set", "credential.remove"}
-)
+UNSUPPORTED_METHODS = frozenset({"credential.set", "credential.remove"})
+
+# The helper's line between a person and a system account (§13 rule 5), which
+# it applies to accounts as well as folders. Mirrored, not imported: it is a
+# C constant, and a test pins the two together.
+FIRST_PERSON_UID = 500
 
 
 def refusal(path: str, facts: PathFacts) -> str | None:
@@ -97,10 +103,10 @@ class SharepointApplier:
     # a commit that leaves the shares alone leaves the sharepoints alone too.
     APPLY_ONLY_WHEN_SHARES_CHANGE = True
     UNSUPPORTED_DETAIL = (
-        "on macOS SMBPal publishes the folder and leaves its permissions and "
-        "the Mac's accounts as they are. Change who can write to it in the "
-        "folder's Get Info window, and turn on SMB sign-in for an account in "
-        "System Settings > General > Sharing > File Sharing > Options."
+        "on macOS the SMB password is the account's login password, so SMBPal "
+        "does not set one. Turn on SMB sign-in for an account in System "
+        "Settings > General > Sharing > File Sharing > Options, where macOS "
+        "asks for that account's password."
     )
 
     # No command runner: nothing here runs a command. The dispatcher hands
@@ -114,6 +120,14 @@ class SharepointApplier:
     # --- planning ----------------------------------------------------------
 
     def _facts(self, share: dict[str, Any]) -> PathFacts:
+        # The share's account goes with the question when there is one, so the
+        # answer says whether an ACE lets it write -- without which an ACL
+        # makes writability unknown. Only a name the helper would accept: one
+        # it refuses would fail the whole inspection over a typo in a field
+        # that only refines it.
+        identity = _identity_for(share)
+        if identity is not None and identity.uid >= FIRST_PERSON_UID:
+            return self.helper.path_inspect(share["path"], user=identity.username)
         return self.helper.path_inspect(share["path"])
 
     def plan(self, config: dict[str, Any]) -> list[PlannedShare]:
@@ -156,6 +170,7 @@ class SharepointApplier:
                 owner_name=facts.owner,
                 identity=_identity_for(share),
                 has_acl=facts.has_acl,
+                access=facts.access,
             )
         read_only, reason = ownership.effective_read_only(
             bool(share.get("read_only")), status
@@ -256,6 +271,57 @@ class SharepointApplier:
             removed.append(name)
         return {"sharepoints_removed": removed}
 
+    # --- access ------------------------------------------------------------
+
+    def make_writable(
+        self, share: dict[str, Any], *, grant: bytes | None
+    ) -> ownership.DirectoryStatus:
+        """§3c's explicit action, macOS form: an ACE for the share's account.
+
+        Never an ownership change, which is what it is on Linux: the folder
+        stays its owner's, and the account spike measured that an appended ACE
+        is enough for a client to write. Idempotent -- the helper answers OK
+        without adding a second ACE when one already allows the account.
+        """
+        user = share.get("credential_ref")
+        if not user:
+            raise ApplyError(
+                f"share {share['id']!r} has no user assigned",
+                detail="Assign one with --user so there is an account to grant.",
+            )
+        if grant is None:
+            raise NeedsAuthorisation(
+                "changing who can write to a shared folder needs an "
+                "administrator's authorisation, even for root",
+                right=macos_auth.MANAGE_SHARES,
+            )
+        try:
+            self.helper.share_grant(share["path"], user, auth=grant)
+        except HelperError as exc:
+            # Headed with what could not be done, not with the verb that said
+            # no: "the helper refused share.grant" is plumbing.
+            raise _explain(
+                exc, headline=f"cannot make {share['name']!r} writable for {user}"
+            ) from exc
+        [planned] = self.plan({"shares": [share]})
+        return planned.status
+
+    def can_sign_in(self, share: dict[str, Any]) -> bool | None:
+        """Whether anybody can open this share from another machine at all.
+
+        For a named account, whether it has SMB sign-in turned on. For a share
+        with none, unknown rather than a guess: any account with sign-in on
+        could open it, and the helper is not asked to list every account.
+        None, too, when the helper cannot be asked -- not the same as no.
+        """
+        user = share.get("credential_ref")
+        if not user:
+            return None
+        try:
+            return self.helper.account_smb(user)
+        except HelperError:
+            return None
+
     # --- what the dispatcher asks of any applier ---------------------------
 
     def effective_shares(self) -> dict[str, str]:
@@ -342,16 +408,21 @@ _HELPER_REFUSALS = {
     "exists": "a sharepoint with that name already exists and SMBPal did not create it",
     "published": "SMBPal already published that sharepoint; run `smbpal apply`",
     "not-ours": "that sharepoint was not published by SMBPal, so SMBPal will not remove it",
+    "account": "that is not an existing person's account on this Mac -- SMBPal "
+    "grants access to people, not to system or role accounts",
+    "deny-ace": "an access entry on the folder denies that account; somebody set it "
+    "on purpose, so SMBPal leaves it alone",
+    "chmod": "macOS's `chmod` did not add the access entry",
     "sharing": "macOS's `sharing` tool did not make the change",
     "ledger": "the helper could not update its record of what SMBPal published",
 }
 
 
-def _explain(exc: HelperError) -> SmbpalError:
+def _explain(exc: HelperError, *, headline: str | None = None) -> SmbpalError:
     detail = _HELPER_REFUSALS.get(exc.token or "")
     if detail is None and exc.token:
         # A §13 verdict: the helper re-checked the folder and refused it, after
         # `apply` had already found it acceptable. Rare (the folder changed in
         # between), and exactly the TOCTOU window §13 records.
         detail = f"the helper refused the folder: {exc.token}"
-    return ApplyError(exc.message, detail=detail or exc.detail)
+    return ApplyError(headline or exc.message, detail=detail or exc.detail)

@@ -48,9 +48,27 @@ class FakeHelper:
         self.owned: list[str] = []
         self.calls: list[tuple[str, ...]] = []
         self.publish_takes = True
+        self.signed_in: set[str] = set()
+        self.access: dict[tuple[str, str], str] = {}
+        self.inspected_as: list[str | None] = []
 
-    def path_inspect(self, path: str) -> PathFacts:
-        return self.facts.get(path, ok(path))
+    def path_inspect(self, path: str, *, user: str | None = None) -> PathFacts:
+        self.inspected_as.append(user)
+        facts = self.facts.get(path, ok(path))
+        if user is None or not facts.exists:
+            return facts
+        from dataclasses import replace
+
+        return replace(facts, access=self.access.get((path, user), "none"))
+
+    def account_smb(self, user: str) -> bool:
+        return user in self.signed_in
+
+    def share_grant(self, path: str, user: str, *, auth: bytes) -> None:
+        self.calls.append(("grant", path, user))
+        if self.access.get((path, user)) == "deny":
+            raise HelperError("refused", token="deny-ace")
+        self.access[(path, user)] = "allow"
 
     def share_list(self) -> bytes:
         return json.dumps(self.records).encode()
@@ -287,6 +305,10 @@ class TestTheUnsupportedMethodsOverTheSocket(ServerTestCase):
                 self.assertIn(method, caught.exception.message)
                 self.assertNotIn("Samba", caught.exception.detail or "")
 
+    def test_make_writable_is_no_longer_among_them(self) -> None:
+        self.assertNotIn("share.make_writable", SharepointApplier.UNSUPPORTED_METHODS)
+        self.assertIn("credential.set", SharepointApplier.UNSUPPORTED_METHODS)
+
 
 class TestWhatTheDispatcherLeavesAlone(DispatcherCase):
     def test_a_connection_edit_does_not_reconcile_sharepoints(self) -> None:
@@ -335,3 +357,147 @@ class TestTheDaemonChoosesTheApplier(unittest.TestCase):
         from smbpal.daemon.main import choose_applier
 
         self.assertIsNone(choose_applier(None, "auto", "darwin"))
+
+
+
+def me() -> str:
+    """An account that exists on any machine running the suite, at uid >= 500
+    where it can be (CI runs as `runner`, uid 1001; a Mac as uid 501)."""
+    import pwd
+    import os
+
+    return pwd.getpwuid(os.getuid()).pw_name
+
+
+class TestAccessForExistingAccounts(SharepointCase):
+    """`share make-writable` on macOS is an ACE through the helper, never an
+    ownership change. Decided 12 October 2026: existing accounts only."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        import os
+
+        if os.getuid() < 500:
+            self.skipTest("needs an ordinary account to stand in for a person")
+        self.user = me()
+        self.share = share("Docs", f"{HOME}/Documents", credential_ref=self.user)
+
+    def test_the_grant_goes_to_the_helper_with_the_requests_authorisation(self) -> None:
+        status = self.applier.make_writable(self.share, grant=GRANT)
+        self.assertEqual(self.helper.calls, [("grant", f"{HOME}/Documents", self.user)])
+        self.assertIs(status.writable, True)
+
+    def test_no_grant_asks_for_one(self) -> None:
+        with self.assertRaises(NeedsAuthorisation):
+            self.applier.make_writable(self.share, grant=None)
+        self.assertEqual(self.helper.calls, [])
+
+    def test_a_share_with_no_account_has_nobody_to_grant(self) -> None:
+        with self.assertRaises(ApplyError):
+            self.applier.make_writable(share("Docs", f"{HOME}/Documents"), grant=GRANT)
+
+    def test_a_deny_is_explained_and_left_alone(self) -> None:
+        self.helper.access[(f"{HOME}/Documents", self.user)] = "deny"
+        with self.assertRaises(ApplyError) as caught:
+            self.applier.make_writable(self.share, grant=GRANT)
+        self.assertIn("on purpose", caught.exception.detail or "")
+        # Headed with what could not be done, not with the helper's verb.
+        self.assertIn("cannot make 'Docs' writable", caught.exception.message)
+        self.assertNotIn("share.grant", caught.exception.message)
+
+    def test_a_deny_is_not_offered_the_command_that_cannot_fix_it(self) -> None:
+        """Measured 12 October 2026: `share add` on a denied folder suggested
+        `make-writable`, which the helper then refused."""
+        from smbpal.cli.main import _read_only_notes
+
+        self.helper.facts[f"{HOME}/Documents"] = PathFacts(
+            "ok", f"{HOME}/Documents", 4242, 4242, 0o777, "someone-else", has_acl=True
+        )
+        self.helper.access[(f"{HOME}/Documents", self.user)] = "deny"
+        [planned] = self.applier.plan(self.config(self.share))
+        notes = "\n".join(_read_only_notes([planned.to_wire()]))
+        self.assertIn("denies", notes)
+        self.assertNotIn("make-writable", notes)
+
+    def test_the_plan_asks_about_the_shares_account(self) -> None:
+        self.applier.plan(self.config(self.share))
+        self.assertEqual(self.helper.inspected_as, [self.user])
+
+    def test_an_allowing_ace_makes_the_share_writable_despite_the_mode(self) -> None:
+        self.helper.facts[f"{HOME}/Documents"] = PathFacts(
+            "ok", f"{HOME}/Documents", 4242, 4242, 0o700, "someone-else", has_acl=True
+        )
+        self.helper.access[(f"{HOME}/Documents", self.user)] = "allow"
+        [planned] = self.applier.plan(self.config(self.share))
+        self.assertIs(planned.status.writable, True)
+        self.assertFalse(planned.read_only)
+
+    def test_a_denying_ace_makes_it_read_only_with_the_reason(self) -> None:
+        self.helper.facts[f"{HOME}/Documents"] = PathFacts(
+            "ok", f"{HOME}/Documents", 4242, 4242, 0o777, "someone-else", has_acl=True
+        )
+        self.helper.access[(f"{HOME}/Documents", self.user)] = "deny"
+        [planned] = self.applier.plan(self.config(self.share))
+        self.assertIs(planned.status.writable, False)
+        self.assertIn("denies", planned.reason or "")
+
+    def test_an_acl_that_says_nothing_leaves_the_mode_as_the_answer(self) -> None:
+        self.helper.facts[f"{HOME}/Documents"] = PathFacts(
+            "ok", f"{HOME}/Documents", 4242, 4242, 0o700, "someone-else", has_acl=True
+        )
+        [planned] = self.applier.plan(self.config(self.share))
+        self.assertIs(planned.status.writable, False)
+
+    def test_a_system_account_is_not_named_to_the_helper(self) -> None:
+        """The helper refuses role accounts, and refusing would fail the whole
+        inspection over a field that only refines it."""
+        self.applier.plan(self.config(share("R", f"{HOME}/R", credential_ref="root")))
+        self.assertEqual(self.helper.inspected_as, [None])
+
+
+class TestSignIn(SharepointCase):
+    def test_a_named_account_is_asked_about(self) -> None:
+        self.helper.signed_in.add("someone")
+        self.assertIs(self.applier.can_sign_in(share("A", "/x", credential_ref="someone")), True)
+        self.assertIs(self.applier.can_sign_in(share("B", "/x", credential_ref="other")), False)
+
+    def test_no_account_named_is_unknown_not_no(self) -> None:
+        self.assertIsNone(self.applier.can_sign_in(share("A", "/x")))
+
+    def test_a_helper_that_cannot_be_asked_is_unknown_not_no(self) -> None:
+        def down(_user: str) -> bool:
+            raise HelperError("the privileged helper is not running")
+
+        self.helper.account_smb = down  # type: ignore[method-assign]
+        self.assertIsNone(self.applier.can_sign_in(share("A", "/x", credential_ref="someone")))
+
+
+class TestTheDispatcherGrants(DispatcherCase):
+    def test_make_writable_reaches_the_helper_and_does_not_republish(self) -> None:
+        import os
+
+        if os.getuid() < 500:
+            self.skipTest("needs an ordinary account to stand in for a person")
+        self.dispatcher._share_add(
+            self.request(
+                "share.add",
+                {"name": "Docs", "path": f"{HOME}/Documents", "credential_ref": me()},
+            ),
+            self.peer,
+        )
+        self.helper.calls.clear()
+        result = self.dispatcher._share_make_writable(
+            self.request("share.make_writable", {"ref": "docs"}), self.peer
+        )
+        self.assertEqual(self.helper.calls, [("grant", f"{HOME}/Documents", me())])
+        self.assertTrue(result["directory"]["writable"])
+
+    def test_status_reports_sign_in_from_the_helper(self) -> None:
+        self.store.save(
+            {"version": 1, "shares": [share("Docs", f"{HOME}/Documents", credential_ref="someone")], "connections": []}
+        )
+        [row] = [r for r in self.dispatcher._share_states(self.store.load()) if r["id"] == "docs"]
+        self.assertIs(row["can_sign_in"], False)
+        self.helper.signed_in.add("someone")
+        [row] = [r for r in self.dispatcher._share_states(self.store.load()) if r["id"] == "docs"]
+        self.assertIs(row["can_sign_in"], True)
