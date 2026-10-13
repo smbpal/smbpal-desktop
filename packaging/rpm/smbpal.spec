@@ -10,7 +10,7 @@
 # no second removal step.
 
 Name:           smbpal
-Version:        0.2.11
+Version:        0.2.12
 Release:        1%{?dist}
 Summary:        Share folders over SMB, and connect to shares on other machines
 
@@ -261,6 +261,23 @@ fi
 %{_datadir}/icons/hicolor/scalable/status/smbpal-attention.svg
 
 %changelog
+* Tue Oct 13 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.12-1
+- macOS: sharing your own folders works. `smbpal share add` publishes the
+  folder as a macOS shared folder through the privileged helper, with guest
+  access always off. Folders must be inside /Users or /Volumes, and a whole
+  home folder is refused: share a folder inside it. File Sharing has to be on
+  in System Settings, and `smbpal status` says when it is not.
+- macOS: shares are served to accounts that already exist. Turn SMB sign-in on
+  for an account in System Settings; `status` says when it is off.
+  `smbpal share make-writable` lets that account write without changing who
+  owns the folder. Not yet: read-only shares, and SMBPal does not set SMB
+  passwords on macOS.
+- macOS, upgrading: rebuild the helper from this release's source and install
+  it with `sudo make -C helper install`, which also re-registers it with
+  launchd. Replacing the binary alone leaves the helper unable to start.
+- Linux and macOS: `smbpal share add --user` refuses an account that does not
+  exist, before asking for a password. It used to accept it, and the share
+  then looked healthy while nobody could open it.
 * Sun Oct 11 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.11-1
 - macOS: sharing a folder says it is not supported yet, rather than failing
   with a permission error about /etc/samba -- a path macOS has never had,

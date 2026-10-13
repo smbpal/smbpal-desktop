@@ -1,3 +1,31 @@
+smbpal (0.2.12) trixie; urgency=medium
+
+  * **macOS: sharing your own folders works.** `smbpal share add` publishes
+    the folder as a macOS shared folder through the privileged helper, with
+    guest access always off. Folders must be inside /Users or /Volumes, and a
+    whole home folder is refused — share a folder inside it instead. File
+    Sharing has to be on in System Settings; `smbpal status` says when it is
+    not, and that turning it on serves every shared folder on the Mac.
+  * **macOS: shares are served to accounts that already exist.** On a Mac the
+    SMB password is the account's login password, so SMBPal does not set one:
+    turn SMB sign-in on for the account in System Settings > General > Sharing
+    > File Sharing > Options, and `smbpal status` says when it is off.
+    `smbpal share make-writable` then lets that account write, with an access
+    entry rather than by changing who owns the folder. Not yet: read-only
+    shares, and `smbpal credential set` on macOS.
+  * **macOS, upgrading from 0.2.11:** rebuild the helper from this release's
+    source and install it with `sudo make -C helper install`, which also
+    re-registers it with launchd. Replacing the binary on its own leaves the
+    new helper unable to start.
+  * Linux and macOS: `smbpal share add --user` refuses an account that does
+    not exist, and says so before asking for a password. It used to accept
+    it, and the share then looked healthy while nobody could open it.
+  * Known on macOS: files a second account writes into a shared folder are not
+    readable by the folder's owner, and a newly created account may need to
+    log in once at the Mac before it can sign in over SMB.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Tue, 13 Oct 2026 21:30:00 +0100
+
 smbpal (0.2.11) trixie; urgency=medium
 
   * On macOS, trying to share a folder says so plainly instead of failing
