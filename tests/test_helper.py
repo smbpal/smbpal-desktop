@@ -770,3 +770,42 @@ class TestTheRightsMatchTheClient(unittest.TestCase):
         # Unshared is the one field this rule changes from the fallback, so it
         # is the one field whose loss the install has to warn about.
         self.assertIn('CFSTR("shared"), kCFBooleanFalse', rule)
+
+
+class TestTheInstallTarget(unittest.TestCase):
+    """`make -C helper install`, which 0.2.12 shipped broken in two ways and
+    which a test cannot run: it needs root and replaces the live helper.
+
+    Measured on the first real upgrade, 13 October 2026: `bootstrap` straight
+    after `bootout` failed with `5: Input/output error` and left no helper
+    loaded, and `sudo make install` built the binary as root inside the
+    checkout. The Makefile's recipe was exercised against a fake `launchctl`
+    when this was written; these pin the shape that made it pass.
+    """
+
+    def setUp(self) -> None:
+        text = (HELPER_DIR / "Makefile").read_text(encoding="utf-8")
+        start = text.index("\ninstall:")
+        end = text.index("\n\n", start + 1)
+        self.target = text[start:end]
+
+    def test_it_does_not_build_as_root(self) -> None:
+        first_line = self.target.strip().splitlines()[0]
+        self.assertEqual(first_line.strip(), "install:", "no build prerequisite")
+        self.assertIn("build the helper as yourself first", self.target)
+        self.assertIn("smbpal-helper.c -nt smbpal-helper", self.target)
+
+    def test_it_waits_for_launchd_to_let_go_before_bootstrapping(self) -> None:
+        self.assertLess(
+            self.target.index("launchctl bootout"),
+            self.target.index("while launchctl print"),
+        )
+        self.assertLess(
+            self.target.index("while launchctl print"),
+            self.target.index("launchctl bootstrap"),
+        )
+
+    def test_a_bootstrap_that_will_not_take_says_what_to_run(self) -> None:
+        self.assertIn("for attempt in", self.target)
+        self.assertIn("run: sudo launchctl bootstrap system", self.target)
+

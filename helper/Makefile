@@ -30,12 +30,41 @@ smbpal-helper: smbpal-helper.c
 # Launch Constraint Violation -- and the helper stays down behind its old
 # socket. Measured 12 October 2026, twice; `bootout` then `bootstrap` cleared it
 # (helper spike §16). So when a job is installed, this target re-registers it.
-install: smbpal-helper
+#
+# **`bootout` returns before launchd has finished with the job**, and a
+# `bootstrap` straight after it fails with `5: Input/output error` -- which is
+# what 0.2.12's version of this target did on its first real upgrade, 13
+# October 2026, leaving no helper loaded at all. So it waits for `print` to
+# stop finding the job, then retries `bootstrap` a few times before giving up.
+# The wait is the documented-behaviour half; the retry is for a launchd that
+# still answers EIO a moment after the job reads as gone, which nobody has
+# measured either way.
+#
+# **It installs a binary you built, and does not build one.** `install` used to
+# depend on the build, so `sudo make install` compiled as root and left a
+# root-owned file in the checkout that the next unprivileged `make` -- the test
+# suite's among them -- could not replace. Build as yourself, install as root.
+install:
+	@if [ ! -f smbpal-helper ] || [ smbpal-helper.c -nt smbpal-helper ]; then \
+	    echo "build the helper as yourself first: make -C helper" >&2; exit 1; \
+	fi
 	install -d -o root -g wheel -m 755 $(LIBEXEC)
 	install -S -o root -g wheel -m 755 smbpal-helper $(LIBEXEC)/smbpal-helper
-	if [ -f /Library/LaunchDaemons/app.smbpal.helper.plist ]; then \
+	@if [ -f /Library/LaunchDaemons/app.smbpal.helper.plist ]; then \
 	    launchctl bootout system/app.smbpal.helper 2>/dev/null || true; \
-	    launchctl bootstrap system /Library/LaunchDaemons/app.smbpal.helper.plist; \
+	    i=0; while launchctl print system/app.smbpal.helper >/dev/null 2>&1; do \
+	        i=$$((i + 1)); \
+	        if [ $$i -gt 50 ]; then echo "the old helper job is still loaded after 10s" >&2; exit 1; fi; \
+	        sleep 0.2; \
+	    done; \
+	    for attempt in 1 2 3 4 5; do \
+	        if launchctl bootstrap system /Library/LaunchDaemons/app.smbpal.helper.plist 2>/dev/null; then \
+	            echo "re-registered app.smbpal.helper with launchd"; exit 0; \
+	        fi; \
+	        sleep 1; \
+	    done; \
+	    echo "could not bootstrap app.smbpal.helper; run: sudo launchctl bootstrap system /Library/LaunchDaemons/app.smbpal.helper.plist" >&2; \
+	    exit 1; \
 	fi
 
 # `-Dmain=` renames the helper's entry point so the test can have its own,
