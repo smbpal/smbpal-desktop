@@ -413,6 +413,8 @@ _HELPER_REFUSALS = {
     "deny-ace": "an access entry on the folder denies that account; somebody set it "
     "on purpose, so SMBPal leaves it alone",
     "chmod": "macOS's `chmod` did not add the access entry",
+    "owner": "the share's account can now write, but the folder's owner could not be "
+    "given access to what it writes; run make-writable again",
     "sharing": "macOS's `sharing` tool did not make the change",
     "ledger": "the helper could not update its record of what SMBPal published",
 }
