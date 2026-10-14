@@ -10,7 +10,7 @@
 # no second removal step.
 
 Name:           smbpal
-Version:        0.2.13
+Version:        0.2.14
 Release:        1%{?dist}
 Summary:        Share folders over SMB, and connect to shares on other machines
 
@@ -261,6 +261,16 @@ fi
 %{_datadir}/icons/hicolor/scalable/status/smbpal-attention.svg
 
 %changelog
+* Wed Oct 14 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.14-1
+- macOS: the owner of a shared folder can open what another account writes
+  into it. `smbpal share make-writable` now gives the folder's owner access to
+  new files as well as the share's account. Files written before keep their
+  old permissions; run make-writable again on an existing share to include
+  the owner from now on.
+- Corrects 0.2.12's note that a new macOS account may need to log in once
+  before it can sign in over SMB. It does not: an account that had never
+  logged in signed in fine, and the failure that suggested otherwise was a
+  coincidence.
 * Tue Oct 13 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.13-1
 - macOS: upgrading the helper works in one step. `make -C helper && sudo make
   -C helper install` now waits for launchd to finish with the old helper
