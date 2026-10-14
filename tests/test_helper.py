@@ -379,7 +379,29 @@ class TestTheVocabularyIsFixed(unittest.TestCase):
 
     def test_a_deny_is_never_overridden(self) -> None:
         branch = self.verb("share.grant")
-        self.assertLess(branch.index("ACCESS_DENY"), branch.index("ace_add("))
+        self.assertLess(branch.index("ACCESS_DENY"), branch.index("grant_ace("))
+
+    def test_the_owner_is_granted_after_the_share_account(self) -> None:
+        """Decided 13 October 2026: the owner could not open what the share
+        account wrote into their own folder."""
+        branch = self.verb("share.grant")
+        self.assertLess(
+            branch.index("grant_ace(who, report.resolved)"),
+            branch.index("grant_ace(person_owner, report.resolved)"),
+        )
+
+    def test_the_owner_is_skipped_when_it_is_the_share_account(self) -> None:
+        self.assertIn("owner->pw_uid != who->pw_uid", self.verb("share.grant"))
+
+    def test_an_owner_deny_is_never_overridden_either(self) -> None:
+        branch = self.verb("share.grant")
+        owner_part = branch[branch.index("getpwuid(report.st.st_uid)") :]
+        self.assertLess(
+            owner_part.index("!= ACCESS_DENY"), owner_part.index("grant_ace(person_owner")
+        )
+
+    def test_every_grant_is_recorded_for_uninstall(self) -> None:
+        self.assertIn("grants_add(who->pw_name, resolved)", self.function("static int grant_ace("))
 
     def test_sign_in_is_a_read(self) -> None:
         self.assertIn("req.has_auth ||", self.verb("account.smb"))

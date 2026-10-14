@@ -1143,6 +1143,25 @@ static int ace_remove(const char *user, const char *resolved) {
     return run_silent(argv);
 }
 
+/* Make sure `who` can write in `resolved` by an ACE this helper added, adding
+ * and recording one if none allows it yet. 0 when it was added, 1 when an ACE
+ * already allowed it (and nothing was recorded: only what this helper adds is
+ * SMBPal's), -1 when `chmod` did not take, -2 when the ledger could not be
+ * written -- in which case the ACE is taken back, because an ACE SMBPal cannot
+ * remember adding is one uninstall would leave behind. The caller has already
+ * refused a deny. */
+static int grant_ace(const struct passwd *who, const char *resolved) {
+    if (ace_for(resolved, who->pw_uid) == ACCESS_ALLOW) return 1;
+    ace_add(who->pw_name, resolved);
+    if (ace_for(resolved, who->pw_uid) != ACCESS_ALLOW) return -1;
+    if (grants_add(who->pw_name, resolved) != 0) {
+        ace_remove(who->pw_name, resolved);
+        return -2;
+    }
+    fprintf(stderr, "smbpal-helper: granted %s write on %s\n", who->pw_name, resolved);
+    return 0;
+}
+
 /* Removes what the install recorded and nothing else -- §10.6. The order is
  * §4's, learned on 11 October 2026: an ACE outlives the account it names and
  * orphans to a raw UUID, and ownership does the same, so files go before the
@@ -1614,26 +1633,39 @@ static void serve_one(int conn) {
             respond_err(conn, "deny-ace");
             return;
         }
-        if (state == ACCESS_ALLOW) {
-            /* Already able to write, by an ACE this helper may or may not have
-             * added. Not recorded: only what this call adds is SMBPal's. */
-            respond(conn, "OK\n");
+        int granted = grant_ace(who, report.resolved);
+        if (granted < 0) {
+            respond_err(conn, granted == -1 ? "chmod" : "ledger");
             return;
         }
-        ace_add(who->pw_name, report.resolved);
-        if (ace_for(report.resolved, who->pw_uid) != ACCESS_ALLOW) {
-            respond_err(conn, "chmod");
-            return;
+
+        /* **The folder's owner gets the same inherited ACE**, decided 13
+         * October 2026. Measured the day before: files the share account
+         * wrote over SMB arrived `0600`, owned by it, carrying only its own
+         * inherited ACE -- so the person who owns the folder could not open
+         * what was written into it. A second inherited entry for the owner
+         * lands on new files the same way (the measurement showed macOS's SMB
+         * server applies inherited ACEs); files already written are untouched.
+         *
+         * Skipped when the share account *is* the owner, when the owner is not
+         * a person (§13 rule 5 already refuses such folders, so this is a
+         * backstop), and when somebody has set a deny for the owner -- which is
+         * theirs, and is never overridden. Also reached when the share account
+         * was already allowed, so re-running `make-writable` on a share granted
+         * before this brings the owner in. */
+        struct passwd *owner = getpwuid(report.st.st_uid);
+        if (owner != NULL && owner->pw_uid != who->pw_uid) {
+            struct passwd *person_owner = person(owner->pw_name);
+            if (person_owner != NULL &&
+                ace_for(report.resolved, person_owner->pw_uid) != ACCESS_DENY &&
+                grant_ace(person_owner, report.resolved) < 0) {
+                /* The share account's grant stands -- it is recorded and
+                 * correct -- but the owner's did not take, and a person told
+                 * "done" would find out from a file they cannot open. */
+                respond_err(conn, "owner");
+                return;
+            }
         }
-        if (grants_add(who->pw_name, report.resolved) != 0) {
-            /* An ACE SMBPal cannot remember adding is one uninstall would
-             * leave behind, so it does not get to stay. */
-            ace_remove(who->pw_name, report.resolved);
-            respond_err(conn, "ledger");
-            return;
-        }
-        fprintf(stderr, "smbpal-helper: granted %s write on %s\n", who->pw_name,
-                report.resolved);
         respond(conn, "OK\n");
         return;
     }
