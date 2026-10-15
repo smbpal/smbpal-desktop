@@ -37,7 +37,12 @@ log = logging.getLogger(__name__)
 
 # The account the helper creates for the daemon (helper spike §9).
 DAEMON_ACCOUNT = "_smbpald"
-FIRST_RETRY = 5.0
+# Half a second first, because the commonest gap is a daemon restart, which
+# takes about one: at five seconds, a command typed straight after
+# `launchctl kickstart` found no agent, and on 15 October 2026 that silently
+# lost a password given to `connection add --user`. Doubling from there keeps
+# a daemon that is really down from being dialled ten times a second.
+FIRST_RETRY = 0.5
 LONGEST_RETRY = 60.0
 
 
@@ -72,6 +77,37 @@ class DaemonLink:
         self._thread: threading.Thread | None = None
         self._said: str | None = None
         self.registered = threading.Event()
+        # The latest connection states from the reconnect loop, kept so a
+        # daemon that restarts hears them as soon as the link is back.
+        self._states: list[dict[str, Any]] | None = None
+        self._states_lock = threading.Lock()
+
+    def report(self, states: list[dict[str, Any]]) -> None:
+        """Tell the daemon what this person's connections are doing.
+
+        **The daemon cannot find this out for itself on macOS.** It has no
+        `Mounter` there and cannot see into the session; the agent is what
+        mounts, so the agent is what knows. Sent without waiting for the
+        acknowledgement, for the reason `Client.send` gives.
+        """
+        with self._states_lock:
+            self._states = states
+        self._send_states()
+
+    def _send_states(self) -> None:
+        client = self._client
+        if client is None or not self.registered.is_set():
+            return
+        with self._states_lock:
+            states = self._states
+        if states is None:
+            return
+        try:
+            client.send("agent.state", {"states": states})
+        except SmbpalError as exc:
+            # The link loop finds out too, and reconnects; this is not where
+            # that is reported.
+            log.debug("could not send connection states: %s", exc.message)
 
     def start(self) -> None:
         if self._thread is not None:
@@ -125,6 +161,7 @@ class DaemonLink:
         client.on_event = None
         self.registered.set()
         self._say(f"connected to the daemon at {self.socket_path}")
+        self._send_states()
         for event in early:
             self._answer(client, event)
         for event in client.events():

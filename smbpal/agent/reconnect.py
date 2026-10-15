@@ -67,6 +67,16 @@ from typing import Any, Callable
 from smbpal.errors import SmbpalError
 from smbpal.mounts import volumes
 from smbpal.mounts.netfs import NetFSError
+from smbpal.state.machine import (
+    AUTH_FAILED,
+    CONNECTED,
+    DISABLED,
+    FAILED,
+    IDLE,
+    RECONNECTING,
+    UNKNOWN,
+    UNREACHABLE,
+)
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +92,21 @@ SLEEP_GAP = 30.0
 
 Connections = Callable[[], list[dict[str, Any]]]
 Mount = Callable[[dict[str, Any]], str]
+States = Callable[[list[dict[str, Any]]], None]
+
+# The words a person is shown for a share the loop is deliberately leaving
+# alone. `idle`, not a problem: on macOS a disconnected share is a choice, and
+# `smbpal connection connect` or the window's Connect undoes it.
+_DISCONNECTED = (
+    IDLE,
+    "disconnected; it stays disconnected until you connect it",
+    False,
+)
+_EJECTED = (
+    IDLE,
+    "ejected; it stays disconnected until you connect it",
+    False,
+)
 
 
 @dataclass
@@ -98,6 +123,12 @@ class _Track:
     # What was last logged about it, so a line is written when it changes and
     # not every five seconds.
     said: str | None = None
+    # What a person is shown: `(state, message, retryable)` in the words of
+    # `state/machine.py`, reported to the daemon whenever it changes.
+    status: tuple[str, str, bool] = (UNKNOWN, "not checked yet", False)
+    # The status that goes with `held`, which is not always the same kind of
+    # thing: an eject is calm, a refused password is a problem.
+    held_status: tuple[str, str, bool] | None = None
 
 
 class Reconnector:
@@ -113,6 +144,7 @@ class Reconnector:
         interval: float = DEFAULT_INTERVAL,
         wall: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
+        on_states: States | None = None,
     ) -> None:
         self.uid = uid
         self.username = username
@@ -131,6 +163,9 @@ class Reconnector:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # Told the whole list when any of it changes; see `states`.
+        self.on_states = on_states
+        self._reported: list[dict[str, Any]] | None = None
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -173,6 +208,7 @@ class Reconnector:
                         "it was disconnected through SMBPal; "
                         "`smbpal connection connect` brings it back"
                     )
+                    track.held_status = _DISCONNECTED
 
     def connected(self, url: str, mountpoint: str) -> None:
         """A connect asked for through SMBPal: whatever held it, no longer."""
@@ -182,6 +218,7 @@ class Reconnector:
                 if track.key == key:
                     track.mounted_at = track.last_at = mountpoint
                     track.held = None
+                    track.held_status = None
                     track.failures = 0
                     track.next_try = 0.0
 
@@ -211,6 +248,32 @@ class Reconnector:
         with self._lock:
             for gone in set(self._tracks) - seen:
                 del self._tracks[gone]
+        self._report()
+
+    def states(self) -> list[dict[str, Any]]:
+        """Every connection's state, as `connection.watch` rows."""
+        with self._lock:
+            return [
+                {
+                    "id": connection_id,
+                    "state": track.status[0],
+                    "message": track.status[1],
+                    "retryable": track.status[2],
+                    "mountpoint": track.mounted_at,
+                }
+                for connection_id, track in sorted(self._tracks.items())
+            ]
+
+    def _report(self) -> None:
+        """Hand the list on when it has changed, and only then."""
+        current = self.states()
+        if current == self._reported or self.on_states is None:
+            return
+        self._reported = current
+        try:
+            self.on_states(current)
+        except Exception:  # noqa: BLE001 - reporting must not stop reconnecting
+            log.exception("could not report connection states")
 
     def _consider(
         self,
@@ -236,8 +299,10 @@ class Reconnector:
                 # Mounted by anyone — this loop, Finder, `smbpal connect` — is
                 # a mount somebody wanted, and whatever held it is over.
                 track.held = None
+                track.held_status = None
                 track.failures = 0
                 track.next_try = 0.0
+                track.status = (CONNECTED, f"mounted at {mounted.mountpoint}", False)
                 return
 
             if track.mounted_at is not None:
@@ -250,12 +315,18 @@ class Reconnector:
                         f"lost from {gone_from} after the Mac slept or a server "
                         "stopped responding; reconnecting",
                     )
+                    track.status = (
+                        RECONNECTING,
+                        "the connection was lost; SMBPal is reconnecting",
+                        True,
+                    )
                 else:
                     track.held = (
                         f"it was unmounted from {gone_from} while nothing said its "
                         "server had gone, which is how an eject looks; "
                         "`smbpal connection connect` brings it back"
                     )
+                    track.held_status = _EJECTED
 
             if connection.get("disconnected"):
                 # Recorded by the daemon, so it survives this agent restarting.
@@ -265,11 +336,14 @@ class Reconnector:
                     "it was disconnected through SMBPal; "
                     "`smbpal connection connect` brings it back"
                 )
+                track.held_status = _DISCONNECTED
             if track.held is not None:
                 self._say(track, connection_id, f"not reconnecting: {track.held}")
+                track.status = track.held_status or _DISCONNECTED
                 return
             if (connection.get("auto_connect") or "on_this_network") == "never":
                 self._say(track, connection_id, "not connecting: auto_connect is never")
+                track.status = (DISABLED, "not connected automatically", False)
                 return
             if now < track.next_try:
                 return
@@ -279,7 +353,8 @@ class Reconnector:
         try:
             where = self._mount(connection)
         except NetFSError as exc:
-            self._failed(connection_id, exc.message, retryable=exc.retryable, now=now)
+            self._failed(connection_id, exc.message, retryable=exc.retryable,
+                         now=now, kind=exc.state)
             return
         except SmbpalError as exc:
             # The Keychain, the URL: nothing that names a refused credential,
@@ -292,22 +367,38 @@ class Reconnector:
                 track.mounted_at = track.last_at = where
                 track.failures = 0
                 track.next_try = 0.0
+                track.status = (CONNECTED, f"mounted at {where}", False)
                 self._say(track, connection_id, f"connected at {where}")
 
     def _failed(self, connection_id: str, message: str, *, retryable: bool,
-                now: float) -> None:
+                now: float, kind: str = FAILED) -> None:
         with self._lock:
             track = self._tracks.get(connection_id)
             if track is None:
                 return
             if not retryable:
                 track.held = f"the mount was refused: {message}"
+                # `auth_failed` keeps its own word, because the window offers
+                # the password for it; anything else refused is `failed`.
+                track.held_status = (
+                    AUTH_FAILED if kind == AUTH_FAILED else FAILED,
+                    f"{message}; SMBPal will not retry it until you connect it",
+                    False,
+                )
+                track.status = track.held_status
                 self._say(track, connection_id, f"not reconnecting: {track.held}",
                           warn=True)
                 return
             track.failures += 1
             delay = min(self.interval * (2 ** track.failures), MAX_BACKOFF)
             track.next_try = now + delay
+            # The machine's own rule: a retryable `failed` is `reconnecting`,
+            # and `unreachable` keeps its word because it says why.
+            track.status = (
+                UNREACHABLE if kind == UNREACHABLE else RECONNECTING,
+                f"{message}; SMBPal is trying again",
+                True,
+            )
             self._say(track, connection_id,
                       f"could not connect ({message}); trying again with backoff")
 

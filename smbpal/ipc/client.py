@@ -419,6 +419,20 @@ class Client:
                     detail="It may have been restarted.",
                 ) from exc
 
+    def listen_without_limit(self) -> None:
+        """Wait for events for as long as it takes, on a connected client.
+
+        `connect()` gives the socket `reply_timeout`, which is right for a
+        reply and wrong for a listener: nothing may change for hours. The
+        window's listener learned this in 0.1.0 and 0.2.0 (`gui/session.py`);
+        `smbpal watch` had not, and stopped with "no reply from the daemon
+        within 130s" after two quiet minutes -- found watching a Mac's
+        connection states on 15 October 2026. Safe on a Unix socket for the
+        reason the window gives: a daemon that dies closes its end.
+        """
+        self.reply_timeout = None
+        self._require_socket().settimeout(None)
+
     def peer(self) -> PeerCredentials:
         """Who is listening on the other end, as the kernel reports it."""
         return peer_credentials(self._require_socket())

@@ -1115,3 +1115,39 @@ class TestADismissedDialog(unittest.TestCase):
             held = client_module.Client("/nonexistent")._acquire(needed)
         self.assertIsNone(held)
         self.assertEqual(needed.detail, "the dialog was dismissed")
+
+
+class TestAListenerWaitsWithoutALimit(unittest.TestCase):
+    """`smbpal watch` stopped after 130 s of quiet, 15 October 2026."""
+
+    def test_the_socket_has_no_timeout_after_listen_without_limit(self) -> None:
+        here, there = socket.socketpair()
+        self.addCleanup(here.close)
+        self.addCleanup(there.close)
+        here.settimeout(client_module.REPLY_TIMEOUT)
+        client = client_module.Client("/nonexistent")
+        client._sock = here
+        client.listen_without_limit()
+        self.assertIsNone(here.gettimeout())
+        self.assertIsNone(client.reply_timeout)
+
+    def test_watch_asks_for_it_before_it_listens(self) -> None:
+        from smbpal.cli import main as cli
+
+        calls: list[str] = []
+
+        class Fake:
+            def call(self, method: str, params: Any = None) -> Any:
+                return []
+
+            def listen_without_limit(self) -> None:
+                calls.append("listen_without_limit")
+
+            def events(self) -> Any:
+                calls.append("events")
+                return iter(())
+
+        args = type("Args", (), {"json": False, "once": False})()
+        with mock.patch("builtins.print"):
+            cli._cmd_watch(Fake(), args)
+        self.assertEqual(calls, ["listen_without_limit", "events"])

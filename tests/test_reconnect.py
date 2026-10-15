@@ -470,3 +470,76 @@ class DisconnectFindsTheShare(unittest.TestCase):
         self.table.clear()
         self.unmount(mountpoint="/Volumes/Code", url="smb://nas.example/Code")
         self.assertEqual(self.unmounted, ["/Volumes/Code"])
+
+
+class WhatAPersonIsShown(unittest.TestCase):
+    """The states the loop reports, in `state/machine.py`'s words."""
+
+    def harness(self, **overrides: Any) -> tuple[Harness, list[list[dict[str, Any]]]]:
+        h = Harness([connection(**overrides)])
+        reports: list[list[dict[str, Any]]] = []
+        h.loop.on_states = reports.append
+        return h, reports
+
+    def last(self, reports: list[list[dict[str, Any]]]) -> dict[str, Any]:
+        return reports[-1][0]
+
+    def test_mounted_is_connected_with_where(self) -> None:
+        h, reports = self.harness()
+        h.tick()
+        self.assertEqual(self.last(reports)["state"], "connected")
+        self.assertEqual(self.last(reports)["mountpoint"], "/Volumes/Media")
+
+    def test_a_report_is_sent_when_something_changes_and_not_otherwise(self) -> None:
+        h, reports = self.harness()
+        h.tick()
+        h.tick()
+        h.tick()
+        self.assertEqual(len(reports), 1)
+
+    def test_an_eject_is_calm_and_says_so(self) -> None:
+        h, reports = self.harness()
+        h.tick()
+        h.drop()
+        h.tick()
+        self.assertEqual(self.last(reports)["state"], "idle")
+        self.assertIn("ejected", self.last(reports)["message"])
+
+    def test_a_disconnect_is_calm_and_says_so(self) -> None:
+        h, reports = self.harness(disconnected=True)
+        h.tick()
+        self.assertEqual(self.last(reports)["state"], "idle")
+        self.assertIn("disconnected", self.last(reports)["message"])
+
+    def test_never_is_disabled(self) -> None:
+        h, reports = self.harness(auto_connect="never")
+        h.tick()
+        self.assertEqual(self.last(reports)["state"], "disabled")
+
+    def test_a_refused_password_is_auth_failed(self) -> None:
+        h, reports = self.harness()
+        h.fail_with = NetFSError("refused", status=80, retryable=False, state="auth_failed")
+        h.tick()
+        self.assertEqual(self.last(reports)["state"], "auth_failed")
+        self.assertFalse(self.last(reports)["retryable"])
+
+    def test_an_unreachable_server_keeps_its_word_and_is_retried(self) -> None:
+        h, reports = self.harness()
+        h.fail_with = NetFSError("no route", status=65, retryable=True, state="unreachable")
+        h.tick()
+        self.assertEqual(self.last(reports)["state"], "unreachable")
+        self.assertTrue(self.last(reports)["retryable"])
+
+    def test_another_temporary_failure_is_reconnecting(self) -> None:
+        h, reports = self.harness()
+        h.fail_with = NetFSError("odd", status=-5000, retryable=True, state="failed")
+        h.tick()
+        self.assertEqual(self.last(reports)["state"], "reconnecting")
+
+    def test_every_reported_state_is_one_the_machine_knows(self) -> None:
+        from smbpal.state.machine import STATES
+
+        for overrides in ({}, {"disconnected": True}, {"auto_connect": "never"}):
+            h, reports = self.harness(**overrides)
+            h.tick()
+            self.assertIn(self.last(reports)["state"], STATES)

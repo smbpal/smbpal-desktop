@@ -67,8 +67,12 @@ class NetFSError(SmbpalError):
         detail: str | None = None,
         status: int | None = None,
         retryable: bool = False,
+        state: str = "failed",
     ) -> None:
         super().__init__(message, detail=detail)
+        # `describe`'s first word -- `auth_failed`, `unreachable`, `failed` --
+        # which is what a person is shown (`state/machine.py`).
+        self.state = state
         # **What the reconnect loop decides on**, carried rather than re-parsed
         # out of `detail`. §4's rule is the same one the Linux monitor applies
         # to the journal: a refused credential is never retried, because
@@ -357,12 +361,13 @@ def mount(
         )
 
         if status != 0:
-            _state, message, retryable = describe(status)
+            state, message, retryable = describe(status)
             raise NetFSError(
                 message,
                 detail=f"NetFSMountURLSync returned {status}",
                 status=status,
                 retryable=retryable,
+                state=state,
             )
 
         if not out or cf.CFArrayGetCount(out) < 1:
