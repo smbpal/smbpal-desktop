@@ -1,3 +1,24 @@
+smbpal (0.2.15) trixie; urgency=medium
+
+  * **macOS: shares reconnect by themselves.** macOS never puts back an SMB
+    share it has lost. The agent now does: it connects your shares at login,
+    puts a share back after the Mac sleeps or the server comes back, and
+    leaves alone a share you ejected or disconnected. A refused password is
+    never retried. Run `smbpal-agent --install` again after upgrading.
+  * **macOS: connecting, disconnecting and adding a connection with a
+    password work on an installed Mac.** The daemon could not reach the
+    agent, so all three failed. The agent now connects to the daemon instead.
+  * **macOS: `smbpal status` and `smbpal watch` say what each connection is
+    doing**, where they said "not applied". The window shows the same.
+  * **`connection add --user` stores the password and adds the connection in
+    one step.** If the password cannot be stored, nothing is added. On a Mac,
+    a share added this way could mount as a different account first.
+  * `smbpal watch` no longer stops after two minutes without a change.
+  * Dismissing a macOS administrator-password dialog no longer crashes the
+    command that asked for it.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Thu, 15 Oct 2026 18:09:00 +0100
+
 smbpal (0.2.14) trixie; urgency=medium
 
   * **macOS: the owner of a shared folder can open what another account

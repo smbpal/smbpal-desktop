@@ -10,7 +10,7 @@
 # no second removal step.
 
 Name:           smbpal
-Version:        0.2.14
+Version:        0.2.15
 Release:        1%{?dist}
 Summary:        Share folders over SMB, and connect to shares on other machines
 
@@ -261,6 +261,19 @@ fi
 %{_datadir}/icons/hicolor/scalable/status/smbpal-attention.svg
 
 %changelog
+* Thu Oct 15 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.15-1
+- macOS: shares reconnect by themselves. The agent connects your shares at
+  login, puts a share back after the Mac sleeps or the server comes back, and
+  leaves alone a share you ejected or disconnected. A refused password is
+  never retried. Run `smbpal-agent --install` again after upgrading.
+- macOS: connecting, disconnecting and adding a connection with a password
+  work on an installed Mac. The agent now connects to the daemon.
+- macOS: `smbpal status` and `smbpal watch` say what each connection is doing.
+- `connection add --user` stores the password and adds the connection in one
+  step. If the password cannot be stored, nothing is added.
+- `smbpal watch` no longer stops after two minutes without a change.
+- Dismissing a macOS administrator-password dialog no longer crashes the
+  command that asked for it.
 * Wed Oct 14 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.14-1
 - macOS: the owner of a shared folder can open what another account writes
   into it. `smbpal share make-writable` now gives the folder's owner access to
