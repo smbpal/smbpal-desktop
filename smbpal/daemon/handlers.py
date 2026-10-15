@@ -969,7 +969,48 @@ class Dispatcher:
         if self.monitor is not None:
             self.monitor.forget(connection["id"])
         _audit(peer, "connection.remove", connection["id"])
+        if self.agents is not None:
+            # After the record is gone, so the reconnect loop cannot see the
+            # share unmounted and put it back in between.
+            return {**connection, **self._release_mounts(connection, peer)}
         return connection
+
+    def _release_mounts(
+        self, connection: dict[str, Any], peer: PeerCredentials
+    ) -> dict[str, Any]:
+        """macOS: unmount what SMBPal mounted for a removed connection.
+
+        On Linux removing a connection reaps its units and so unmounts it. The
+        agent does the same here, but only for mounts it made (`agent/ledger.py`):
+        a share the person opened in Finder stays, and so does one in use. Each
+        is said, because a mount that silently outlives its connection is one
+        nobody manages and nobody notices.
+        """
+        share = str(connection.get("share"))
+        try:
+            released = self.agents.for_uid(peer.uid).release(_smb_url(connection))
+        except SmbpalError as exc:
+            return {
+                "unmounted": [],
+                "notes": [
+                    f"{share} was not unmounted: {exc.message}. If it is still "
+                    "mounted, eject it in Finder."
+                ],
+            }
+        notes = []
+        for left in released.get("left", []):
+            where = left.get("mountpoint", "")
+            if left.get("reason") == "busy":
+                notes.append(
+                    f"{share} is still mounted at {where} because it is in use. "
+                    "Eject it in Finder once nothing is using it."
+                )
+            else:
+                notes.append(
+                    f"{share} is still mounted at {where}. SMBPal did not mount it, "
+                    "so it was left alone; eject it in Finder if you no longer need it."
+                )
+        return {"unmounted": list(released.get("unmounted", [])), "notes": notes}
 
     def _connection_set_credentials(
         self, request: Request, peer: PeerCredentials

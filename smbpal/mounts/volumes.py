@@ -104,6 +104,10 @@ class SmbMount:
     share: str
     mountpoint: str
     owner_uid: int
+    # `f_fsid`: which mount this is, not only where. A share unmounted and
+    # mounted again at the same path is a different mount, and the agent's
+    # ledger must not mistake Finder's second mount for its own first.
+    fsid: tuple[int, int] = (0, 0)
 
     @property
     def key(self) -> tuple[str, str]:
@@ -182,6 +186,7 @@ def smb_mounts() -> list[SmbMount]:
                 share=parsed[1],
                 mountpoint=entry.f_mntonname.decode(errors="replace"),
                 owner_uid=int(entry.f_owner),
+                fsid=(int(entry.f_fsid[0]), int(entry.f_fsid[1])),
             )
         )
     return found

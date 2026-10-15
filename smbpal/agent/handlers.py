@@ -41,6 +41,7 @@ from smbpal.errors import SmbpalError
 from smbpal.ipc.protocol import Request, encode_failure, encode_success, parse_request
 from smbpal.ipc.transport import Connection
 from smbpal.agent import keychain as keychain_module
+from smbpal.agent.ledger import MountLedger
 from smbpal.mounts import netfs, volumes
 
 log = logging.getLogger(__name__)
@@ -71,6 +72,7 @@ class AgentDispatcher:
         mounter: Any = netfs,
         keychain: Any = keychain_module,
         mounts: Callable[[], list[volumes.SmbMount]] = volumes.smb_mounts,
+        ledger: Any = None,
     ) -> None:
         # Injected so the suite can run on Linux, where neither NetFS nor the
         # Keychain exists and where CI runs. The defaults are the real things.
@@ -78,6 +80,9 @@ class AgentDispatcher:
         self.mounter = mounter
         self.keychain = keychain
         self.mounts = mounts
+        # Which mounts SMBPal made (`agent/ledger.py`). In memory unless `main`
+        # gives it a file, so the suite never writes into a home directory.
+        self.ledger = ledger if ledger is not None else MountLedger(mounts=mounts)
         # One mount at a time. The reconnect loop and a `connect` from the
         # daemon can otherwise both find a share unmounted and both mount it,
         # and macOS answers the second with `/Volumes/Code-1`.
@@ -162,6 +167,7 @@ class AgentDispatcher:
                 password = self.keychain.get_password(str(host), user)
                 looked_up = password is not None
         where = self.mounter.mount(url, user=user, password=password)
+        self._remember(url, where)
         # The URL is safe to log and the password was never in the message we
         # keep: `request.params` is not logged anywhere, and this line names
         # only what a mount table would show anyway. Whether a credential was
@@ -173,6 +179,47 @@ class AgentDispatcher:
             " (credential from the Keychain)" if looked_up else "",
         )
         return {"url": url, "mountpoint": where, "used_keychain": looked_up}
+
+    def _remember(self, url: str, where: str) -> None:
+        """Write the mount just made into the ledger, by its filesystem id."""
+        key = volumes.key_for_url(url)
+        for mount in self.mounts():
+            if mount.owner_uid == self.uid and mount.key == key and mount.mountpoint == where:
+                self.ledger.record(mount)
+                return
+        log.warning("mounted %s at %s but cannot find it in the mount table", url, where)
+
+    def _release(self, request: Request) -> dict[str, Any]:
+        """Unmount what SMBPal mounted for a share, and say what was left.
+
+        For `connection remove`. Unlike a disconnect, which unmounts the share
+        wherever it is because a person asked for exactly that, removal only
+        undoes SMBPal's own work: a mount the ledger does not hold is left
+        alone and reported, and so is one macOS will not unmount because it is
+        in use.
+        """
+        url = _require_str(request.params, "url")
+        key = volumes.key_for_url(url)
+        unmounted: list[str] = []
+        left: list[dict[str, str]] = []
+        for mount in self.mounts():
+            if mount.owner_uid != self.uid or mount.key != key:
+                continue
+            if not self.ledger.owns(mount):
+                left.append({"mountpoint": mount.mountpoint, "reason": "not-ours"})
+                continue
+            try:
+                self.mounter.unmount(mount.mountpoint)
+            except SmbpalError as exc:
+                left.append(
+                    {"mountpoint": mount.mountpoint, "reason": "busy", "detail": exc.message}
+                )
+                continue
+            self.ledger.forget(mount)
+            unmounted.append(mount.mountpoint)
+        if unmounted:
+            log.info("released %s: unmounted %s", url, ", ".join(unmounted))
+        return {"url": url, "unmounted": unmounted, "left": left}
 
     def _unmount(self, request: Request) -> dict[str, Any]:
         """Unmount, by the share when the caller names it.
@@ -204,6 +251,9 @@ class AgentDispatcher:
         # a person "unmounted" from "there was nothing mounted there" rather
         # than reporting the first for both.
         unmounted = [where for where in targets if self.mounter.unmount(where)]
+        for mount in self.mounts():
+            if mount.mountpoint in unmounted:
+                self.ledger.forget(mount)
         if self.reconnector is not None:
             # Held whether or not anything was mounted there: "disconnect" is
             # the state the person asked for, and a mount that had already
@@ -337,6 +387,7 @@ class AgentDispatcher:
             "agent.ping": self._ping,
             "agent.mount": self._mount,
             "agent.unmount": self._unmount,
+            "agent.release": self._release,
             "agent.remount_url": self._remount_url,
             "agent.credential_set": self._credential_set,
             "agent.credential_present": self._credential_present,

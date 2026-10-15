@@ -134,6 +134,11 @@ class AgentClient:
         result = self._call("agent.unmount", params, timeout=MOUNT_TIMEOUT)
         return bool(result.get("unmounted", True))
 
+    def release(self, url: str) -> dict[str, Any]:
+        """Unmount what SMBPal mounted for this share; report what was left."""
+        result = self._call("agent.release", {"url": url}, timeout=MOUNT_TIMEOUT)
+        return result if isinstance(result, dict) else {}
+
     def remount_url(self, mountpoint: str) -> str | None:
         result = self._call(
             "agent.remount_url", {"mountpoint": mountpoint}, timeout=DEFAULT_TIMEOUT
