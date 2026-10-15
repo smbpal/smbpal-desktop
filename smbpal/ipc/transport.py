@@ -35,11 +35,18 @@ class Connection(Protocol):
 # say nothing. It is called on the connection's own thread.
 Handler = Callable[[Connection, bytes], bytes | None]
 
+# Told when a connection has gone, on that connection's thread, after its last
+# frame. For state held per connection -- the daemon's registered agents --
+# which would otherwise outlive the peer it describes.
+Disconnected = Callable[[Connection], None]
+
 
 class Transport(Protocol):
     """Somewhere clients arrive from."""
 
-    def serve_forever(self, handler: Handler) -> None: ...
+    def serve_forever(
+        self, handler: Handler, on_disconnect: Disconnected | None = None
+    ) -> None: ...
 
     def broadcast(self, payload: bytes) -> None:
         """Push one framed message to every live connection (M5's channel)."""

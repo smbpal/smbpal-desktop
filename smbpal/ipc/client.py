@@ -31,6 +31,7 @@ from smbpal.errors import (
     UnknownMethod,
     UnsupportedVersion,
 )
+from smbpal.ipc.peer import PeerCredentials, peer_credentials
 from smbpal.ipc.protocol import MAX_FRAME_BYTES
 from smbpal.ipc.server import DEFAULT_SOCKET_PATH
 
@@ -381,6 +382,43 @@ class Client:
                 if message.get("id") != request_id:
                     continue
                 return self._unwrap(message)
+
+    def send(self, method: str, params: dict[str, Any] | None = None) -> None:
+        """Send one request and do not wait for its reply.
+
+        **For a client whose own reading is elsewhere** -- the agent's link,
+        which sits in `events()` answering the daemon's requests. Answering
+        with `call` would read until its own reply, and a request the daemon
+        sent in the meantime would be read there and dropped as an unsolicited
+        event. The reply to this one arrives later as a response, which
+        `events()` already skips.
+        """
+        with self._lock:
+            sock = self._require_socket()
+            self._counter += 1
+            frame = (
+                json.dumps(
+                    {
+                        "v": PROTOCOL_VERSION,
+                        "id": str(self._counter),
+                        "method": method,
+                        "params": params or {},
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            try:
+                sock.sendall(frame)
+            except OSError as exc:
+                raise DaemonUnreachable(
+                    "the daemon closed the connection",
+                    detail="It may have been restarted.",
+                ) from exc
+
+    def peer(self) -> PeerCredentials:
+        """Who is listening on the other end, as the kernel reports it."""
+        return peer_credentials(self._require_socket())
 
     def events(self) -> Iterator[dict[str, Any]]:
         """Yield pushed events. For a client that only listens (M5, the tray)."""

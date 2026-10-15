@@ -102,6 +102,12 @@ _CONNECTION_KEYS = {
     # Absent on every Linux connection and on every macOS one made before the
     # credential was set.
     "keychain_credential",
+    # macOS only. True after `connection disconnect`, until `connection
+    # connect`: the reconnect loop leaves it alone. Here rather than in the
+    # agent's memory because an agent restart, a logout or a reboot would
+    # otherwise forget it and the first pass would mount it straight back --
+    # found reinstalling the agent on 15 October 2026.
+    "disconnected",
 }
 _TOP_KEYS = {"version", "shares", "connections"}
 
@@ -249,6 +255,9 @@ def _validate_connection(
     _check_host(problems, f"{where}.fallback_host", connection.get("fallback_host"))
     _check_remote_account(
         problems, f"{where}.credential_account", connection.get("credential_account")
+    )
+    _check_optional_bool(
+        problems, f"{where}.disconnected", connection.get("disconnected")
     )
     keychain = connection.get("keychain_credential")
     if keychain is not None and keychain not in KEYCHAIN_CREDENTIAL_VALUES:

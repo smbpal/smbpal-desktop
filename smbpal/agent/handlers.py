@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
@@ -40,7 +41,7 @@ from smbpal.errors import SmbpalError
 from smbpal.ipc.protocol import Request, encode_failure, encode_success, parse_request
 from smbpal.ipc.transport import Connection
 from smbpal.agent import keychain as keychain_module
-from smbpal.mounts import netfs
+from smbpal.mounts import netfs, volumes
 
 log = logging.getLogger(__name__)
 
@@ -69,12 +70,22 @@ class AgentDispatcher:
         uid: int | None = None,
         mounter: Any = netfs,
         keychain: Any = keychain_module,
+        mounts: Callable[[], list[volumes.SmbMount]] = volumes.smb_mounts,
     ) -> None:
         # Injected so the suite can run on Linux, where neither NetFS nor the
         # Keychain exists and where CI runs. The defaults are the real things.
         self.uid = os.getuid() if uid is None else uid
         self.mounter = mounter
         self.keychain = keychain
+        self.mounts = mounts
+        # One mount at a time. The reconnect loop and a `connect` from the
+        # daemon can otherwise both find a share unmounted and both mount it,
+        # and macOS answers the second with `/Volumes/Code-1`.
+        self._mount_lock = threading.Lock()
+        # Set by `main` when the reconnect loop runs, so a connect or
+        # disconnect asked for through SMBPal reaches it: the loop must not
+        # mount back what somebody disconnected on purpose.
+        self.reconnector: Any = None
 
     # --- the methods -------------------------------------------------------
 
@@ -97,11 +108,56 @@ class AgentDispatcher:
         caller working, at the cost of its lowercasing.
         """
         url = _require_str(request.params, "url")
-        user = request.params.get("user") or None
-        password = request.params.get("password") or None
+        result = self.mount_url(
+            url,
+            user=request.params.get("user") or None,
+            password=request.params.get("password") or None,
+            host=request.params.get("host") or None,
+        )
+        if self.reconnector is not None:
+            self.reconnector.connected(url, result["mountpoint"])
+        return result
+
+    def mount_url(
+        self,
+        url: str,
+        *,
+        user: str | None = None,
+        password: str | None = None,
+        host: str | None = None,
+    ) -> dict[str, Any]:
+        """The mount itself, shared by `agent.mount` and the reconnect loop.
+
+        **A share already mounted by this user is answered, not mounted
+        again.** Found on 15 October 2026: the loop had mounted Code at
+        `/Volumes/Code` a moment before `connection connect` arrived, and NetFS
+        mounted a second copy at `/Volumes/Code-1`. The table is read without
+        blocking (`mounts/volumes.py`), under the same lock as the mount.
+        """
+        with self._mount_lock:
+            key = volumes.key_for_url(url)
+            for existing in self.mounts():
+                if existing.owner_uid == self.uid and existing.key == key:
+                    log.info("%s is already mounted at %s", url, existing.mountpoint)
+                    return {
+                        "url": url,
+                        "mountpoint": existing.mountpoint,
+                        "used_keychain": False,
+                        "already": True,
+                    }
+            return self._mount_now(url, user=user, password=password, host=host)
+
+    def _mount_now(
+        self,
+        url: str,
+        *,
+        user: str | None,
+        password: str | None,
+        host: str | None,
+    ) -> dict[str, Any]:
         looked_up = False
         if password is None and user:
-            host = request.params.get("host") or urlsplit(url).hostname
+            host = host or urlsplit(url).hostname
             if host:
                 password = self.keychain.get_password(str(host), user)
                 looked_up = password is not None
@@ -119,12 +175,46 @@ class AgentDispatcher:
         return {"url": url, "mountpoint": where, "used_keychain": looked_up}
 
     def _unmount(self, request: Request) -> dict[str, Any]:
+        """Unmount, by the share when the caller names it.
+
+        **A recorded mountpoint goes stale**, and the record is all the daemon
+        has: macOS chooses where a mount lands, and Finder, an eject or a
+        duplicate can move it after the daemon wrote it down. Found on
+        15 October 2026: the record said `/Volumes/Code-1`, Code was mounted
+        at `/Volumes/Code`, and `disconnect` reported "nothing was mounted"
+        while the share stayed mounted. So with a `url` the mount table is
+        asked which of this user's mounts are that share, and every one of
+        them is unmounted: a disconnect means none, not one fewer. The
+        `mountpoint` is still tried when the table has nothing, which keeps a
+        caller that sends no URL working as before.
+        """
         mountpoint = _require_str(request.params, "mountpoint")
+        url = request.params.get("url")
+        targets: list[str] = []
+        if isinstance(url, str) and url:
+            key = volumes.key_for_url(url)
+            targets = [
+                m.mountpoint
+                for m in self.mounts()
+                if m.owner_uid == self.uid and m.key == key
+            ]
+        if not targets:
+            targets = [mountpoint]
         # `unmount` is idempotent and says which it was, so the caller can tell
         # a person "unmounted" from "there was nothing mounted there" rather
         # than reporting the first for both.
-        unmounted = bool(self.mounter.unmount(mountpoint))
-        return {"mountpoint": mountpoint, "unmounted": unmounted}
+        unmounted = [where for where in targets if self.mounter.unmount(where)]
+        if self.reconnector is not None:
+            # Held whether or not anything was mounted there: "disconnect" is
+            # the state the person asked for, and a mount that had already
+            # dropped is exactly the one the loop would otherwise put back.
+            for where in {mountpoint, *targets}:
+                self.reconnector.released(where)
+        return {
+            "mountpoint": unmounted[0] if unmounted else mountpoint,
+            "unmounted": bool(unmounted),
+            "mountpoints": unmounted,
+        }
 
     def _remount_url(self, request: Request) -> dict[str, Any]:
         mountpoint = _require_str(request.params, "mountpoint")
@@ -176,6 +266,18 @@ class AgentDispatcher:
             "account": account,
             "removed": self.keychain.forget(host, account),
         }
+
+    def perform(self, method: str, params: dict[str, Any]) -> Any:
+        """Run one method for a request that came down the daemon link.
+
+        The socket's ownership check does not apply, and nothing is skipped by
+        that: the link only exists once `agent/link.py` has confirmed the
+        listener is the daemon, which is the caller `_may` admits anyway.
+        """
+        handler = self._methods().get(method)
+        if handler is None:
+            raise UnknownMethod(f"no such method: {method}")
+        return handler(Request(id="link", method=method, params=params))
 
     # --- who may ask -------------------------------------------------------
 

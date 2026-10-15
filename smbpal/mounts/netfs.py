@@ -36,6 +36,7 @@ import errno as _errno
 import logging
 import sys
 from typing import Any
+from urllib.parse import quote
 
 from smbpal.errors import SmbpalError
 
@@ -58,6 +59,24 @@ FORCE_NEW_SESSION_KEY = "ForceNewSession"
 
 class NetFSError(SmbpalError):
     code = "netfs"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        detail: str | None = None,
+        status: int | None = None,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message, detail=detail)
+        # **What the reconnect loop decides on**, carried rather than re-parsed
+        # out of `detail`. §4's rule is the same one the Linux monitor applies
+        # to the journal: a refused credential is never retried, because
+        # retrying one is how accounts get locked out, and anything temporary
+        # is. `retryable` defaults to False so that an error raised without a
+        # status -- a URL that does not parse -- is not tried again for ever.
+        self.status = status
+        self.retryable = retryable
 
 
 # --- the platform's numbers -------------------------------------------------
@@ -338,8 +357,13 @@ def mount(
         )
 
         if status != 0:
-            _state, message, _retryable = describe(status)
-            raise NetFSError(message, detail=f"NetFSMountURLSync returned {status}")
+            _state, message, retryable = describe(status)
+            raise NetFSError(
+                message,
+                detail=f"NetFSMountURLSync returned {status}",
+                status=status,
+                retryable=retryable,
+            )
 
         if not out or cf.CFArrayGetCount(out) < 1:
             raise NetFSError(
@@ -393,6 +417,30 @@ def unmount(mountpoint: str, *, force: bool = False) -> bool:
         message if code in _STATUS else f"could not unmount {mountpoint}",
         detail=f"unmount(2) failed with errno {code}",
     )
+
+
+def smb_url(host: str, share: str) -> str:
+    """`smb://host/share`, and nothing else in it.
+
+    **No username and no password, deliberately.** `mount_smbfs` takes the
+    credential in the URL, which is the reason §3.2 ruled it out: a URL is the
+    kind of string that ends up in an argv, a log line and a mount table.
+    `NetFSMountURLSync` takes both as separate arguments (D13), so the URL here
+    carries only what it has to.
+
+    The share name is percent-encoded because it is allowed to contain a space
+    — `mount` refuses a string CoreFoundation cannot parse as a URL, and does
+    it before touching the network, so this would fail as *not a URL* rather
+    than as anything to do with the share. An IPv6 literal is bracketed for the
+    same reason.
+
+    Here rather than in the daemon since the agent began mounting on its own
+    account (`agent/reconnect.py`): two callers building the same URL two ways
+    is how one of them comes to address a different share.
+    """
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"smb://{host}/{quote(share, safe='')}"
 
 
 def remount_url(mountpoint: str) -> str | None:

@@ -236,3 +236,14 @@ class TestRaising(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDisconnected(unittest.TestCase):
+    def doc(self, value: object) -> dict[str, object]:
+        return {"version": SCHEMA_VERSION, "connections": [_connection(disconnected=value)]}
+
+    def test_true_is_valid(self) -> None:
+        self.assertEqual(validate(self.doc(True)), [])
+
+    def test_a_string_is_refused(self) -> None:
+        self.assertIn("connections[0].disconnected", _problems(self.doc("yes")))

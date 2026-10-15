@@ -26,7 +26,7 @@ from typing import Iterator
 
 from smbpal.ipc.peer import PeerCredentials, peer_credentials
 from smbpal.ipc.protocol import MAX_FRAME_BYTES
-from smbpal.ipc.transport import Handler
+from smbpal.ipc.transport import Disconnected, Handler
 
 log = logging.getLogger(__name__)
 
@@ -200,6 +200,7 @@ class UnixSocketTransport:
         self._connections_lock = threading.Lock()
         self._threads_lock = threading.Lock()
         self._threads: list[threading.Thread] = []
+        self._on_disconnect: Disconnected | None = None
         self._stopping = threading.Event()
         # **Closing the listener does not stop `accept()` on Linux.** It does
         # on macOS, which is why this was written without a wake-up and why
@@ -388,7 +389,10 @@ class UnixSocketTransport:
                 "does on macOS."
             ) from None
 
-    def serve_forever(self, handler: Handler) -> None:
+    def serve_forever(
+        self, handler: Handler, on_disconnect: Disconnected | None = None
+    ) -> None:
+        self._on_disconnect = on_disconnect
         listener = self._listener
         if listener is None:
             if self._stopping.is_set():
@@ -483,6 +487,11 @@ class UnixSocketTransport:
                 self._connections.discard(connection)
             connection.close()
             log.debug("client disconnected: %s", peer.describe())
+            if self._on_disconnect is not None:
+                try:
+                    self._on_disconnect(connection)
+                except Exception:  # noqa: BLE001 - a hook must not kill the thread
+                    log.exception("disconnect hook failed for %s", peer.describe())
 
     def broadcast(self, payload: bytes) -> None:
         """M5's push channel. Nothing emits events yet; the path exists."""
