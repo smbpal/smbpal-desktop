@@ -18,7 +18,7 @@ from pathlib import Path
 from types import FrameType
 
 from smbpal import __version__, version_banner
-from smbpal.agent.client import AgentClients
+from smbpal.agent.client import AgentClients, AgentLinks
 from smbpal.config import ConfigStore
 from smbpal.config.store import DEFAULT_CONFIG_PATH
 from smbpal.daemon.handlers import Authoriser, Dispatcher
@@ -193,13 +193,24 @@ def main(argv: list[str] | None = None) -> int:
         log.error("cannot bind %s: %s", args.socket, exc)
         return 2
 
+    mount_via_agent = mounts_via_agent(args.mount_via, sys.platform)
     applier: Applier | None = None
     mounter: Mounter | None = None
     if not args.no_apply:
-        mounter = Mounter(
-            unit_dir=args.unit_dir,
-            credentials=CredentialsStore(args.credentials_dir),
-        )
+        if not mount_via_agent:
+            # **Not on macOS.** `Mounter` is systemd units and a mountpoint the
+            # daemon creates, and on macOS NetFS chooses the mountpoint and the
+            # agent mounts (D13). Left in, every `connection add` on an
+            # installed Mac ran it: `_smbpald` cannot create anything in root's
+            # `/Volumes`, and cannot even see into a share somebody already
+            # mounted there, so the add was rolled back -- `cannot create
+            # /Volumes/Code`, File exists, found adding a share Finder had
+            # mounted on 15 October 2026. The systemd-based state monitor goes
+            # with it, since it can only report states systemd knows.
+            mounter = Mounter(
+                unit_dir=args.unit_dir,
+                credentials=CredentialsStore(args.credentials_dir),
+            )
         applier = Applier(
             smb_conf=args.smb_conf,
             smbpal_conf=args.smbpal_conf,
@@ -238,14 +249,20 @@ def main(argv: list[str] | None = None) -> int:
     # measurements point into the user's session (D13). `auto` is the whole of
     # the platform decision, in one place, rather than a `sys.platform` test
     # scattered through the handlers.
-    agents: AgentClients | None = None
-    if args.mount_via == "agent" or (
-        args.mount_via == "auto" and sys.platform == "darwin"
-    ):
-        agents = AgentClients(directory=args.agent_socket_dir)
+    agents: AgentClients | AgentLinks | None = None
+    if mount_via_agent:
+        # **The agent dials in**, because this daemon runs as `_smbpald` and
+        # cannot open an agent's socket inside somebody's home (see
+        # `AgentLinks`). `--agent-socket-dir` keeps the old direction for a
+        # development daemon whose agents listen in one shared directory.
+        agents = (
+            AgentClients(directory=args.agent_socket_dir)
+            if args.agent_socket_dir is not None
+            else AgentLinks()
+        )
         log.info(
-            "mounting is delegated to each user's own smbpal-agent; "
-            "they install it with `smbpal-agent --install`"
+            "mounting is delegated to each user's own smbpal-agent, which "
+            "connects here; they install it with `smbpal-agent --install`"
         )
 
     # The same shape as `--mount-via auto` above: the platform decision in one
@@ -296,13 +313,23 @@ def main(argv: list[str] | None = None) -> int:
     log.info("smbpald %s ready", __version__)
 
     try:
-        transport.serve_forever(dispatcher.handle)
+        transport.serve_forever(dispatcher.handle, dispatcher.disconnected)
     finally:
         _sd_notify("STOPPING=1")
         if monitor is not None:
             monitor.stop()
         transport.shutdown()
     return 0
+
+
+def mounts_via_agent(mount_via: str, platform: str) -> bool:
+    """Whether connections are mounted by each user's agent rather than here.
+
+    It decides two things, which is why it is one function: the daemon holds
+    no `Mounter` (no systemd units, no mountpoint it creates), and it takes
+    agents' links instead.
+    """
+    return mount_via == "agent" or (mount_via == "auto" and platform == "darwin")
 
 
 def choose_applier(

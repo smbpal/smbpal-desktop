@@ -12,10 +12,9 @@ import sys
 import os
 import pwd
 from typing import Any, Callable
-from urllib.parse import quote
 
 from smbpal import PROTOCOL_VERSION, __version__
-from smbpal.agent.client import AgentClients
+from smbpal.agent.client import AgentClients, AgentLinks
 from smbpal.config import ConfigStore
 from smbpal.config import operations as ops
 from smbpal.discovery import discover
@@ -33,7 +32,7 @@ from smbpal.errors import (
 )
 from smbpal.daemon import polkit
 from smbpal.system import authorization as macos_auth
-from smbpal.mounts import inventory, systemd, units
+from smbpal.mounts import inventory, netfs, systemd, units
 from smbpal.mounts.apply import Mounter
 from smbpal.samba import passwd
 from smbpal.samba.apply import Applier
@@ -318,6 +317,12 @@ class Dispatcher:
         request: Request | None = None
         try:
             request = parse_request(frame)
+            if request.method in _LINK_METHODS:
+                # Before the method table, because these act on the connection
+                # itself and every method in the table is given a peer instead.
+                return encode_success(
+                    request.id, self._agent_link(request, connection)
+                )
             # Existence before permission. Answering "requires authorisation"
             # for a method that does not exist sends someone hunting for a
             # permission problem they do not have — the same failure mode M0 §4
@@ -1090,6 +1095,36 @@ class Dispatcher:
             "the folder, which on some desktops is immediately.",
         }
 
+    # --- the agent's own link (macOS) ---------------------------------------
+
+    def disconnected(self, connection: Connection) -> None:
+        """The transport's disconnect hook: an agent that left is not there."""
+        if isinstance(self.agents, AgentLinks):
+            self.agents.drop(connection)
+
+    def _agent_link(self, request: Request, connection: Connection) -> dict[str, Any]:
+        """`agent.register` and `agent.reply`, which only an agent sends.
+
+        **No authorisation step, and none is missing.** Registering offers
+        nothing but the caller's own session: it is filed under the uid the
+        kernel reported, so it can only ever receive requests made for that
+        same uid — by its owner, through methods the authoriser has already
+        gated. A reply is accepted only from the connection its request was
+        sent down (`AgentLinks.reply`). Reaching the socket at all already
+        took membership of `smbpal`.
+        """
+        if not isinstance(self.agents, AgentLinks):
+            raise NotSupported(
+                f"{request.method} is for the macOS agent, and this daemon does "
+                "not mount through one"
+            )
+        if request.method == "agent.register":
+            self.agents.register(connection)
+            _audit(connection.peer, "agent.register", str(connection.peer.uid))
+            return {"uid": connection.peer.uid}
+        self.agents.reply(connection, request.params)
+        return {}
+
     # --- mounting through a per-user agent (macOS, D13) --------------------
 
     def _connect_via_agent(
@@ -1116,12 +1151,33 @@ class Dispatcher:
             host=str(connection["host"]),
         )
         _audit(peer, "connection.connect", connection["id"])
+        self._set_disconnected(connection, False)
         return {
             "id": connection["id"],
             "url": url,
             "mountpoint": landed,
             **self._record_where_it_landed(connection, landed),
         }
+
+    def _set_disconnected(self, connection: dict[str, Any], value: bool) -> None:
+        """Record a disconnect, or clear one, where the agent's loop reads it.
+
+        Absent rather than `false` when cleared, so a connection that was never
+        disconnected and one that was reconnected read the same.
+        """
+        previous = self.store.load()
+        changed = False
+        rows = []
+        for candidate in previous.get("connections", []):
+            if candidate.get("id") == connection["id"]:
+                if bool(candidate.get("disconnected")) != value:
+                    changed = True
+                    candidate = {k: v for k, v in candidate.items() if k != "disconnected"}
+                    if value:
+                        candidate["disconnected"] = True
+            rows.append(candidate)
+        if changed:
+            self.store.save({**previous, "connections": rows})
 
     def _record_where_it_landed(
         self, connection: dict[str, Any], landed: str
@@ -1182,8 +1238,9 @@ class Dispatcher:
     ) -> dict[str, Any]:
         connection = self._connection_for(request)
         agent = self.agents.for_uid(peer.uid)
-        unmounted = agent.unmount(connection["mountpoint"])
+        unmounted = agent.unmount(connection["mountpoint"], url=_smb_url(connection))
         _audit(peer, "connection.disconnect", connection["id"])
+        self._set_disconnected(connection, True)
         # **The Linux note is false here and must not be repeated.** There it
         # warns that the automount is still armed, so the share comes back the
         # moment anything opens the folder. macOS has no automount: §6.8
@@ -1360,25 +1417,8 @@ def _find_connection(config: dict[str, Any], ref: str) -> dict[str, Any]:
 
 
 def _smb_url(connection: dict[str, Any]) -> str:
-    """`smb://host/share`, and nothing else in it.
-
-    **No username and no password, deliberately.** `mount_smbfs` takes the
-    credential in the URL, which is the reason §3.2 ruled it out: a URL is the
-    kind of string that ends up in an argv, a log line and a mount table.
-    `NetFSMountURLSync` takes both as separate arguments (D13), so the URL here
-    carries only what it has to.
-
-    The share name is percent-encoded because it is allowed to contain a space
-    — `netfs.mount` refuses a string CoreFoundation cannot parse as a URL, and
-    does it before touching the network, so this would fail as *not a URL*
-    rather than as anything to do with the share. An IPv6 literal is bracketed
-    for the same reason.
-    """
-    host = str(connection["host"])
-    if ":" in host and not host.startswith("["):
-        host = f"[{host}]"
-    share = quote(str(connection["share"]), safe="")
-    return f"smb://{host}/{share}"
+    """The connection's URL, built where the agent builds it: `netfs.smb_url`."""
+    return netfs.smb_url(str(connection["host"]), str(connection["share"]))
 
 
 def _find_share(config: dict[str, Any], ref: str) -> dict[str, Any]:
@@ -1456,6 +1496,8 @@ _PRECHECKS = {
     "share.add": _require_account,
 }
 
+
+_LINK_METHODS = frozenset({"agent.register", "agent.reply"})
 
 _METHODS: dict[str, Method] = {
     "ping": Dispatcher._ping,

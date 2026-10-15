@@ -33,8 +33,12 @@ from types import FrameType
 from smbpal import __version__, version_banner
 from smbpal.agent.handlers import AgentDispatcher
 from smbpal.agent import launchd
+from smbpal.agent.client import username_for_uid
+from smbpal.agent.link import DaemonLink
+from smbpal.agent.reconnect import DEFAULT_INTERVAL, Reconnector
 from smbpal.errors import SmbpalError
-from smbpal.ipc.server import UnixSocketTransport
+from smbpal.ipc.client import Client
+from smbpal.ipc.server import UnixSocketTransport, default_socket_path as daemon_socket_path
 from smbpal.mounts import netfs
 
 log = logging.getLogger(__name__)
@@ -83,6 +87,26 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="say whether the LaunchAgent is installed, loaded, and still "
         "pointing at this copy of the program",
+    )
+    parser.add_argument(
+        "--no-reconnect",
+        action="store_true",
+        help="mount only when asked: do not connect this user's connections at "
+        "login or put them back after sleep or a lost server",
+    )
+    parser.add_argument(
+        "--reconnect-interval",
+        type=float,
+        default=DEFAULT_INTERVAL,
+        help=f"seconds between reconnect checks (default {DEFAULT_INTERVAL:g}); "
+        "a volume mounting or unmounting wakes the check sooner",
+    )
+    parser.add_argument(
+        "--daemon-socket",
+        type=Path,
+        default=None,
+        help="where smbpald listens, which is where the connection list is read "
+        f"(default {daemon_socket_path()})",
     )
     parser.add_argument(
         "--program",
@@ -156,13 +180,69 @@ def main(argv: list[str] | None = None) -> int:
         print(f"smbpal-agent: cannot bind {path}: {exc}", file=sys.stderr)
         return 2
 
+    daemon_socket = args.daemon_socket or daemon_socket_path()
+    reconnector: Reconnector | None = None
+    if not args.no_reconnect:
+        reconnector = build_reconnector(
+            dispatcher,
+            daemon_socket=daemon_socket,
+            interval=args.reconnect_interval,
+        )
+        dispatcher.reconnector = reconnector
+    # How the daemon reaches this agent: it cannot open this socket, so the
+    # agent dials the daemon's and holds it open (`agent/link.py`).
+    link = DaemonLink(dispatcher, daemon_socket)
+
     _install_signal_handlers(transport)
     log.info("smbpal-agent %s listening on %s (uid %s)", __version__, path, os.getuid())
+    link.start()
+    if reconnector is not None:
+        reconnector.start()
     try:
         transport.serve_forever(dispatcher.handle)
     finally:
+        if reconnector is not None:
+            reconnector.stop()
+        link.stop()
         transport.shutdown()
     return 0
+
+
+def build_reconnector(
+    dispatcher: AgentDispatcher, *, daemon_socket: Path, interval: float
+) -> Reconnector:
+    """The loop, wired to the daemon's list and to this agent's own mount.
+
+    **The list comes from the daemon and the mount happens here.** Reading
+    `connection.list` needs only membership of the `smbpal` group, which the
+    install already asks for; nothing about the link from the daemon to this
+    agent is involved, which is the point (see `agent/reconnect.py`).
+    """
+
+    def connections() -> list[dict]:
+        with Client(daemon_socket, timeout=5.0, reply_timeout=10.0) as client:
+            listed = client.call("connection.list")
+        return listed if isinstance(listed, list) else []
+
+    def mount(connection: dict) -> str:
+        host = str(connection["host"])
+        account = connection.get("credential_account")
+        result = dispatcher.mount_url(
+            netfs.smb_url(host, str(connection["share"])),
+            user=str(account) if account else None,
+            # The Keychain key is the record's host verbatim, as the daemon
+            # stored it -- the same reason `agent.mount` takes `host`.
+            host=host,
+        )
+        return str(result["mountpoint"])
+
+    return Reconnector(
+        uid=dispatcher.uid,
+        username=username_for_uid(dispatcher.uid),
+        connections=connections,
+        mount=mount,
+        interval=interval,
+    )
 
 
 def _problem(line: str) -> None:

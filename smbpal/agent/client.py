@@ -1,5 +1,11 @@
 """The daemon's view of a per-user agent.
 
+**Superseded in part, 15 October 2026: the agent now dials the daemon** — see
+`AgentLinks` at the end of this module for why. `AgentClient` below still
+connects into an agent's socket, and is what a development daemon given
+`--agent-socket-dir` uses; an installed one uses the link. What follows is the
+original reasoning, which still holds for everything but the direction.
+
 **The direction is daemon to agent, and that was not obvious.** The agent is
 the privileged-looking half in every way except the one that matters: it runs
 unprivileged, in one session, and it is the only thing on a Mac that can mount.
@@ -29,9 +35,11 @@ person and the command, because "connection refused" names neither.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import pwd
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -114,11 +122,16 @@ class AgentClient:
         result = self._call("agent.mount", params, timeout=MOUNT_TIMEOUT)
         return str(result["mountpoint"])
 
-    def unmount(self, mountpoint: str) -> bool:
-        """True if something was unmounted, False if nothing was mounted."""
-        result = self._call(
-            "agent.unmount", {"mountpoint": mountpoint}, timeout=MOUNT_TIMEOUT
-        )
+    def unmount(self, mountpoint: str, *, url: str | None = None) -> bool:
+        """True if something was unmounted, False if nothing was mounted.
+
+        With `url`, the agent finds the share in the mount table rather than
+        trusting `mountpoint`, which is only where it was last seen.
+        """
+        params: dict[str, Any] = {"mountpoint": mountpoint}
+        if url:
+            params["url"] = url
+        result = self._call("agent.unmount", params, timeout=MOUNT_TIMEOUT)
         return bool(result.get("unmounted", True))
 
     def remount_url(self, mountpoint: str) -> str | None:
@@ -235,3 +248,147 @@ class AgentClients:
         if self.directory is not None:
             return AgentClient(uid, path=self.directory / f"agent-{uid}.sock")
         return AgentClient(uid)
+
+
+# --- the link the agent dials (macOS since the daemon left root) -------------
+
+
+class _Pending:
+    def __init__(self, connection: Any) -> None:
+        self.connection = connection
+        self.done = threading.Event()
+        self.message: dict[str, Any] | None = None
+
+
+class AgentLinks:
+    """Agents that dialled in, one per user, and the requests waiting on them.
+
+    **Why the direction reversed.** The first form of this module connected
+    into the agent's socket, which is `0600` inside a `0700` directory under
+    the person's home and admits its owner and root. That worked while the
+    daemon was root. Since the helper work it runs as `_smbpald`, which can
+    open neither, so every connect, disconnect and stored password failed on
+    an installed Mac. Rather than widen the agent's door, the agent now dials
+    the daemon's socket, which members of `smbpal` can already reach, and
+    holds the connection open; the daemon sends its requests down it.
+
+    **Which session is still the kernel's answer.** An agent is registered
+    under the uid `getpeereid(2)` reported for its connection, so one person
+    cannot register as another, and a request for uid N goes only to the
+    connection uid N opened. A reply is accepted only from the connection its
+    request went to, so nobody else can answer for an agent.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_uid: dict[int, Any] = {}
+        self._pending: dict[str, _Pending] = {}
+        self._counter = itertools.count(1)
+
+    def register(self, connection: Any) -> None:
+        uid = connection.peer.uid
+        with self._lock:
+            replaced = self._by_uid.get(uid)
+            self._by_uid[uid] = connection
+        log.info(
+            "%s's agent connected%s",
+            username_for_uid(uid),
+            " (replacing an earlier connection)" if replaced is not None else "",
+        )
+
+    def drop(self, connection: Any) -> None:
+        """The connection closed: forget it, and fail what was waiting on it."""
+        with self._lock:
+            for uid, registered in list(self._by_uid.items()):
+                if registered is connection:
+                    del self._by_uid[uid]
+                    log.info("%s's agent disconnected", username_for_uid(uid))
+            waiting = [p for p in self._pending.values() if p.connection is connection]
+        for pending in waiting:
+            pending.done.set()
+
+    def connected(self, uid: int) -> bool:
+        with self._lock:
+            return uid in self._by_uid
+
+    def reply(self, connection: Any, params: dict[str, Any]) -> None:
+        rid = params.get("rid")
+        with self._lock:
+            pending = self._pending.get(rid) if isinstance(rid, str) else None
+            if pending is None or pending.connection is not connection:
+                raise SmbpalError(
+                    "no request with that id is waiting on this connection"
+                )
+        pending.message = params
+        pending.done.set()
+
+    def request(
+        self, uid: int, method: str, params: dict[str, Any] | None, *, timeout: float
+    ) -> Any:
+        from smbpal.ipc.protocol import encode_event
+
+        with self._lock:
+            connection = self._by_uid.get(uid)
+            if connection is None:
+                raise _not_connected(uid)
+            rid = str(next(self._counter))
+            pending = self._pending[rid] = _Pending(connection)
+        try:
+            # An event, sent to this one connection and no other. Never
+            # `broadcast`: `credential_set` carries a password.
+            connection.send(
+                encode_event(
+                    "agent.request",
+                    {"rid": rid, "method": method, "params": params or {}},
+                )
+            )
+            if not pending.done.wait(timeout):
+                raise AgentUnreachable(
+                    f"{username_for_uid(uid)}'s agent did not answer within "
+                    f"{timeout:g}s",
+                    detail=f"it was asked to {method}; its log may say why: "
+                    "~/Library/Logs/SMBPal/agent.log",
+                )
+        finally:
+            with self._lock:
+                self._pending.pop(rid, None)
+        if pending.message is None:
+            raise AgentUnreachable(
+                f"{username_for_uid(uid)}'s agent disconnected before answering",
+                detail=f"it was asked to {method}",
+            )
+        reply = pending.message
+        if reply.get("ok"):
+            return reply.get("result")
+        return Client._unwrap({"ok": False, "error": reply.get("error") or {}})
+
+    def for_uid(self, uid: int) -> "LinkedAgent":
+        return LinkedAgent(uid, links=self)
+
+
+class LinkedAgent(AgentClient):
+    """The same methods as `AgentClient`, carried over the agent's own link."""
+
+    def __init__(self, uid: int, *, links: AgentLinks) -> None:
+        self.uid = uid
+        self.links = links
+        self.path = None  # type: ignore[assignment]
+
+    def _call(
+        self, method: str, params: dict[str, Any] | None = None, *, timeout: float
+    ) -> Any:
+        log.info("asking %s's agent to %s", username_for_uid(self.uid), method)
+        return self.links.request(self.uid, method, params, timeout=timeout)
+
+
+def _not_connected(uid: int) -> AgentUnreachable:
+    who = username_for_uid(uid)
+    return AgentUnreachable(
+        f"{who}'s SMBPal agent is not connected, so nothing can mount for them",
+        detail=(
+            "Mounting on macOS happens in the user's own session. "
+            f"{who} starts the agent with `smbpal-agent --install`, and it "
+            "connects at every login. If it is running, its log says why it "
+            "could not connect: ~/Library/Logs/SMBPal/agent.log"
+        ),
+    )
