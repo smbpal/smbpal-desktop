@@ -10,7 +10,7 @@
 # no second removal step.
 
 Name:           smbpal
-Version:        0.2.17
+Version:        0.2.18
 Release:        1%{?dist}
 Summary:        Share folders over SMB, and connect to shares on other machines
 
@@ -261,6 +261,12 @@ fi
 %{_datadir}/icons/hicolor/scalable/status/smbpal-attention.svg
 
 %changelog
+* Thu Oct 15 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.18-1
+- macOS: `smbpal browse` and the window's "Browse servers" find servers on
+  the network. They failed on a Mac before, asking for a Linux tool.
+- macOS: removing a connection unmounts what SMBPal mounted for it. A share
+  opened in Finder, or one in use, is left mounted, with a note saying so.
+  Run `smbpal-agent --install` again after upgrading.
 * Thu Oct 15 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.17-1
 - macOS: shares can be read-only. `smbpal share add --read-only` serves a
   folder that other machines can read but not change. SMBPal checks macOS

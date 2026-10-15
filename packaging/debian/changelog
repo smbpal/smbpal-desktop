@@ -1,3 +1,17 @@
+smbpal (0.2.18) trixie; urgency=medium
+
+  * **macOS: finding servers works.** `smbpal browse` and the window's
+    "Browse servers" now list the machines sharing on your network, and say
+    which run SMBPal. Before this they failed on a Mac, asking for a Linux
+    tool macOS does not have.
+  * **macOS: removing a connection unmounts what SMBPal mounted for it**, as
+    it does on Linux. A share you opened yourself in Finder is left mounted,
+    and so is one in use; SMBPal says so and what to do. Run
+    `smbpal-agent --install` again after upgrading.
+  * Nothing changes on Linux.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Thu, 15 Oct 2026 23:07:00 +0100
+
 smbpal (0.2.17) trixie; urgency=medium
 
   * **macOS: shares can be read-only.** `smbpal share add <name> <folder>
