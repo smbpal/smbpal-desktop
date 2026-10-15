@@ -155,6 +155,12 @@ class TestDiscover(unittest.TestCase):
         original = browse.shutil.which
         browse.shutil.which = lambda _name: None
         self.addCleanup(setattr, browse.shutil, "which", original)
+        # avahi-browse is the Linux route; a Mac browses with dns-sd.
+        from unittest import mock
+
+        pinned = mock.patch.object(browse, "_platform", lambda: "linux")
+        pinned.start()
+        self.addCleanup(pinned.stop)
         with self.assertRaises(Unavailable) as caught:
             discover()
         self.assertIn("avahi-utils", caught.exception.detail or "")
