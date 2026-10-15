@@ -13,7 +13,14 @@ import unittest
 from typing import Any
 
 from smbpal.agent.handlers import AgentDispatcher
-from smbpal.agent.reconnect import MAX_BACKOFF, SLEEP_GAP, TROUBLE_WINDOW, Reconnector
+from smbpal.agent.reconnect import (
+    FAST_BACKOFF,
+    MAX_BACKOFF,
+    SLEEP_GAP,
+    SLOW_ATTEMPT,
+    TROUBLE_WINDOW,
+    Reconnector,
+)
 from smbpal.errors import SmbpalError
 from smbpal.ipc.peer import PeerCredentials
 from smbpal.mounts import volumes
@@ -51,6 +58,7 @@ class Harness:
         self.mounted: list[str] = []
         self.fail_with: SmbpalError | None = None
         self.list_fails = False
+        self.mount_takes = 0.0
         self.wall = 1_000_000.0
         self.mono = 100.0
         self.loop = Reconnector(
@@ -71,6 +79,8 @@ class Harness:
 
     def _mount(self, record: dict[str, Any]) -> str:
         self.mounted.append(record["id"])
+        # How long the attempt takes, on the loop's own clock.
+        self.mono += self.mount_takes
         if self.fail_with is not None:
             raise self.fail_with
         where = f"/Volumes/{record['share']}"
@@ -543,3 +553,87 @@ class WhatAPersonIsShown(unittest.TestCase):
             h, reports = self.harness(**overrides)
             h.tick()
             self.assertIn(self.last(reports)["state"], STATES)
+
+
+class TheLagWhenAServerComesBack(unittest.TestCase):
+    """0.2.15 could wait five minutes to remount a NAS that had come back."""
+
+    def unreachable(self) -> NetFSError:
+        return NetFSError("no route", status=65, retryable=True, state="unreachable")
+
+    def wait_for(self, h: Harness) -> float:
+        return h.loop._tracks["nas-media"].next_try - h.mono
+
+    def test_fast_failures_never_wait_longer_than_the_short_cap(self) -> None:
+        h = Harness()
+        h.fail_with = self.unreachable()
+        for _ in range(10):
+            h.advance(MAX_BACKOFF)
+            h.loop.tick()
+        self.assertLessEqual(self.wait_for(h), FAST_BACKOFF)
+
+    def test_slow_failures_still_back_off_to_the_long_cap(self) -> None:
+        h = Harness()
+        h.fail_with = self.unreachable()
+        h.mount_takes = SLOW_ATTEMPT + 1
+        for _ in range(10):
+            h.advance(MAX_BACKOFF)
+            h.loop.tick()
+        self.assertGreater(self.wait_for(h), FAST_BACKOFF)
+
+    def test_a_network_change_retries_at_once(self) -> None:
+        h = Harness()
+        h.fail_with = self.unreachable()
+        for _ in range(5):
+            h.advance(FAST_BACKOFF)
+            h.loop.tick()
+        attempts = len(h.mounted)
+        h.fail_with = None
+        h.advance(1.0)
+        h.loop.tick(volumes.NETWORK_CHANGED)
+        self.assertEqual(len(h.mounted), attempts + 1)
+        self.assertEqual(h.loop._tracks["nas-media"].status[0], "connected")
+
+    def test_without_a_change_the_backoff_is_waited_out(self) -> None:
+        h = Harness()
+        h.fail_with = self.unreachable()
+        for _ in range(5):
+            h.advance(FAST_BACKOFF)
+            h.loop.tick()
+        attempts = len(h.mounted)
+        h.advance(1.0)
+        h.loop.tick()
+        self.assertEqual(len(h.mounted), attempts)
+
+    def test_a_wake_retries_at_once_and_for_a_little_while(self) -> None:
+        h = Harness()
+        h.fail_with = self.unreachable()
+        for _ in range(5):
+            h.advance(FAST_BACKOFF)
+            h.loop.tick()
+        attempts = len(h.mounted)
+        h.advance(1.0, slept=3600)
+        h.loop.tick()
+        h.advance(5.0)
+        h.loop.tick()
+        self.assertEqual(len(h.mounted), attempts + 2)
+
+    def test_a_network_change_does_not_undo_a_disconnect(self) -> None:
+        h = Harness([connection(disconnected=True)])
+        h.tick()
+        h.loop.tick(volumes.NETWORK_CHANGED)
+        self.assertEqual(h.mounted, [])
+
+
+class ALongOutageLeavesATrace(unittest.TestCase):
+    def test_retries_are_logged_about_once_a_minute(self) -> None:
+        h = Harness()
+        h.fail_with = NetFSError("no route", status=65, retryable=True, state="unreachable")
+        with self.assertLogs("smbpal.agent.reconnect", level="INFO") as logs:
+            for _ in range(20):  # ten minutes of 30 s retries
+                h.advance(30.0)
+                h.loop.tick()
+        still = [line for line in logs.output if "still retrying" in line]
+        self.assertGreaterEqual(len(still), 8)
+        self.assertLessEqual(len(still), 11)
+        self.assertIn("attempt", still[-1])
