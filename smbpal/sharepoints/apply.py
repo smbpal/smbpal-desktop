@@ -15,10 +15,11 @@ is not.
 
 **What this does not do yet, and says so rather than pretending.**
 
-- *Read-only shares.* `sharing -l` reports an `smb_read_only` field, so there is
-  probably a way; nothing has measured it, and serving writable a share
-  somebody marked read-only is the one failure here that would be a lie in the
-  dangerous direction. Refused until it is measured.
+- *Read-only shares are served*, since 15 October 2026: the helper publishes
+  them with `sharing -R 1`, and this module confirms `smb_read_only` in
+  `sharing -l` afterwards. Serving writable a share somebody marked read-only
+  is the one failure here that would be a lie in the dangerous direction, so a
+  share that comes back writable is unpublished and the change fails.
 - *Creating accounts or setting their SMB password* (`SMB-NT`, the account
   spike's steps 1-4). Decided 12 October 2026: shares are served to accounts
   that already exist. On macOS the SMB password is the login password, so the
@@ -191,24 +192,23 @@ class SharepointApplier:
             refused = refusal(share["path"], facts[share["id"]])
             if refused is not None:
                 raise ApplyError(f"cannot share {share['name']!r}", detail=refused)
-            if share.get("read_only"):
-                raise ApplyError(
-                    f"cannot share {share['name']!r} read-only on macOS yet",
-                    detail="SMBPal has not yet measured how macOS serves a "
-                    "read-only share, and serving it writable would not be what "
-                    "was asked. Share it without --read-only, or leave it out.",
-                )
 
         # The resolved path is the one the helper publishes (§13 rule 1), so it
         # is the one to compare against what `sharing -l` reports.
         wanted = {s["name"]: facts[s["id"]].resolved for s in enabled}
+        read_only = {s["name"]: bool(s.get("read_only")) for s in enabled}
         owned = set(self.helper.share_owned())
         current = self._sharepoints()
 
+        # A change of read-only is a change of sharepoint: unpublished and
+        # published again, like a change of folder, rather than edited in place
+        # by a verb the helper would need for nothing else.
         stale = sorted(
             name
             for name in owned
-            if name not in wanted or current.get(name, {}).get("path") != wanted[name]
+            if name not in wanted
+            or current.get(name, {}).get("path") != wanted[name]
+            or _is_read_only(current.get(name, {})) != read_only[name]
         )
         missing = sorted(name for name in wanted if name not in owned or name in stale)
 
@@ -238,12 +238,20 @@ class SharepointApplier:
                 self.helper.share_unpublish(name, auth=grant)
                 log.info("unpublished sharepoint %s", name)
             for name in missing:
-                self.helper.share_publish(name, wanted[name], auth=grant)
-                log.info("published sharepoint %s at %s", name, wanted[name])
+                self.helper.share_publish(
+                    name, wanted[name], auth=grant, read_only=read_only[name]
+                )
+                log.info(
+                    "published sharepoint %s at %s%s",
+                    name,
+                    wanted[name],
+                    " (read-only)" if read_only[name] else "",
+                )
         except HelperError as exc:
             raise _explain(exc) from exc
 
         self._verify_present(wanted)
+        self._verify_read_only(read_only, grant=grant)
         log.info("applied %d sharepoint(s)", len(wanted))
         return ApplyReport(shares=planned, served=sorted(wanted), advertising=False)
 
@@ -378,6 +386,38 @@ class SharepointApplier:
             raise ApplyError("could not read this Mac's sharepoints", detail="not a JSON object")
         return {str(k): v for k, v in parsed.items() if isinstance(v, dict)}
 
+    def _verify_read_only(
+        self, read_only: dict[str, bool], *, grant: bytes | None
+    ) -> None:
+        """Every share asked for read-only is read-only, or none of it stands.
+
+        Checked by what `sharing -l` reports, not by what was asked for, for
+        the reason `_verify_present` gives. A share that came back writable is
+        unpublished before the error is raised: the rollback that follows
+        re-applies the previous config, and a writable share must not survive
+        the gap or a failed rollback.
+        """
+        current = self._sharepoints()
+        writable = sorted(
+            name
+            for name, wanted in read_only.items()
+            if wanted and not _is_read_only(current.get(name, {}))
+        )
+        if not writable:
+            return
+        for name in writable:
+            try:
+                self.helper.share_unpublish(name, auth=grant)
+            except HelperError as exc:
+                log.error("could not unpublish %s after it came back writable: %s",
+                          name, exc.message)
+        raise ApplyError(
+            "macOS did not make " + ", ".join(repr(n) for n in writable)
+            + " read-only",
+            detail="`sharing -R 1` was asked for and `sharing -l` reports the share "
+            "writable, so SMBPal unshared it rather than serve it writable.",
+        )
+
     def _verify_present(self, wanted: dict[str, str | None]) -> None:
         current = self._sharepoints()
         wrong = sorted(
@@ -389,6 +429,11 @@ class SharepointApplier:
                 detail="`sharing` accepted the request but the sharepoint is not "
                 "in `sharing -l` at the folder asked for.",
             )
+
+
+def _is_read_only(record: dict[str, Any]) -> bool:
+    """`smb_read_only` as `sharing -l -f json` reports it: 0 or 1."""
+    return bool(record.get("smb_read_only"))
 
 
 def _identity_for(share: dict[str, Any]) -> ownership.ServingIdentity | None:

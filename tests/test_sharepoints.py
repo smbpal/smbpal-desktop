@@ -48,6 +48,8 @@ class FakeHelper:
         self.owned: list[str] = []
         self.calls: list[tuple[str, ...]] = []
         self.publish_takes = True
+        # False to play a macOS that accepts `-R 1` and serves writable anyway.
+        self.read_only_takes = True
         self.signed_in: set[str] = set()
         self.access: dict[tuple[str, str], str] = {}
         self.inspected_as: list[str | None] = []
@@ -76,12 +78,19 @@ class FakeHelper:
     def share_owned(self) -> list[str]:
         return list(self.owned)
 
-    def share_publish(self, name: str, path: str, *, auth: bytes) -> None:
-        self.calls.append(("publish", name, path))
+    def share_publish(
+        self, name: str, path: str, *, auth: bytes, read_only: bool = False
+    ) -> None:
+        self.calls.append(("publish", name, path) + (("read-only",) if read_only else ()))
         if name in self.records:
             raise HelperError("refused", token="exists")
         if self.publish_takes:
-            self.records[name] = {"path": path, "smb_name": name, "smb_shared": True}
+            self.records[name] = {
+                "path": path,
+                "smb_name": name,
+                "smb_shared": True,
+                "smb_read_only": 1 if read_only and self.read_only_takes else 0,
+            }
         self.owned.append(name)
 
     def share_unpublish(self, name: str, *, auth: bytes) -> None:
@@ -209,12 +218,49 @@ class TestWhatSection13Refuses(SharepointCase):
         detail = self.refused("/Users/Shared", PathFacts("system-owned", "/Users/Shared", 0, 0, 0o1777, "root"))
         self.assertIn("system account", detail)
 
-    def test_read_only_is_refused_until_it_is_measured(self) -> None:
+    def test_a_read_only_share_is_published_read_only(self) -> None:
+        self.applier.apply(
+            self.config(share("Docs", f"{HOME}/Documents", read_only=True)), grant=GRANT
+        )
+        self.assertIn(("publish", "Docs", f"{HOME}/Documents", "read-only"), self.helper.calls)
+        self.assertEqual(self.helper.records["Docs"]["smb_read_only"], 1)
+
+    def test_a_writable_share_is_published_without_the_token(self) -> None:
+        self.applier.apply(self.config(share("Docs", f"{HOME}/Documents")), grant=GRANT)
+        self.assertIn(("publish", "Docs", f"{HOME}/Documents"), self.helper.calls)
+
+    def test_a_share_that_comes_back_writable_is_unshared_not_served(self) -> None:
+        """The dangerous direction: asked for read-only, served writable."""
+        self.helper.read_only_takes = False
         with self.assertRaises(ApplyError) as caught:
             self.applier.apply(
                 self.config(share("Docs", f"{HOME}/Documents", read_only=True)), grant=GRANT
             )
         self.assertIn("read-only", caught.exception.message)
+        self.assertNotIn("Docs", self.helper.records)
+        self.assertIn(("unpublish", "Docs"), self.helper.calls)
+
+    def test_changing_read_only_republishes_the_share(self) -> None:
+        docs = share("Docs", f"{HOME}/Documents")
+        self.applier.apply(self.config(docs), grant=GRANT)
+        self.helper.calls.clear()
+        self.applier.apply(self.config({**docs, "read_only": True}), grant=GRANT)
+        self.assertEqual(
+            self.helper.calls,
+            [("unpublish", "Docs"), ("publish", "Docs", f"{HOME}/Documents", "read-only")],
+        )
+        self.helper.calls.clear()
+        self.applier.apply(self.config({**docs, "read_only": False}), grant=GRANT)
+        self.assertEqual(
+            self.helper.calls,
+            [("unpublish", "Docs"), ("publish", "Docs", f"{HOME}/Documents")],
+        )
+
+    def test_an_unchanged_read_only_share_is_left_alone(self) -> None:
+        docs = share("Docs", f"{HOME}/Documents", read_only=True)
+        self.applier.apply(self.config(docs), grant=GRANT)
+        self.helper.calls.clear()
+        self.applier.apply(self.config(docs), grant=None)
         self.assertEqual(self.helper.calls, [])
 
     def test_a_disabled_share_may_point_anywhere(self) -> None:

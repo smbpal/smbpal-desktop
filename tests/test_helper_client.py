@@ -175,6 +175,15 @@ class TestThePathAndSharepointVerbs(HelperClientCase):
         self.assertEqual(client.share_owned(), ["Media", "Family Photos"])
         self.assertEqual(server.seen, b"VERB share.owned\nEND\n")
 
+    def test_a_read_only_publish_adds_one_fixed_token(self) -> None:
+        client, server = self.helper(b"OK\n")
+        client.share_publish("Media", "/Volumes/Disk/Media", auth=bytes(32), read_only=True)
+        self.assertEqual(
+            server.seen,
+            b"VERB share.publish\nAUTH " + b"00" * 32 + b"\n"
+            b"ARG Media\nARG /Volumes/Disk/Media\nARG read-only\nEND\n",
+        )
+
     def test_publish_carries_the_grant_the_name_and_the_path(self) -> None:
         client, server = self.helper(b"OK\n")
         client.share_publish("Media", "/Volumes/Disk/Media", auth=bytes(32))
