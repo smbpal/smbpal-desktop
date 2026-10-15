@@ -32,6 +32,7 @@ from types import FrameType
 
 from smbpal import __version__, version_banner
 from smbpal.agent.handlers import AgentDispatcher
+from smbpal.agent.ledger import FILE_NAME as LEDGER_FILE, MountLedger
 from smbpal.agent import launchd
 from smbpal.agent.client import username_for_uid
 from smbpal.agent.link import DaemonLink
@@ -163,7 +164,8 @@ def main(argv: list[str] | None = None) -> int:
     # tells anyone who looks that this user runs SMBPal and what they mount.
     os.chmod(path.parent, 0o700)
 
-    dispatcher = AgentDispatcher()
+    # Beside the socket: per-user, and kept across restarts (`agent/ledger.py`).
+    dispatcher = AgentDispatcher(ledger=MountLedger(path.parent / LEDGER_FILE))
     transport = UnixSocketTransport(path, group=None, mode=0o600)
 
     try:

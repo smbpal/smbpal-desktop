@@ -299,6 +299,22 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(caught.exception.code, "agent_unreachable")
         self.assertNotIn("Photos", [c["share"] for c in self.store.load()["connections"]])
 
+    def test_remove_releases_the_share_and_says_what_was_left(self) -> None:
+        link = self.dial()
+        self.assertTrue(link.registered.wait(5))
+        released = {"url": "", "unmounted": [], "left": [
+            {"mountpoint": "/Volumes/Media", "reason": "not-ours"}]}
+        self.agent._release = lambda request: {**released, "url": request.params["url"]}
+        result = self.call("connection.remove", {"ref": "nas-media"})
+        self.assertEqual(result["unmounted"], [])
+        self.assertIn("SMBPal did not mount it", result["notes"][0])
+        self.assertEqual(self.store.load()["connections"], [])
+
+    def test_remove_with_no_agent_still_removes_and_says_so(self) -> None:
+        result = self.call("connection.remove", {"ref": "nas-media"})
+        self.assertEqual(self.store.load()["connections"], [])
+        self.assertIn("eject it in Finder", result["notes"][0])
+
     def test_the_agent_reports_and_status_shows_it(self) -> None:
         import getpass
 

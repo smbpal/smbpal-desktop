@@ -1092,7 +1092,14 @@ def _cmd_connection_set_credentials(
 
 def _cmd_connection_remove(client: Client, args: argparse.Namespace) -> int:
     connection = client.call("connection.remove", {"ref": args.ref})
-    return _emit(args, connection, lambda: f"removed connection {connection['id']}")
+
+    def render() -> str:
+        lines = [f"removed connection {connection['id']}"]
+        lines.extend(f"  unmounted {where}" for where in connection.get("unmounted", []))
+        lines.extend(f"  {note}" for note in connection.get("notes", []))
+        return "\n".join(lines)
+
+    return _emit(args, connection, render)
 
 
 # --- plumbing --------------------------------------------------------------
