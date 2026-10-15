@@ -10,7 +10,7 @@
 # no second removal step.
 
 Name:           smbpal
-Version:        0.2.15
+Version:        0.2.16
 Release:        1%{?dist}
 Summary:        Share folders over SMB, and connect to shares on other machines
 
@@ -261,6 +261,12 @@ fi
 %{_datadir}/icons/hicolor/scalable/status/smbpal-attention.svg
 
 %changelog
+* Thu Oct 15 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.16-1
+- macOS: a share lost when its server went away now reconnects within about
+  a minute of the server coming back, where 0.2.15 could take five. It also
+  retries at once when the network changes or the Mac wakes. Run
+  `smbpal-agent --install` again after upgrading.
+- The agent's log says when it is still retrying a share, with the reason.
 * Thu Oct 15 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.15-1
 - macOS: shares reconnect by themselves. The agent connects your shares at
   login, puts a share back after the Mac sleeps or the server comes back, and

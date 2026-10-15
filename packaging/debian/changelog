@@ -1,3 +1,16 @@
+smbpal (0.2.16) trixie; urgency=medium
+
+  * **macOS: a share comes back within about a minute of its server.** In
+    0.2.15 a share lost when its server went away could take up to five
+    minutes to reconnect once the server was back. It now retries every 30
+    seconds at most, and at once when the Mac's network changes or the Mac
+    wakes. Run `smbpal-agent --install` again after upgrading.
+  * The agent's log says when it is still retrying a share, about once a
+    minute, with the reason.
+  * Nothing changes on Linux.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Thu, 15 Oct 2026 20:46:00 +0100
+
 smbpal (0.2.15) trixie; urgency=medium
 
   * **macOS: shares reconnect by themselves.** macOS never puts back an SMB
