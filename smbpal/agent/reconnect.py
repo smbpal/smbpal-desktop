@@ -81,7 +81,15 @@ from smbpal.state.machine import (
 log = logging.getLogger(__name__)
 
 DEFAULT_INTERVAL = 5.0
+# **Two caps, chosen by how long a failed attempt took.** A server that is off
+# usually fails fast -- no route, a name that does not resolve -- and trying
+# that every 30 s costs nothing. The five-minute cap of 0.2.15 is what made a
+# NAS that came back wait up to five minutes to be remounted, measured on
+# 15 October 2026. An attempt that itself took long, a connect timing out,
+# holds the loop for that long, so those still back off to five minutes.
+FAST_BACKOFF = 30.0
 MAX_BACKOFF = 300.0
+SLOW_ATTEMPT = 5.0
 # How long a not-responding report from the kernel explains a disappearance.
 # Generous on purpose: the report comes when the server stops answering, and
 # macOS may drop the mount minutes later, after its own dialog times out.
@@ -89,6 +97,13 @@ TROUBLE_WINDOW = 600.0
 # A wall clock that ran this much further than the monotonic one means the Mac
 # slept. Well above any scheduling jitter, well below any real sleep.
 SLEEP_GAP = 30.0
+# After a wake, how long every pass retries a waiting connection at once.
+RETRY_AFTER_WAKE = 30.0
+# How often a connection that keeps failing says so. Without it, a failure was
+# logged once when its message first appeared, and a run on 15 October 2026
+# could not tell whether retries were still happening, or when one succeeded
+# relative to the server returning.
+RETRY_LOG_EVERY = 60.0
 
 Connections = Callable[[], list[dict[str, Any]]]
 Mount = Callable[[dict[str, Any]], str]
@@ -129,6 +144,9 @@ class _Track:
     # The status that goes with `held`, which is not always the same kind of
     # thing: an eject is calm, a refused password is a problem.
     held_status: tuple[str, str, bool] | None = None
+    # When "still retrying" was last logged, so a long outage leaves a trace
+    # about once a minute rather than one line at its start.
+    retry_logged: float = float("-inf")
 
 
 class Reconnector:
@@ -159,6 +177,7 @@ class Reconnector:
         self._last_list: list[dict[str, Any]] = []
         self._list_problem: str | None = None
         self._trouble_until = float("-inf")
+        self._retry_now_until = float("-inf")
         self._last_clocks: tuple[float, float] | None = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -231,9 +250,20 @@ class Reconnector:
         # pass after the event is too narrow a test.
         if self._slept(now):
             self._trouble_until = max(self._trouble_until, now + TROUBLE_WINDOW)
+            # Retry at once on this pass, and on the next few: the network
+            # can take some seconds to come up after a wake.
+            self._retry_now_until = now + RETRY_AFTER_WAKE
         if flags & volumes.VQ_TROUBLE:
             self._trouble_until = max(self._trouble_until, now + TROUBLE_WINDOW)
             log.info("the kernel reported a volume not responding (flags %#x)", flags)
+        # A network change or a wake is when a waiting connection is most
+        # likely to succeed, so neither waits out its backoff. A sleep also
+        # stops `time.monotonic`, so a backoff set before it would otherwise
+        # run on after the wake.
+        if flags & volumes.NETWORK_CHANGED or now < self._retry_now_until:
+            if flags & volumes.NETWORK_CHANGED:
+                log.info("the network changed; retrying waiting connections now")
+            self._retry_waiting()
         trouble = now < self._trouble_until
 
         mine = [c for c in self._read_connections() if c.get("owner") == self.username]
@@ -274,6 +304,13 @@ class Reconnector:
             self.on_states(current)
         except Exception:  # noqa: BLE001 - reporting must not stop reconnecting
             log.exception("could not report connection states")
+
+    def _retry_waiting(self) -> None:
+        """Clear the backoff of every connection that is waiting to retry."""
+        with self._lock:
+            for track in self._tracks.values():
+                if track.held is None and track.mounted_at is None:
+                    track.next_try = 0.0
 
     def _consider(
         self,
@@ -350,16 +387,19 @@ class Reconnector:
 
         # Outside the lock: a mount can take as long as NetFS's own timeout,
         # and `released`/`connected` must not wait behind it.
+        started = self._monotonic()
         try:
             where = self._mount(connection)
         except NetFSError as exc:
             self._failed(connection_id, exc.message, retryable=exc.retryable,
-                         now=now, kind=exc.state)
+                         now=now, kind=exc.state,
+                         took=self._monotonic() - started)
             return
         except SmbpalError as exc:
             # The Keychain, the URL: nothing that names a refused credential,
             # so tried again later rather than given up on.
-            self._failed(connection_id, exc.message, retryable=True, now=now)
+            self._failed(connection_id, exc.message, retryable=True, now=now,
+                         took=self._monotonic() - started)
             return
         with self._lock:
             track = self._tracks.get(connection_id)
@@ -371,7 +411,7 @@ class Reconnector:
                 self._say(track, connection_id, f"connected at {where}")
 
     def _failed(self, connection_id: str, message: str, *, retryable: bool,
-                now: float, kind: str = FAILED) -> None:
+                now: float, kind: str = FAILED, took: float = 0.0) -> None:
         with self._lock:
             track = self._tracks.get(connection_id)
             if track is None:
@@ -390,7 +430,8 @@ class Reconnector:
                           warn=True)
                 return
             track.failures += 1
-            delay = min(self.interval * (2 ** track.failures), MAX_BACKOFF)
+            cap = MAX_BACKOFF if took >= SLOW_ATTEMPT else FAST_BACKOFF
+            delay = min(self.interval * (2 ** track.failures), cap)
             track.next_try = now + delay
             # The machine's own rule: a retryable `failed` is `reconnecting`,
             # and `unreachable` keeps its word because it says why.
@@ -401,6 +442,15 @@ class Reconnector:
             )
             self._say(track, connection_id,
                       f"could not connect ({message}); trying again with backoff")
+            if now - track.retry_logged >= RETRY_LOG_EVERY:
+                track.retry_logged = now
+                log.info(
+                    "%s: still retrying, attempt %d (%s), next in %.0fs",
+                    connection_id,
+                    track.failures,
+                    message,
+                    delay,
+                )
 
     # --- inputs ------------------------------------------------------------
 

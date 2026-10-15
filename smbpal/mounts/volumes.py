@@ -33,6 +33,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import logging
+import os
 import select
 import sys
 import threading
@@ -53,6 +54,15 @@ VQ_NOTRESPLOCK = 0x0080
 # The flags that mean a volume's server stopped answering, as opposed to a
 # volume coming or going. One mask, so the loop has one question to ask.
 VQ_TROUBLE = VQ_NOTRESP | VQ_DEAD | VQ_NOTRESPLOCK
+
+# Not a `VQ_*` flag: set by `VolumeEvents.wait` when macOS reports that the
+# network configuration changed. Well above every `VQ_*` bit, so the two never
+# collide in one mask.
+NETWORK_CHANGED = 1 << 24
+
+# The notify(3) name configd posts on any network configuration change: an
+# interface coming up, an address arriving, a Wi-Fi join.
+NETWORK_CHANGE_NOTIFICATION = b"com.apple.system.config.network_change"
 
 # `EVFILT_FS` from `sys/event.h`. Python's `select` exports the other filters
 # as `KQ_FILTER_*` and not this one, so it is named here.
@@ -187,6 +197,7 @@ class VolumeEvents:
 
     def __init__(self) -> None:
         self._queue: Any = None
+        self._network_fd: int | None = None
         self._idle = threading.Event()
         if available() and hasattr(select, "kqueue"):
             try:
@@ -207,6 +218,43 @@ class VolumeEvents:
                 # loses the early wake and the not-responding hint.
                 log.warning("cannot watch volume events (%s); polling only", exc)
                 self._queue = None
+        if self._queue is not None:
+            self._watch_the_network()
+
+    def _watch_the_network(self) -> None:
+        """Wake on a network change too, through notify(3) and the same queue.
+
+        **Why it is needed.** A connection whose server was unreachable waits
+        out a backoff, and the moment it is most likely to succeed is when the
+        Mac's network changes -- it rejoins Wi-Fi, or wakes. Without this the
+        loop learned of that only when the backoff ran out.
+
+        `notify_register_file_descriptor` hands back a descriptor that becomes
+        readable when the name is posted, so it joins the kqueue already used
+        for volume events and needs no run loop and no PyObjC. Delivery
+        through that descriptor was measured on 15 October 2026 with a name of
+        our own; an unprivileged process cannot post the system name, so its
+        arrival on a real network change is checked on hardware.
+        """
+        try:
+            libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+            fd = ctypes.c_int(-1)
+            token = ctypes.c_int(0)
+            status = libc.notify_register_file_descriptor(
+                NETWORK_CHANGE_NOTIFICATION, ctypes.byref(fd), 0, ctypes.byref(token)
+            )
+            if status != 0 or fd.value < 0:
+                log.warning("cannot watch network changes (notify status %d)", status)
+                return
+            self._queue.control(
+                [select.kevent(fd.value, filter=select.KQ_FILTER_READ,
+                               flags=select.KQ_EV_ADD)],
+                0,
+                0,
+            )
+            self._network_fd = fd.value
+        except (OSError, AttributeError) as exc:
+            log.warning("cannot watch network changes (%s)", exc)
 
     def wait(self, timeout: float) -> int:
         if self._queue is None:
@@ -214,6 +262,15 @@ class VolumeEvents:
             return 0
         flags = 0
         for event in self._queue.control(None, 8, timeout):
+            if self._network_fd is not None and event.ident == self._network_fd:
+                flags |= NETWORK_CHANGED
+                # Drain the tokens notify wrote, or the descriptor stays
+                # readable and every wait returns at once.
+                try:
+                    os.read(self._network_fd, max(4, int(event.data)))
+                except OSError:
+                    pass
+                continue
             flags |= int(event.fflags)
         return flags
 
