@@ -1088,3 +1088,30 @@ class TestAShareNeedsAnAccountThatExists(ServerTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestADismissedDialog(unittest.TestCase):
+    """A refused or dismissed authorisation dialog gives up quietly.
+
+    `_acquire` logged through a module logger that did not exist, so the one
+    path meant to turn a dismissed dialog into the daemon's own refusal raised
+    `NameError` instead. Nothing in the suite reached it, because nothing
+    raised `AuthorizationError` here; pyflakes found it on 15 October 2026.
+    """
+
+    def test_the_refusal_is_reported_rather_than_a_crash(self) -> None:
+        from smbpal.errors import NeedsAuthorisation
+        from smbpal.system import authorization
+
+        needed = NeedsAuthorisation("ask first", right="app.smbpal.manage-shares")
+        with mock.patch.object(authorization, "available", return_value=True), \
+                mock.patch.object(
+                    authorization,
+                    "grant_for",
+                    side_effect=authorization.AuthorizationError(
+                        "not authorised", detail="the dialog was dismissed"
+                    ),
+                ):
+            held = client_module.Client("/nonexistent")._acquire(needed)
+        self.assertIsNone(held)
+        self.assertEqual(needed.detail, "the dialog was dismissed")

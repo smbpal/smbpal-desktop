@@ -10,6 +10,7 @@ import errno
 import getpass
 import grp
 import json
+import logging
 import os
 import socket
 import sys
@@ -33,6 +34,8 @@ from smbpal.errors import (
 )
 from smbpal.ipc.protocol import MAX_FRAME_BYTES
 from smbpal.ipc.server import DEFAULT_SOCKET_PATH
+
+log = logging.getLogger(__name__)
 
 GROUP = "smbpal"
 
