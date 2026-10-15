@@ -280,9 +280,17 @@ class Helper:
             line for line in self.call("share.owned").decode("utf-8").splitlines() if line
         ]
 
-    def share_publish(self, name: str, path: str, *, auth: bytes) -> None:
-        """`sharing -a`, with §13 applied at the far end. Raises on any refusal."""
-        self.call("share.publish", name, path, auth=auth)
+    def share_publish(
+        self, name: str, path: str, *, auth: bytes, read_only: bool = False
+    ) -> None:
+        """`sharing -a`, with §13 applied at the far end. Raises on any refusal.
+
+        `read_only` adds the helper's one fixed token, which becomes `-R 1`.
+        Left out entirely when false, so a writable publish is the same
+        request it always was and an older helper still understands it.
+        """
+        extra = ("read-only",) if read_only else ()
+        self.call("share.publish", name, path, *extra, auth=auth)
 
     def share_unpublish(self, name: str, *, auth: bytes) -> None:
         """`sharing -r`, for a record the helper published and nothing else."""

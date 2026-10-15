@@ -1689,13 +1689,17 @@ static void serve_one(int conn) {
     }
 
     if (strcmp(req.verb, "share.publish") == 0) {
-        /* ARG <name>, ARG <path>. The shape is checked before the grant and
-         * the path after it: the first is structural, the second is a
-         * privileged look at the filesystem and is not given away to a request
-         * that has not shown it may change anything. */
+        /* ARG <name>, ARG <path>, and optionally ARG read-only. The shape is
+         * checked before the grant and the path after it: the first is
+         * structural, the second is a privileged look at the filesystem and is
+         * not given away to a request that has not shown it may change
+         * anything. The third is a fixed token, never a value: read-only is
+         * the narrower of the two ways to serve a folder, so the only choice
+         * a request gets is whether to narrow it. */
         struct path_report report;
         const char *name = req.args[0];
-        if (!req.has_auth || req.argc != 2 || !share_name_ok(name)) {
+        int read_only = req.argc == 3 && strcmp(req.args[2], "read-only") == 0;
+        if (!req.has_auth || (req.argc != 2 && !read_only) || !share_name_ok(name)) {
             respond_err(conn, "args");
             return;
         }
@@ -1727,7 +1731,14 @@ static void serve_one(int conn) {
          * around: `sharing` takes a path, not a descriptor. */
         char *const argv[] = {(char *)SHARING, "-a", report.resolved, "-n", (char *)name,
                               "-S", (char *)name, "-s", "001", "-g", "000", NULL};
-        run_quiet(argv);
+        /* `-R 1`: read-only over SMB (sharing(8)). Whether macOS applied it is
+         * checked by the daemon in `sharing -l`, which names the field
+         * `smb_read_only`; a share asked for read-only and served writable is
+         * unpublished there rather than left. */
+        char *const argv_read_only[] = {(char *)SHARING, "-a", report.resolved,
+                                        "-n", (char *)name, "-S", (char *)name,
+                                        "-s", "001", "-g", "000", "-R", "1", NULL};
+        run_quiet(read_only ? argv_read_only : argv);
         if (!sharepoint_exists(name)) {
             respond_err(conn, "sharing");
             return;
@@ -1739,7 +1750,8 @@ static void serve_one(int conn) {
             respond_err(conn, "ledger");
             return;
         }
-        fprintf(stderr, "smbpal-helper: published %s at %s\n", name, report.resolved);
+        fprintf(stderr, "smbpal-helper: published %s at %s%s\n", name, report.resolved,
+                read_only ? " (read-only)" : "");
         respond(conn, "OK\n");
         return;
     }

@@ -314,6 +314,14 @@ class TestTheVocabularyIsFixed(unittest.TestCase):
         self.assertIn('"-g", "000"', publish)
         self.assertIn('"-s", "001"', publish)
 
+    def test_read_only_is_a_fixed_token_that_becomes_dash_r_1(self) -> None:
+        """Only the exact token narrows the share; anything else is refused."""
+        publish = self.verb("share.publish")
+        self.assertIn('strcmp(req.args[2], "read-only") == 0', publish)
+        self.assertIn('(req.argc != 2 && !read_only)', publish)
+        self.assertIn('"-R", "1"', publish)
+        self.assertIn("read_only ? argv_read_only : argv", publish)
+
     def test_publish_passes_the_resolved_path(self) -> None:
         """§13 rule 1: `/Volumes/Macintosh HD` is a symlink to `/`, so what is
         checked has to be what is shared."""
