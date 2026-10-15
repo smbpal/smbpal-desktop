@@ -295,6 +295,9 @@ def main(argv: list[str] | None = None) -> int:
         monitor=monitor,
         agents=agents,
     )
+    # macOS has no monitor; agents report state, and this is how it reaches
+    # the window and `smbpal watch`.
+    dispatcher.broadcast = lambda event, data: transport.broadcast(encode_event(event, data))
     # Logged at every start, not only when it is interesting. A line saying
     # which rules are in force is worth nothing if it only appears when they
     # are the weak ones, because then nobody has ever seen it and nobody reads

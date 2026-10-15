@@ -782,6 +782,15 @@ def _cmd_connection_list(client: Client, args: argparse.Namespace) -> int:
 
 
 def _cmd_connection_add(client: Client, args: argparse.Namespace) -> int:
+    # **Asked for before the add, and sent with it.** As two calls -- add, then
+    # set the password -- a Mac's reconnect loop could mount the connection in
+    # between with no account, and a password that failed to store left the
+    # connection behind without it. Both found on 15 October 2026.
+    password: str | None = None
+    if args.user:
+        password = _read_password(args, f"Password for {args.user}@{args.host}: ")
+        if password is None:
+            return EXIT_ERROR
     connection = client.call(
         "connection.add",
         {
@@ -798,6 +807,11 @@ def _cmd_connection_add(client: Client, args: argparse.Namespace) -> int:
             # $SUDO_USER is the only place the real user survives.
             "owner": args.owner or os.environ.get("SUDO_USER") or getpass.getuser(),
             "fallback_host": args.fallback,
+            **(
+                {"username": args.user, "password": password, "domain": args.domain}
+                if args.user
+                else {}
+            ),
         },
     )
     lines = [
@@ -805,25 +819,39 @@ def _cmd_connection_add(client: Client, args: argparse.Namespace) -> int:
         f"//{connection['host']}/{connection['share']} -> {connection['mountpoint']}"
     ]
 
-    password: str | None = None
-    if args.user:
-        password = _read_password(args, f"Password for {args.user}@{args.host}: ")
-        if password is None:
-            return EXIT_ERROR
-        stored = client.call(
-            "connection.set_credentials",
-            {
-                "ref": connection["id"],
-                "username": args.user,
-                "password": password,
-                "domain": args.domain,
-            },
-        )
+    if args.user and isinstance(connection.get("credentials"), dict):
         lines.append(f"  credentials stored for {args.user}")
-        # The daemon says where it put them when that is not obvious — on
-        # macOS it is the login Keychain, and if an item was already there for
-        # that server and account it has just been replaced. Somebody should
-        # hear that at the moment it happens rather than on uninstall.
+        note = connection["credentials"].get("note")
+        if note:
+            lines.append(f"  {note}")
+    elif args.user:
+        # A daemon from before the add carried the password: it ignored it, so
+        # store it the old way.
+        try:
+            stored = client.call(
+                "connection.set_credentials",
+                {
+                    "ref": connection["id"],
+                    "username": args.user,
+                    "password": password,
+                    "domain": args.domain,
+                },
+            )
+        except SmbpalError as exc:
+            # **The connection exists now, and the password does not.** Two
+            # calls, and only the first succeeded. Say both halves, and the one
+            # command that finishes the job.
+            for line in lines:
+                print(line)
+            print(
+                f"  the password was NOT stored: {exc.message}\n"
+                f"  the connection was added without it. Once that is fixed, run:\n"
+                f"    smbpal connection set-credentials {connection['id']} "
+                f"--user {args.user}",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
+        lines.append(f"  credentials stored for {args.user}")
         if isinstance(stored, dict) and stored.get("note"):
             lines.append(f"  {stored['note']}")
     else:
@@ -941,6 +969,8 @@ def _cmd_watch(client: Client, args: argparse.Namespace) -> int:
         return EXIT_OK
 
     # Everything after this arrives unasked: the daemon pushes, we do not poll.
+    # And with no limit on the wait, or two quiet minutes end the watch.
+    client.listen_without_limit()
     print("\nwatching — ^C to stop")
     try:
         for event in client.events():

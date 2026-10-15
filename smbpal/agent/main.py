@@ -192,6 +192,10 @@ def main(argv: list[str] | None = None) -> int:
     # How the daemon reaches this agent: it cannot open this socket, so the
     # agent dials the daemon's and holds it open (`agent/link.py`).
     link = DaemonLink(dispatcher, daemon_socket)
+    if reconnector is not None:
+        # The loop is what knows each connection's state on macOS, and the
+        # link is how the daemon hears it (`status`, `watch`, the window).
+        reconnector.on_states = link.report
 
     _install_signal_handlers(transport)
     log.info("smbpal-agent %s listening on %s (uid %s)", __version__, path, os.getuid())

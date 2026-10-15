@@ -297,6 +297,57 @@ class TestConnections(CliTestCase):
         self.assertIn("added connection", out)
         self.assertNotIn("warning", out)
 
+    def _an_older_daemon(self) -> None:
+        """A daemon from before `connection.add` carried the password.
+
+        It ignored `username` and `password` and answered without
+        `credentials`, so the CLI stores the password with a second call.
+        """
+        import smbpal.daemon.handlers as handlers
+
+        original = handlers._METHODS["connection.add"]
+
+        def older(dispatcher, request, peer):  # type: ignore[no-untyped-def]
+            params = {k: v for k, v in request.params.items()
+                      if k not in ("username", "password", "domain")}
+            return original(dispatcher, handlers.Request(
+                id=request.id, method=request.method, params=params), peer)
+
+        handlers._METHODS["connection.add"] = older
+        self.addCleanup(handlers._METHODS.__setitem__, "connection.add", original)
+
+    def test_a_password_that_cannot_be_stored_adds_nothing(self) -> None:
+        """15 October 2026: added, password lost, share mounted as `admin`.
+
+        This daemon has nowhere to put a password. The connection and its
+        password now arrive in one call, so a refusal leaves nothing behind.
+        """
+        with unittest.mock.patch(
+            "smbpal.cli.main.getpass.getpass", return_value="hunter2"
+        ):
+            code, out, err = self.run_cli(
+                "connection", "add", "nas.local", "Media", "/mnt/nas", "--user", "pi"
+            )
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertIn("nothing was added", err)
+        self.assertNotIn("hunter2", out + err)
+        _, listed, _ = self.run_cli("connection", "list")
+        self.assertNotIn("nas-local-media", listed)
+
+    def test_an_older_daemon_still_hears_why_the_password_was_not_stored(self) -> None:
+        self._an_older_daemon()
+        with unittest.mock.patch(
+            "smbpal.cli.main.getpass.getpass", return_value="hunter2"
+        ):
+            code, out, err = self.run_cli(
+                "connection", "add", "nas.local", "Media", "/mnt/nas", "--user", "pi"
+            )
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertIn("added connection nas-local-media", out)
+        self.assertIn("the password was NOT stored", err)
+        self.assertIn("smbpal connection set-credentials nas-local-media --user pi", err)
+        self.assertNotIn("hunter2", out + err)
+
     def test_add_checks_the_name_with_the_credential_it_just_collected(self) -> None:
         # The whole reason the check runs after the credential is stored:
         # macOS will not list anonymously, so checking before would be silent
@@ -304,6 +355,8 @@ class TestConnections(CliTestCase):
         import smbpal.daemon.handlers as handlers
 
         seen = self._fake_shares([{"name": "Media", "kind": "disk", "comment": ""}])
+        # The two-call path, where the check comes after the second call.
+        self._an_older_daemon()
         # Storing a credential needs a mounter, which a --no-apply daemon has
         # not got, and without this the add fails before the check is reached.
         original = handlers._METHODS["connection.set_credentials"]

@@ -284,6 +284,10 @@ class AgentLinks:
         self._by_uid: dict[int, Any] = {}
         self._pending: dict[str, _Pending] = {}
         self._counter = itertools.count(1)
+        # uid -> connection id -> the state that agent last reported. Cleared
+        # when the agent goes, because a state nobody is maintaining is a
+        # claim nobody can back up.
+        self._states: dict[int, dict[str, dict[str, Any]]] = {}
 
     def register(self, connection: Any) -> None:
         uid = connection.peer.uid
@@ -296,20 +300,50 @@ class AgentLinks:
             " (replacing an earlier connection)" if replaced is not None else "",
         )
 
-    def drop(self, connection: Any) -> None:
-        """The connection closed: forget it, and fail what was waiting on it."""
+    def drop(self, connection: Any) -> list[int]:
+        """The connection closed: forget it, and fail what was waiting on it.
+
+        Returns the uids whose agent this was, so the caller can say what
+        their connections now are.
+        """
+        gone: list[int] = []
         with self._lock:
             for uid, registered in list(self._by_uid.items()):
                 if registered is connection:
                     del self._by_uid[uid]
+                    self._states.pop(uid, None)
+                    gone.append(uid)
                     log.info("%s's agent disconnected", username_for_uid(uid))
             waiting = [p for p in self._pending.values() if p.connection is connection]
         for pending in waiting:
             pending.done.set()
+        return gone
+
+    def set_states(
+        self, uid: int, rows: list[dict[str, Any]]
+    ) -> list[tuple[dict[str, Any] | None, dict[str, Any]]]:
+        """Replace that agent's states; return `(previous, current)` changes."""
+        with self._lock:
+            previous = self._states.get(uid, {})
+            current = {row["id"]: row for row in rows}
+            self._states[uid] = current
+        return [
+            (previous.get(key), row)
+            for key, row in current.items()
+            if previous.get(key) != row
+        ]
+
+    def state_for(self, uid: int, connection_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            return self._states.get(uid, {}).get(connection_id)
 
     def connected(self, uid: int) -> bool:
         with self._lock:
             return uid in self._by_uid
+
+    def is_registered(self, connection: Any) -> bool:
+        with self._lock:
+            return self._by_uid.get(connection.peer.uid) is connection
 
     def reply(self, connection: Any, params: dict[str, Any]) -> None:
         rid = params.get("rid")

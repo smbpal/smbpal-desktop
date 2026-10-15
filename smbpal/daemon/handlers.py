@@ -38,6 +38,7 @@ from smbpal.samba import passwd
 from smbpal.samba.apply import Applier
 from smbpal.shares import ownership
 from smbpal.system import selinux as selinux_module
+from smbpal.state.machine import PROBLEM_STATES, STATES
 from smbpal.state.monitor import StateMonitor, fallback_hint
 from smbpal.ipc.peer import PeerCredentials
 from smbpal.ipc.protocol import Request, encode_failure, encode_success, parse_request
@@ -312,6 +313,10 @@ class Dispatcher:
         # mounter: it is the same two operations, performed in the session of
         # whoever asked, by the one process on that machine that is allowed to.
         self.agents = agents
+        # How a state reported by an agent reaches clients on macOS, where
+        # there is no monitor to push it. Set by `main` to the transport's
+        # broadcast; None in tests that do not listen.
+        self.broadcast: Callable[[str, dict[str, Any]], None] | None = None
 
     def handle(self, connection: Connection, frame: bytes) -> bytes | None:
         request: Request | None = None
@@ -561,6 +566,9 @@ class Dispatcher:
         return self._unaccounted(self.store.load())
 
     def _connection_states(self, config: dict[str, Any]) -> list[dict[str, Any]]:
+        if self.mounter is None and isinstance(self.agents, AgentLinks):
+            # macOS: what each owner's agent last reported (`_agent_state`).
+            return self._agent_rows(config)
         if self.mounter is None:
             return [
                 {**conn, "state": NOT_APPLIED}
@@ -861,13 +869,80 @@ class Dispatcher:
             # agent could not create either, since `/Volumes` is root:wheel.
             style=ops.platform_style(sys.platform),
         )
-        self._commit(previous, updated)
+        username = _optional_str(params, "username")
+        password = params.get("password")
+        if username and (not isinstance(password, str) or not password):
+            raise InvalidParams("'password' is required with 'username'")
+        stored: dict[str, Any] | None = None
+        if username and self.agents is not None:
+            # **macOS: the password first, then the connection, in one call.**
+            # As two calls, the agent's loop could see the connection between
+            # them and mount it with no account, and macOS then supplied
+            # whatever login Finder had cached -- `admin`, where `pi` was
+            # given; found on 15 October 2026. And when the second call failed,
+            # the connection stayed without its password. Now a refused
+            # password adds nothing, and the loop never sees the connection
+            # without its account.
+            outcome = self.agents.for_uid(peer.uid).credential_set(
+                str(connection["host"]), username, str(password)
+            )
+            connection = {
+                **connection,
+                "credential_account": username,
+                "keychain_credential": outcome,
+            }
+            updated = {
+                **updated,
+                "connections": [
+                    connection if c["id"] == connection["id"] else c
+                    for c in updated["connections"]
+                ],
+            }
+            stored = {
+                "username": username,
+                "keychain": outcome,
+                "note": _keychain_note(outcome),
+            }
+        written_ref: str | None = None
+        if username and stored is None:
+            # Linux: the credentials file first, for the same reason -- a
+            # connection is never saved without the password it was given.
+            if self.mounter is None:
+                raise SmbpalError(
+                    "this daemon was started with --no-apply, so it has nowhere "
+                    "to store a password; nothing was added"
+                )
+            written_ref = connection.get("credential_ref") or connection["id"]
+            self.mounter.credentials.write(
+                written_ref,
+                username=username,
+                password=str(password),
+                domain=_optional_str(params, "domain"),
+            )
+            connection = {**connection, "credential_ref": written_ref}
+            updated = {
+                **updated,
+                "connections": [
+                    connection if c["id"] == connection["id"] else c
+                    for c in updated["connections"]
+                ],
+            }
+            stored = {"username": username}
+        try:
+            self._commit(previous, updated)
+        except BaseException:
+            if written_ref is not None:
+                self.mounter.forget_credentials(written_ref)
+            raise
         if self.monitor is not None:
             # An id is derived from host and share, so this one may be the id of
             # a connection that was removed a moment ago and primed before that.
             # See StateMonitor.forget.
             self.monitor.forget(connection["id"])
         _audit(peer, "connection.add", connection["id"])
+        if stored is not None:
+            # Never the password: only that it was stored, and where.
+            return {**connection, "credentials": stored}
         return connection
 
     def _connection_remove(
@@ -1001,13 +1076,7 @@ class Dispatcher:
             "id": connection["id"],
             "username": username,
             "keychain": outcome,
-            "note": (
-                "Stored in your login Keychain."
-                if outcome == "created"
-                else "Replaced the login Keychain item that was already there "
-                "for that server and account, which SMBPal will leave behind "
-                "if you uninstall it."
-            ),
+            "note": _keychain_note(outcome),
         }
 
     def _connection_use_fallback(
@@ -1054,6 +1123,8 @@ class Dispatcher:
         A client calls this once to prime itself and then listens for
         `state.changed` events rather than calling it in a loop.
         """
+        if self.monitor is None and isinstance(self.agents, AgentLinks):
+            return [_wire_state(row) for row in self._agent_rows(self.store.load())]
         if self.monitor is None:
             raise SmbpalError("this daemon is not watching connection state")
         return [state.to_wire() for state in self.monitor.snapshot()]
@@ -1100,7 +1171,12 @@ class Dispatcher:
     def disconnected(self, connection: Connection) -> None:
         """The transport's disconnect hook: an agent that left is not there."""
         if isinstance(self.agents, AgentLinks):
-            self.agents.drop(connection)
+            for uid in self.agents.drop(connection):
+                # Its connections are not "connected" any more as far as
+                # anyone can tell; say so rather than leave the last word up.
+                for row in self._agent_rows(self.store.load()):
+                    if _owner_uid(row) == uid:
+                        self._push_state(None, row)
 
     def _agent_link(self, request: Request, connection: Connection) -> dict[str, Any]:
         """`agent.register` and `agent.reply`, which only an agent sends.
@@ -1122,8 +1198,83 @@ class Dispatcher:
             self.agents.register(connection)
             _audit(connection.peer, "agent.register", str(connection.peer.uid))
             return {"uid": connection.peer.uid}
+        if request.method == "agent.state":
+            return self._agent_state(request, connection)
         self.agents.reply(connection, request.params)
         return {}
+
+    def _agent_state(self, request: Request, connection: Connection) -> dict[str, Any]:
+        """An agent's report of its connections, kept and passed on.
+
+        **Only from a registered agent, and only about its own connections**:
+        a report is filed under the uid the kernel gave, and a row for a
+        connection another person owns is dropped, so nobody can paint
+        somebody else's share as connected or failed.
+        """
+        if not self.agents.is_registered(connection):
+            raise NotPermitted("only a registered agent reports connection state")
+        rows = request.params.get("states")
+        if not isinstance(rows, list):
+            raise InvalidParams("states must be a list")
+        uid = connection.peer.uid
+        owned = {
+            c["id"]: c
+            for c in self.store.load().get("connections", [])
+            if _owner_uid(c) == uid
+        }
+        accepted: list[dict[str, Any]] = []
+        for row in rows:
+            cleaned = _clean_state(row)
+            if cleaned is not None and cleaned["id"] in owned:
+                accepted.append(cleaned)
+        for previous, current in self.agents.set_states(uid, accepted):
+            self._push_state(previous, {**owned[current["id"]], **current})
+        return {"accepted": len(accepted)}
+
+    def _agent_rows(self, config: dict[str, Any]) -> list[dict[str, Any]]:
+        """Every connection with the state its owner's agent last reported."""
+        rows = []
+        for connection in config.get("connections", []):
+            uid = _owner_uid(connection)
+            reported = (
+                self.agents.state_for(uid, connection["id"])
+                if uid is not None and isinstance(self.agents, AgentLinks)
+                else None
+            )
+            if reported is None and uid is not None and self.agents.connected(uid):
+                reported = {
+                    "id": connection["id"],
+                    "state": "unknown",
+                    "message": "not checked yet; the agent reports within a few seconds",
+                    "retryable": False,
+                    "mountpoint": None,
+                }
+            if reported is None:
+                owner = connection.get("owner") or "its owner"
+                reported = {
+                    "id": connection["id"],
+                    "state": "unknown",
+                    "message": (
+                        f"{owner}'s SMBPal agent is not connected, so SMBPal "
+                        "cannot tell; it reports once `smbpal-agent --install` "
+                        "has started it"
+                    ),
+                    "retryable": False,
+                    "mountpoint": None,
+                }
+            rows.append({**connection, **_wire_state(reported),
+                         "mountpoint": reported.get("mountpoint") or connection.get("mountpoint")})
+        return rows
+
+    def _push_state(self, previous: dict[str, Any] | None, row: dict[str, Any]) -> None:
+        if self.broadcast is None:
+            return
+        payload = {
+            **_wire_state(row),
+            "previous": previous.get("state") if previous else None,
+            "mountpoint": row.get("mountpoint"),
+        }
+        self.broadcast("state.changed", payload)
 
     # --- mounting through a per-user agent (macOS, D13) --------------------
 
@@ -1497,7 +1648,61 @@ _PRECHECKS = {
 }
 
 
-_LINK_METHODS = frozenset({"agent.register", "agent.reply"})
+def _keychain_note(outcome: str) -> str:
+    return (
+        "Stored in your login Keychain."
+        if outcome == "created"
+        else "Replaced the login Keychain item that was already there for that "
+        "server and account, which SMBPal will leave behind if you uninstall it."
+    )
+
+
+_LINK_METHODS = frozenset({"agent.register", "agent.reply", "agent.state"})
+
+
+def _owner_uid(connection: dict[str, Any]) -> int | None:
+    owner = connection.get("owner")
+    if not isinstance(owner, str) or not owner:
+        return None
+    try:
+        return pwd.getpwnam(owner).pw_uid
+    except KeyError:
+        return None
+
+
+_MAX_STATE_MESSAGE = 500
+
+
+def _clean_state(row: Any) -> dict[str, Any] | None:
+    """One reported row, or None if it is not one `state/machine.py` knows."""
+    if not isinstance(row, dict):
+        return None
+    identifier, state, message = row.get("id"), row.get("state"), row.get("message")
+    if not isinstance(identifier, str) or state not in STATES:
+        return None
+    if not isinstance(message, str):
+        message = ""
+    mountpoint = row.get("mountpoint")
+    return {
+        "id": identifier,
+        "state": state,
+        "message": message[:_MAX_STATE_MESSAGE],
+        "retryable": bool(row.get("retryable")),
+        "mountpoint": mountpoint if isinstance(mountpoint, str) else None,
+    }
+
+
+def _wire_state(row: dict[str, Any]) -> dict[str, Any]:
+    """The `connection.watch` shape, from a reported row."""
+    return {
+        "id": row["id"],
+        "state": row["state"],
+        "message": row.get("message", ""),
+        "errno": None,
+        "retryable": bool(row.get("retryable")),
+        "read_only": False,
+        "is_problem": row["state"] in PROBLEM_STATES,
+    }
 
 _METHODS: dict[str, Method] = {
     "ping": Dispatcher._ping,

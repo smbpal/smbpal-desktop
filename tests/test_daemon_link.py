@@ -275,6 +275,49 @@ class EndToEnd(unittest.TestCase):
         self.assertFalse(link.registered.wait(0.5))
         self.assertFalse(self.links.connected(self.uid))
 
+    def test_add_with_a_password_stores_it_first_in_one_call(self) -> None:
+        link = self.dial()
+        self.assertTrue(link.registered.wait(5))
+        result = self.call(
+            "connection.add",
+            {"host": "nas.example", "share": "Photos", "mountpoint": "/Volumes/Photos",
+             "username": "pi", "password": "throwaway"},
+        )
+        self.assertEqual(result["credentials"]["keychain"], "created")
+        self.assertNotIn("throwaway", json.dumps(result))
+        self.assertEqual(self.keychain.items[("nas.example", "pi")], "throwaway")
+        record = next(c for c in self.store.load()["connections"] if c["share"] == "Photos")
+        self.assertEqual(record["credential_account"], "pi")
+
+    def test_add_with_a_password_and_no_agent_adds_nothing(self) -> None:
+        with self.assertRaises(SmbpalError) as caught:
+            self.call(
+                "connection.add",
+                {"host": "nas.example", "share": "Photos", "mountpoint": "/Volumes/Photos",
+                 "username": "pi", "password": "throwaway"},
+            )
+        self.assertEqual(caught.exception.code, "agent_unreachable")
+        self.assertNotIn("Photos", [c["share"] for c in self.store.load()["connections"]])
+
+    def test_the_agent_reports_and_status_shows_it(self) -> None:
+        import getpass
+
+        record = self.store.load()
+        record["connections"][0]["owner"] = getpass.getuser()
+        self.store.save(record)
+        link = self.dial()
+        self.assertTrue(link.registered.wait(5))
+        link.report([{"id": "nas-media", "state": "connected", "message": "mounted at /Volumes/Media",
+                      "retryable": False, "mountpoint": "/Volumes/Media"}])
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status = self.call("status", {})
+            row = status["connections"][0]
+            if row["state"] == "connected":
+                break
+            time.sleep(0.05)
+        self.assertEqual(row["state"], "connected")
+
     def test_a_stopped_agent_is_reported_not_waited_for(self) -> None:
         link = self.dial()
         self.assertTrue(link.registered.wait(5))
@@ -322,3 +365,96 @@ class TheMacDaemonDoesNotMount(unittest.TestCase):
             self.assertTrue(reply["ok"], reply)
             self.assertFalse((Path(directory) / "Volumes").exists())
             self.assertEqual(len(store.load()["connections"]), 1)
+
+
+class ReportedState(unittest.TestCase):
+    """macOS has no monitor: the agent reports state and the daemon keeps it."""
+
+    def setUp(self) -> None:
+        import getpass
+
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.me = getpass.getuser()
+        self.store = ConfigStore(Path(self._dir.name) / "config.json")
+        self.store.save(
+            {
+                "version": 1,
+                "shares": [],
+                "connections": [
+                    {"type": "os", "id": "mine", "host": "nas.example", "share": "Media",
+                     "mountpoint": "/Volumes/Media", "owner": self.me},
+                    {"type": "os", "id": "theirs", "host": "nas.example", "share": "Other",
+                     "mountpoint": "/Volumes/Other", "owner": "root"},
+                ],
+            }
+        )
+        self.links = AgentLinks()
+        self.dispatcher = Dispatcher(
+            self.store, authoriser=Authoriser(policy="group"), agents=self.links
+        )
+        self.events: list[tuple[str, dict[str, Any]]] = []
+        self.dispatcher.broadcast = lambda event, data: self.events.append((event, data))
+        self.agent = FakeConnection(os.getuid())
+
+    def send(self, connection: FakeConnection, method: str, **params: Any) -> dict[str, Any]:
+        frame = json.dumps({"v": 1, "id": "1", "method": method, "params": params}).encode()
+        reply = self.dispatcher.handle(connection, frame)
+        assert reply is not None
+        return json.loads(reply)
+
+    def report(self, *rows: dict[str, Any]) -> dict[str, Any]:
+        return self.send(self.agent, "agent.state", states=list(rows))
+
+    def row(self, id: str = "mine", state: str = "connected", **extra: Any) -> dict[str, Any]:
+        return {"id": id, "state": state, "message": "mounted at /Volumes/Media",
+                "retryable": False, "mountpoint": "/Volumes/Media", **extra}
+
+    def status_of(self, connection_id: str) -> dict[str, Any]:
+        rows = self.dispatcher._connection_states(self.store.load())
+        return next(r for r in rows if r["id"] == connection_id)
+
+    def test_an_unregistered_connection_cannot_report(self) -> None:
+        reply = self.report(self.row())
+        self.assertFalse(reply["ok"])
+
+    def test_a_report_reaches_status_and_watch_and_is_pushed(self) -> None:
+        self.send(self.agent, "agent.register")
+        self.assertTrue(self.report(self.row())["ok"])
+        self.assertEqual(self.status_of("mine")["state"], "connected")
+        watched = self.send(self.agent, "connection.watch")["result"]
+        self.assertIn("connected", [w["state"] for w in watched if w["id"] == "mine"])
+        self.assertEqual(self.events[-1][0], "state.changed")
+        self.assertEqual(self.events[-1][1]["state"], "connected")
+
+    def test_the_same_report_twice_is_pushed_once(self) -> None:
+        self.send(self.agent, "agent.register")
+        self.report(self.row())
+        self.report(self.row())
+        self.assertEqual(len(self.events), 1)
+
+    def test_nobody_can_report_on_somebody_elses_connection(self) -> None:
+        if os.getuid() == 0:
+            self.skipTest("root owns the other connection here")
+        self.send(self.agent, "agent.register")
+        reply = self.report(self.row(id="theirs", state="auth_failed"))
+        self.assertEqual(reply["result"]["accepted"], 0)
+        self.assertNotEqual(self.status_of("theirs")["state"], "auth_failed")
+
+    def test_a_state_the_machine_does_not_know_is_dropped(self) -> None:
+        self.send(self.agent, "agent.register")
+        self.assertEqual(self.report(self.row(state="exploded"))["result"]["accepted"], 0)
+
+    def test_before_any_report_status_says_why_it_cannot_tell(self) -> None:
+        self.assertEqual(self.status_of("mine")["state"], "unknown")
+        self.assertIn("agent is not connected", self.status_of("mine")["message"])
+        self.send(self.agent, "agent.register")
+        self.assertIn("not checked yet", self.status_of("mine")["message"])
+
+    def test_an_agent_that_leaves_takes_its_states_with_it(self) -> None:
+        self.send(self.agent, "agent.register")
+        self.report(self.row())
+        self.dispatcher.disconnected(self.agent)
+        self.assertEqual(self.status_of("mine")["state"], "unknown")
+        self.assertEqual(self.events[-1][1]["state"], "unknown")
+
