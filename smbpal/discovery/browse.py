@@ -21,9 +21,15 @@ tested against captured output rather than against a live network.
 
 from __future__ import annotations
 
+import os
 import re
+import selectors
 import shutil
+import socket
 import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
@@ -34,6 +40,10 @@ SMBPAL_SERVICE = "_smbpal._tcp"
 
 AVAHI_BROWSE = "avahi-browse"
 DEFAULT_TIMEOUT = 5.0
+# macOS: Apple's own client for mDNSResponder. Not Python's resolver: the Local
+# Network privacy gate refuses Homebrew's interpreter a `.local` lookup
+# (`probe.can_probe`), and Apple's binary is let through.
+DNS_SD = "/usr/bin/dns-sd"
 
 # One pass over `\ddd` (avahi's decimal form for anything non-printable) and
 # `\X` (everything else it escapes, including ';' '.' and '\\' itself). A single
@@ -213,7 +223,8 @@ def merge(
 
 
 def _is_uninteresting(service: Service) -> bool:
-    if service.interface == "lo" or service.address in _LOOPBACK_ADDRESSES:
+    # `lo` is Linux's loopback and `lo0` macOS's.
+    if service.interface in ("lo", "lo0") or service.address in _LOOPBACK_ADDRESSES:
         # This machine advertising to itself. Offering to mount your own share
         # as a remote is nonsense.
         return True
@@ -234,14 +245,212 @@ def _address_sort_key(address: str) -> tuple[int, str]:
 Runner = Callable[[str, float], str]
 
 
+# `(args, window, until)`: run `dns-sd` for at most `window` seconds, stopping
+# early once `until` says the output so far holds the answer.
+DnsSd = Callable[[list[str], float, Callable[[str], bool] | None], str]
+
+
 def discover(
-    *, timeout: float = DEFAULT_TIMEOUT, runner: Runner | None = None
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    runner: Runner | None = None,
+    platform: str | None = None,
+    dns_sd: DnsSd | None = None,
 ) -> list[Machine]:
     """Browse the network and return one row per machine."""
+    if runner is None and (platform or _platform()) == "darwin":
+        # Both types at once: each spends most of its time waiting.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            smb, smbpal = pool.map(
+                lambda kind: discover_dns_sd(kind, timeout, dns_sd),
+                (SMB_SERVICE, SMBPAL_SERVICE),
+            )
+        return merge(smb, smbpal)
     run = runner or _run_avahi_browse
     return merge(
         parse(run(SMB_SERVICE, timeout)), parse(run(SMBPAL_SERVICE, timeout))
     )
+
+
+def _platform() -> str:
+    """The platform, asked at call time and only by this module.
+
+    A function rather than `sys.platform` read in place, so a test can choose
+    the Linux route without telling the whole process it is on Linux -- which
+    sent the CLI looking for Linux sockets and polkit, and stalled it.
+    """
+    return sys.platform
+
+
+# --- macOS: dns-sd ---------------------------------------------------------
+#
+# Found on 15 October 2026: `smbpal browse` and the window's "Browse servers"
+# had never worked on a Mac -- both asked for `avahi-browse`, which macOS does
+# not have, and the Homebrew caveats said browsing worked. `dns-sd` is three
+# steps where avahi's `-r` is one: browse for instance names, resolve each to a
+# host and port, then look the host up. None of them exits on its own, so each
+# runs for a window and is stopped, and the second and third run in parallel.
+
+_RESOLVED = re.compile(
+    r"can be reached at (?P<host>.+?):(?P<port>\d+) \(interface (?P<index>\d+)\)"
+)
+
+
+def parse_dns_sd_browse(text: str) -> list[tuple[int, str]]:
+    """`(interface index, instance name)` from `dns-sd -B` output.
+
+    Columns are `Timestamp A/R Flags if Domain Type Name`, and the name is the
+    rest of the line, because it may contain spaces.
+    """
+    found: list[tuple[int, str]] = []
+    for line in text.splitlines():
+        fields = line.split(None, 6)
+        if len(fields) < 7 or fields[1] != "Add":
+            continue
+        try:
+            found.append((int(fields[3]), fields[6].strip()))
+        except ValueError:
+            continue
+    return found
+
+
+def parse_dns_sd_resolve(text: str) -> tuple[str, int, int] | None:
+    """`(hostname, port, interface index)` from `dns-sd -L` output."""
+    match = _RESOLVED.search(text)
+    if match is None:
+        return None
+    return (
+        match.group("host").rstrip("."),
+        int(match.group("port")),
+        int(match.group("index")),
+    )
+
+
+def parse_dns_sd_addresses(text: str) -> list[tuple[int, str]]:
+    """`(interface index, address)` from `dns-sd -G v4v6` output."""
+    found: list[tuple[int, str]] = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 6 or fields[1] != "Add":
+            continue
+        try:
+            found.append((int(fields[3]), fields[5]))
+        except ValueError:
+            continue
+    return found
+
+
+def discover_dns_sd(
+    service_type: str, timeout: float, run: DnsSd | None = None
+) -> list[Service]:
+    """Every instance of `service_type`, resolved, as avahi's `Service` rows."""
+    execute = run or _run_dns_sd
+    # Browsing has no last answer, so it gets most of the budget; a resolve or
+    # a lookup stops at its first answer and keeps the rest only in reserve.
+    browse_window = max(1.0, timeout * 0.6)
+    window = max(1.0, timeout * 0.2)
+    names = sorted({name for _index, name in parse_dns_sd_browse(
+        execute(["-B", service_type, "local."], browse_window, None)
+    )})
+    if not names:
+        return []
+    with ThreadPoolExecutor(max_workers=min(16, len(names))) as pool:
+        resolved = dict(zip(names, pool.map(
+            lambda name: parse_dns_sd_resolve(
+                execute(["-L", name, service_type, "local."], window, _has_resolve)
+            ),
+            names,
+        )))
+        hosts = sorted({r[0] for r in resolved.values() if r is not None})
+        addresses = dict(zip(hosts, pool.map(
+            lambda host: parse_dns_sd_addresses(
+                execute(["-G", "v4v6", host + "."], window, _has_last_address)
+            ),
+            hosts,
+        )))
+    services: list[Service] = []
+    for name in names:
+        found = resolved.get(name)
+        if found is None:
+            continue
+        host, port, _index = found
+        for index, address in addresses.get(host, []):
+            services.append(
+                Service(
+                    interface=_interface_name(index),
+                    protocol="IPv6" if ":" in address else "IPv4",
+                    name=name,
+                    type=service_type,
+                    domain="local",
+                    hostname=host,
+                    address=address,
+                    port=port,
+                )
+            )
+    return services
+
+
+def _has_resolve(text: str) -> bool:
+    return _RESOLVED.search(text) is not None
+
+
+def _has_last_address(text: str) -> bool:
+    """An `Add` without mDNSResponder's more-coming bit (0x1) is the last."""
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 6 and fields[1] == "Add":
+            try:
+                if not int(fields[2], 16) & 0x1:
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
+def _interface_name(index: int) -> str:
+    try:
+        return socket.if_indextoname(index)
+    except OSError:
+        return str(index)
+
+
+def _run_dns_sd(
+    args: list[str], window: float, until: Callable[[str], bool] | None = None
+) -> str:
+    """Run `dns-sd` for up to `window` seconds and return what it printed.
+
+    It never exits by itself, so being stopped is the normal end, not an
+    error; with `until`, it is stopped as soon as the output answers the
+    question. A missing binary is an error, and says so.
+    """
+    try:
+        process = subprocess.Popen(
+            [DNS_SD, *args], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+    except OSError as exc:
+        raise Unavailable(f"cannot run {DNS_SD}", detail=str(exc)) from exc
+    assert process.stdout is not None
+    out = bytearray()
+    deadline = time.monotonic() + window
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while (left := deadline - time.monotonic()) > 0:
+            if not selector.select(left):
+                continue
+            chunk = os.read(process.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            out += chunk
+            if until is not None and until(out.decode("utf-8", errors="replace")):
+                break
+    process.terminate()
+    try:
+        process.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+    process.stdout.close()
+    return out.decode("utf-8", errors="replace")
 
 
 def _run_avahi_browse(service_type: str, timeout: float) -> str:

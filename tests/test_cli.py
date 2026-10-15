@@ -570,6 +570,12 @@ class TestBrowse(CliTestCase):
         original = browse.shutil.which
         browse.shutil.which = lambda _name: None
         self.addCleanup(setattr, browse.shutil, "which", original)
+        # avahi-browse is the Linux route; a Mac browses with dns-sd.
+        from unittest import mock
+
+        pinned = mock.patch.object(browse, "_platform", lambda: "linux")
+        pinned.start()
+        self.addCleanup(pinned.stop)
         code, _, err = self.run_cli("browse")
         self.assertEqual(code, EXIT_ERROR)
         self.assertIn("avahi-browse", err)
