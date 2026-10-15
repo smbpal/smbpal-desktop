@@ -1,3 +1,16 @@
+smbpal (0.2.17) trixie; urgency=medium
+
+  * **macOS: shares can be read-only.** `smbpal share add <name> <folder>
+    --read-only` serves the folder so other machines can open its files but
+    not change them or add new ones. SMBPal checks that macOS really made the
+    share read-only, and unshares it rather than serve it writable if not.
+  * **macOS: rebuild the helper after upgrading**, because this release
+    changes it: from a checkout of this release's source, run
+    `make -C helper && sudo make -C helper install`.
+  * Nothing changes on Linux.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Thu, 15 Oct 2026 21:30:00 +0100
+
 smbpal (0.2.16) trixie; urgency=medium
 
   * **macOS: a share comes back within about a minute of its server.** In

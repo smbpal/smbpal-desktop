@@ -10,7 +10,7 @@
 # no second removal step.
 
 Name:           smbpal
-Version:        0.2.16
+Version:        0.2.17
 Release:        1%{?dist}
 Summary:        Share folders over SMB, and connect to shares on other machines
 
@@ -261,6 +261,12 @@ fi
 %{_datadir}/icons/hicolor/scalable/status/smbpal-attention.svg
 
 %changelog
+* Thu Oct 15 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.17-1
+- macOS: shares can be read-only. `smbpal share add --read-only` serves a
+  folder that other machines can read but not change. SMBPal checks macOS
+  really made it read-only, and unshares it rather than serve it writable.
+- macOS: this release changes the helper; rebuild it after upgrading with
+  `make -C helper && sudo make -C helper install`.
 * Thu Oct 15 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.16-1
 - macOS: a share lost when its server went away now reconnects within about
   a minute of the server coming back, where 0.2.15 could take five. It also
