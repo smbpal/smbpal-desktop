@@ -1,3 +1,15 @@
+smbpal (0.2.19) trixie; urgency=medium
+
+  * **macOS: no source checkout needed.** The Homebrew formula now builds the
+    root helper, and `smbpal setup` uses it, so installing with `brew` is
+    enough. Before this, setting SMBPal up on a Mac needed a copy of the
+    source to compile the helper.
+  * **macOS: `smbpal setup` says when the helper is out of date** after an
+    upgrade, and prints the commands that replace it.
+  * Nothing changes on Linux.
+
+ -- Luke Hynek <luke.hynek@aiminternet.co.uk>  Fri, 16 Oct 2026 09:55:00 +0100
+
 smbpal (0.2.18) trixie; urgency=medium
 
   * **macOS: finding servers works.** `smbpal browse` and the window's

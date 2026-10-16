@@ -10,7 +10,7 @@
 # no second removal step.
 
 Name:           smbpal
-Version:        0.2.18
+Version:        0.2.19
 Release:        1%{?dist}
 Summary:        Share folders over SMB, and connect to shares on other machines
 
@@ -261,6 +261,11 @@ fi
 %{_datadir}/icons/hicolor/scalable/status/smbpal-attention.svg
 
 %changelog
+* Fri Oct 16 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.19-1
+- macOS: installing with Homebrew is enough; the formula builds the root
+  helper and `smbpal setup` uses it, with no source checkout.
+- macOS: `smbpal setup` says when the helper is out of date after an upgrade,
+  and prints the commands that replace it.
 * Thu Oct 15 2026 Luke Hynek <luke.hynek@aiminternet.co.uk> - 0.2.18-1
 - macOS: `smbpal browse` and the window's "Browse servers" find servers on
   the network. They failed on a Mac before, asking for a Linux tool.
