@@ -315,6 +315,85 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.store.load()["connections"], [])
         self.assertIn("eject it in Finder", result["notes"][0])
 
+    # --- one Keychain item, several connections (16 October 2026) ---------
+
+    def _add(self, share: str, account: str = "pi", host: str = "nas.example") -> str:
+        result = self.call(
+            "connection.add",
+            {"host": host, "share": share, "mountpoint": f"/Volumes/{share}",
+             "username": account, "password": "throwaway"},
+        )
+        return result["id"]
+
+    def _mark(self, connection_id: str) -> object:
+        return next(
+            c for c in self.store.load()["connections"] if c["id"] == connection_id
+        ).get("keychain_credential")
+
+    def test_removing_one_of_two_keeps_the_password_the_other_uses(self) -> None:
+        link = self.dial()
+        self.assertTrue(link.registered.wait(5))
+        first, second = self._add("Photos"), self._add("Music")
+        self.assertEqual((self._mark(first), self._mark(second)), ("created", "created"))
+        self.call("connection.remove", {"ref": first})
+        self.assertIn(("nas.example", "pi"), self.keychain.items)
+        self.call("connection.remove", {"ref": second})
+        self.assertNotIn(("nas.example", "pi"), self.keychain.items)
+
+    def test_a_config_from_before_the_fix_hands_the_mark_on(self) -> None:
+        link = self.dial()
+        self.assertTrue(link.registered.wait(5))
+        first, second = self._add("Photos"), self._add("Music")
+        record = self.store.load()
+        for c in record["connections"]:
+            if c["id"] == second:
+                c["keychain_credential"] = "replaced"  # as 0.2.19 and earlier recorded it
+        self.store.save(record)
+        self.call("connection.remove", {"ref": first})
+        self.assertIn(("nas.example", "pi"), self.keychain.items)
+        self.assertEqual(self._mark(second), "created")
+        self.call("connection.remove", {"ref": second})
+        self.assertNotIn(("nas.example", "pi"), self.keychain.items)
+
+    def test_a_password_the_person_stored_is_never_removed(self) -> None:
+        link = self.dial()
+        self.assertTrue(link.registered.wait(5))
+        self.keychain.items[("nas.example", "pi")] = "theirs"
+        only = self._add("Photos")
+        self.assertEqual(self._mark(only), "replaced")
+        self.call("connection.remove", {"ref": only})
+        self.assertIn(("nas.example", "pi"), self.keychain.items)
+
+    def test_another_account_on_the_same_server_is_its_own_item(self) -> None:
+        link = self.dial()
+        self.assertTrue(link.registered.wait(5))
+        pi = self._add("Photos", account="pi")
+        self._add("Music", account="bob")
+        self.call("connection.remove", {"ref": pi})
+        self.assertNotIn(("nas.example", "pi"), self.keychain.items)
+        self.assertIn(("nas.example", "bob"), self.keychain.items)
+
+    def test_changing_the_password_keeps_smbpal_the_owner(self) -> None:
+        link = self.dial()
+        self.assertTrue(link.registered.wait(5))
+        only = self._add("Photos")
+        result = self.call(
+            "connection.set_credentials",
+            {"ref": only, "username": "pi", "password": "another"},
+        )
+        self.assertEqual(self._mark(only), "created")
+        self.assertIn("Stored in your login Keychain", result["note"])
+        self.call("connection.remove", {"ref": only})
+        self.assertNotIn(("nas.example", "pi"), self.keychain.items)
+
+    def test_two_spellings_of_one_host_share_the_item(self) -> None:
+        link = self.dial()
+        self.assertTrue(link.registered.wait(5))
+        first = self._add("Photos", host="nas.example")
+        self._add("Music", host="NAS.example")
+        self.call("connection.remove", {"ref": first})
+        self.assertIn(("nas.example", "pi"), self.keychain.items)
+
     def test_the_agent_reports_and_status_shows_it(self) -> None:
         import getpass
 

@@ -889,7 +889,9 @@ class Dispatcher:
             connection = {
                 **connection,
                 "credential_account": username,
-                "keychain_credential": outcome,
+                "keychain_credential": _keychain_mark(
+                    previous, str(connection["host"]), username, outcome
+                ),
             }
             updated = {
                 **updated,
@@ -900,8 +902,8 @@ class Dispatcher:
             }
             stored = {
                 "username": username,
-                "keychain": outcome,
-                "note": _keychain_note(outcome),
+                "keychain": connection["keychain_credential"],
+                "note": _keychain_note(connection["keychain_credential"]),
             }
         written_ref: str | None = None
         if username and stored is None:
@@ -951,6 +953,28 @@ class Dispatcher:
         ref = _require_str(request.params, "ref")
         previous = self.store.load()
         updated, connection = ops.remove_connection(previous, ref)
+        account = connection.get("credential_account")
+        host = str(connection.get("host", ""))
+        # **One Keychain item per server and account, shared.** Several
+        # connections to one server as one account all mount with the same
+        # item, so removing one must not take it from the rest -- which the
+        # first version did: the connection marked `created` deleted the item
+        # and the others failed at their next mount. Found reading the code on
+        # 16 October 2026, before many connections to one server made it
+        # routine. So the item goes with the last connection that uses it, and
+        # until then the mark moves to the ones left, so that last one still
+        # knows the item is SMBPal's to remove.
+        sharing = [
+            c for c in updated["connections"] if account and _same_credential(c, host, str(account))
+        ]
+        if connection.get("keychain_credential") == "created" and sharing:
+            updated = {
+                **updated,
+                "connections": [
+                    {**c, "keychain_credential": "created"} if c in sharing else c
+                    for c in updated["connections"]
+                ],
+            }
         self._commit(previous, updated)
         if self.mounter is not None and connection.get("credential_ref"):
             self.mounter.forget_credentials(connection["credential_ref"])
@@ -961,11 +985,10 @@ class Dispatcher:
         if (
             self.agents is not None
             and connection.get("keychain_credential") == "created"
-            and connection.get("credential_account")
+            and account
+            and not sharing
         ):
-            self.agents.for_uid(peer.uid).credential_forget(
-                str(connection["host"]), str(connection["credential_account"])
-            )
+            self.agents.for_uid(peer.uid).credential_forget(host, str(account))
         if self.monitor is not None:
             self.monitor.forget(connection["id"])
         _audit(peer, "connection.remove", connection["id"])
@@ -1096,13 +1119,14 @@ class Dispatcher:
         # subtle once it ran: `connection remove` asked the Keychain to forget
         # an account called `nas-example-media`, which does not exist, and the
         # real item survived a removal that reported success.
+        mark = _keychain_mark(previous, str(connection["host"]), username, outcome)
         updated = {
             **previous,
             "connections": [
                 {
                     **candidate,
                     "credential_account": username,
-                    "keychain_credential": outcome,
+                    "keychain_credential": mark,
                 }
                 if candidate["id"] == connection["id"]
                 else candidate
@@ -1116,8 +1140,8 @@ class Dispatcher:
         return {
             "id": connection["id"],
             "username": username,
-            "keychain": outcome,
-            "note": _keychain_note(outcome),
+            "keychain": mark,
+            "note": _keychain_note(mark),
         }
 
     def _connection_use_fallback(
@@ -1687,6 +1711,40 @@ def _require_account(request: Request) -> None:
 _PRECHECKS = {
     "share.add": _require_account,
 }
+
+
+def _same_credential(connection: dict[str, Any], host: str, account: str) -> bool:
+    """Whether a connection mounts with the Keychain item for `host` and `account`.
+
+    The host without case, because a hostname has none and two spellings of one
+    server must not be taken for two items -- the safe mistake here is keeping
+    an item, never deleting one another connection needs.
+    """
+    return (
+        str(connection.get("host", "")).casefold() == host.casefold()
+        and connection.get("credential_account") == account
+    )
+
+
+def _keychain_mark(
+    config: dict[str, Any], host: str, account: str, outcome: str
+) -> str:
+    """What to record about the Keychain item a credential was stored in.
+
+    `created` when SMBPal created it just now, and also when another
+    connection already records SMBPal as its creator: the agent answers
+    `replaced` whenever the item exists, including when the item is SMBPal's
+    own from a sibling connection or from this one's earlier password. Taken at
+    its word, that would leave no connection that knows to remove it.
+    """
+    if outcome == "created":
+        return "created"
+    if any(
+        c.get("keychain_credential") == "created" and _same_credential(c, host, account)
+        for c in config.get("connections", [])
+    ):
+        return "created"
+    return outcome
 
 
 def _keychain_note(outcome: str) -> str:
