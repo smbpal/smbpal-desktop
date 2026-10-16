@@ -1091,6 +1091,63 @@ class TestSetupSaysWhatIsLeftToDoByHand(unittest.TestCase):
         self.assertIn("uninstall", out)
         self.assertNotIn("--daemon", out)
 
+    def test_an_out_of_date_helper_gets_the_upgrade_commands(self) -> None:
+        """16 October 2026: a `brew upgrade` leaves the root-owned helper behind."""
+        with tempfile.TemporaryDirectory() as tmp:
+            installed = Path(tmp) / "installed"
+            shipped = Path(tmp) / "shipped"
+            installed.write_bytes(b"old build")
+            shipped.write_bytes(b"new build")
+            with (
+                mock.patch.object(cli_main.sys, "platform", "darwin"),
+                mock.patch.object(cli_main, "HELPER_INSTALLED", installed),
+                mock.patch.object(cli_main, "_group_exists", return_value=True),
+                mock.patch.object(cli_main, "_helper_source", return_value=shipped),
+                mock.patch.object(cli_main.shutil, "which", return_value="/x/smbpald"),
+            ):
+                code, out = self.run_setup()
+        self.assertEqual(code, 0)
+        self.assertIn(f"sudo install -S -o root -g wheel -m 755 {shipped} {installed}", out)
+        self.assertIn("sudo launchctl bootout system/app.smbpal.helper", out)
+        self.assertIn(
+            "sudo launchctl bootstrap system /Library/LaunchDaemons/app.smbpal.helper.plist", out
+        )
+        self.assertNotIn("uninstall", out)
+
+    def test_a_current_helper_is_set_up_already(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            installed = Path(tmp) / "installed"
+            shipped = Path(tmp) / "shipped"
+            installed.write_bytes(b"same build")
+            shipped.write_bytes(b"same build")
+            with (
+                mock.patch.object(cli_main.sys, "platform", "darwin"),
+                mock.patch.object(cli_main, "HELPER_INSTALLED", installed),
+                mock.patch.object(cli_main, "_group_exists", return_value=True),
+                mock.patch.object(cli_main, "_helper_source", return_value=shipped),
+                mock.patch.object(cli_main.shutil, "which", return_value="/x/smbpald"),
+            ):
+                _, out = self.run_setup()
+        self.assertIn("Set up already", out)
+
+    def test_the_helper_homebrew_ships_is_found(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            shipped = Path(tmp) / "helper" / "smbpal-helper"
+            shipped.parent.mkdir()
+            shipped.write_bytes(b"built by the formula")
+            with (
+                mock.patch.object(cli_main.sys, "prefix", tmp),
+                mock.patch.object(cli_main, "__file__", str(Path(tmp) / "a" / "b" / "c" / "main.py")),
+            ):
+                self.assertEqual(cli_main._helper_source(), shipped)
+
+    def test_the_launchd_names_match_the_helper(self) -> None:
+        source = (Path(__file__).parent.parent / "helper" / "smbpal-helper.c").read_text()
+        self.assertIn(f'#define HELPER_LABEL "{cli_main.HELPER_LABEL}"', source)
+        self.assertEqual(
+            str(cli_main.HELPER_PLIST), f"/Library/LaunchDaemons/{cli_main.HELPER_LABEL}.plist"
+        )
+
     def test_it_says_so_when_the_helper_is_not_built(self) -> None:
         with (
             mock.patch.object(cli_main.sys, "platform", "darwin"),

@@ -1132,6 +1132,9 @@ _COMMANDS: dict[tuple[str, str | None], Handler] = {
 
 
 HELPER_INSTALLED = Path("/usr/local/libexec/smbpal/smbpal-helper")
+# The helper's launchd job, as `helper/smbpal-helper.c` names it.
+HELPER_LABEL = "app.smbpal.helper"
+HELPER_PLIST = Path(f"/Library/LaunchDaemons/{HELPER_LABEL}.plist")
 
 
 def _cmd_setup(args: argparse.Namespace) -> int:
@@ -1162,15 +1165,19 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     print(f"  smbpald on PATH    {smbpald or 'no'}")
     print()
 
+    source = _helper_source()
     if helper_there and group_there:
+        if source is not None and _differs(source, HELPER_INSTALLED):
+            _print_helper_upgrade(source)
+            return 0
         print("Set up already. To change it, remove it first -- the install")
         print("refuses to run twice rather than guess which half to repair:")
         print(f"  sudo {HELPER_INSTALLED} uninstall")
         return 0
 
-    source = _helper_source()
     if source is None:
-        print("The helper is not built yet. From a source checkout:")
+        print("The helper is not built yet. A Homebrew install builds it; from a")
+        print("source checkout instead:")
         print("  make -C helper")
         print("then run `smbpal setup` again.")
         return 1
@@ -1210,11 +1217,53 @@ def _group_exists(name: str) -> bool:
 def _helper_source() -> Path | None:
     """Where an unprivileged copy of the helper can be found to install from.
 
-    The formula does not ship it yet, so a source checkout is the only answer
-    today and saying so beats naming a path that is not there.
+    A source checkout first, for development; then the copy the Homebrew
+    formula builds into the virtualenv's `helper/` since 0.2.19, which is what
+    a person who installed with `brew` has. Before that the formula shipped no
+    helper, and a Mac install needed a source checkout to compile one -- found
+    on 16 October 2026 while putting macOS on the website.
     """
-    candidate = Path(__file__).resolve().parent.parent.parent / "helper" / "smbpal-helper"
-    return candidate if candidate.exists() else None
+    for candidate in (
+        Path(__file__).resolve().parent.parent.parent / "helper" / "smbpal-helper",
+        Path(sys.prefix) / "helper" / "smbpal-helper",
+    ):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _differs(source: Path, installed: Path) -> bool:
+    """Whether the installed helper is not the one this install ships.
+
+    By content, because that is the question: a `brew upgrade` that changed the
+    helper leaves the root-owned copy behind, and nothing else notices.
+    Unreadable counts as the same, so `setup` never prints an upgrade it cannot
+    justify.
+    """
+    try:
+        return source.read_bytes() != installed.read_bytes()
+    except OSError:
+        return False
+
+
+def _print_helper_upgrade(source: Path) -> None:
+    """The commands that replace the root-owned helper with the shipped one.
+
+    Printed, not run, for `_cmd_setup`'s reason. They are what
+    `make -C helper install` does, without running a Makefile as root from a
+    prefix any admin can write to: copy onto a new inode, then re-register the
+    job, because launchd kills a replaced build at launch until it is
+    bootstrapped again (helper spike §16).
+    """
+    print("The installed helper is not the one this version of SMBPal ships, so")
+    print("it is out of date. Replace it and re-register it with launchd:")
+    print()
+    print(f"  sudo install -S -o root -g wheel -m 755 {source} {HELPER_INSTALLED}")
+    print(f"  sudo launchctl bootout system/{HELPER_LABEL}")
+    print(f"  sudo launchctl bootstrap system {HELPER_PLIST}")
+    print()
+    print("If the last one says `Input/output error`, launchd had not finished")
+    print("with the old helper yet: wait a second and run it again.")
 
 
 # Commands that must run with no daemon, dispatched before one is contacted.
